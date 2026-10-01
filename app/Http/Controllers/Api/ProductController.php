@@ -22,49 +22,49 @@ class ProductController extends Controller
 
         $query = Product::where('store_id', $storeId)->with('brand', 'category', 'gstRate');
 
-        if ($role === 'manager') {
-            $assignedBranchIds = DB::table('branch_staff')
-                ->where('user_id', $user->id)
-                ->pluck('branch_id')
-                ->toArray();
+        // if ($role === 'manager') {
+        //     $assignedBranchIds = DB::table('branch_staff')
+        //         ->where('user_id', $user->id)
+        //         ->pluck('branch_id')
+        //         ->toArray();
 
-            if (empty($assignedBranchIds)) {
-                return response()->json(['status' => true, 'products' => []], 200);
-            }
+        //     if (empty($assignedBranchIds)) {
+        //         return response()->json(['status' => true, 'products' => []], 200);
+        //     }
 
-            if ($request->filled('branch_id')) {
-                $requestedBranchId = (int) $request->branch_id;
+        //     if ($request->filled('branch_id')) {
+        //         $requestedBranchId = (int) $request->branch_id;
 
-                if (! in_array($requestedBranchId, $assignedBranchIds)) {
-                    return response()->json([
-                        'status' => false,
-                        'message' => 'Unauthorized access to this branch products.',
-                    ], 403);
-                }
+        //         if (! in_array($requestedBranchId, $assignedBranchIds)) {
+        //             return response()->json([
+        //                 'status' => false,
+        //                 'message' => 'Unauthorized access to this branch products.',
+        //             ], 403);
+        //         }
 
-                $targetBranchIds = [$requestedBranchId];
-            } else {
-                $targetBranchIds = $assignedBranchIds;
-            }
+        //         $targetBranchIds = [$requestedBranchId];
+        //     } else {
+        //         $targetBranchIds = $assignedBranchIds;
+        //     }
 
-            $staffUserIds = DB::table('branch_staff')
-                ->whereIn('branch_id', $targetBranchIds)
-                ->pluck('user_id')
-                ->toArray();
+        //     $staffUserIds = DB::table('branch_staff')
+        //         ->whereIn('branch_id', $targetBranchIds)
+        //         ->pluck('user_id')
+        //         ->toArray();
 
-            $query->whereIn('created_by', $staffUserIds);
-        } elseif ($role === 'admin') {
-            if ($request->filled('branch_id')) {
-                $requestedBranchId = $request->branch_id;
+        //     $query->whereIn('created_by', $staffUserIds);
+        // } elseif ($role === 'admin') {
+        //     if ($request->filled('branch_id')) {
+        //         $requestedBranchId = $request->branch_id;
 
-                $staffUserIds = DB::table('branch_staff')
-                    ->where('branch_id', $requestedBranchId)
-                    ->pluck('user_id')
-                    ->toArray();
+        //         $staffUserIds = DB::table('branch_staff')
+        //             ->where('branch_id', $requestedBranchId)
+        //             ->pluck('user_id')
+        //             ->toArray();
 
-                $query->whereIn('created_by', $staffUserIds);
-            }
-        }
+        //         $query->whereIn('created_by', $staffUserIds);
+        //     }
+        // }
 
         $products = $query->get();
 

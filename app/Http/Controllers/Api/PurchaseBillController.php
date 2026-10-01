@@ -175,8 +175,9 @@ class PurchaseBillController extends Controller
         // Financial Year prefix (e.g., 2425)
         $fy = date('m') >= 4 ? date('y').(date('y') + 1) : (date('y') - 1).date('y');
 
+        // Filter by FY to reset sequence every financial year globally
         $lastSequence = PurchaseBill::withTrashed()
-            ->where('branch_id', $branchId)
+            ->where('inward_no', 'like', "INW/{$fy}/%")
             ->max('inward_sequence') ?? 0;
 
         $nextSequence = $lastSequence + 1;
