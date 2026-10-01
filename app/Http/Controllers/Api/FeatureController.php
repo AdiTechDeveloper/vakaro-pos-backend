@@ -13,7 +13,18 @@ class FeatureController extends Controller
 {
     public function index()
     {
-        return response()->json(['status' => true, 'data' => config('features')], 200);
+        $user = Auth::user();
+        $catalog = array_intersect_key(
+            config('features'),
+            array_flip(FeatureService::selectableFeatures())
+        );
+
+        if ($user && in_array($user->role, ['admin', 'manager'], true)) {
+            $allowed = FeatureService::assignedFeatures($user);
+            $catalog = array_intersect_key($catalog, array_flip($allowed));
+        }
+
+        return response()->json(['status' => true, 'data' => $catalog], 200);
     }
 
     public function myFeatures()
@@ -57,7 +68,7 @@ class FeatureController extends Controller
 
         return response()->json([
             'status' => true,
-            'data' => FeatureService::effectiveFeatures($manager),
+            'data' => FeatureService::assignedFeatures($manager),
             'available' => FeatureService::storeFeatures($authUser->store_id),
         ], 200);
     }
@@ -79,7 +90,7 @@ class FeatureController extends Controller
 
         return response()->json([
             'status' => true, 'message' => 'Manager features updated.',
-            'data' => FeatureService::effectiveFeatures($manager->fresh()),
+            'data' => FeatureService::assignedFeatures($manager->fresh()),
         ], 200);
     }
 }
