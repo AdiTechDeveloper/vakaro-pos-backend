@@ -33,8 +33,8 @@ Route::get('/staff/register-status', [App\Http\Controllers\Api\StaffController::
 Route::get('/staff/shift-summary', [StaffController::class, 'getShiftSummary'])->middleware('auth:sanctum');
 Route::post('/staff/close-register', [StaffController::class, 'closeRegister'])->middleware('auth:sanctum');
 Route::post('/open-register', [StaffController::class, 'openRegister'])->middleware('auth:sanctum');
-Route::post('/open-register', [StaffController::class, 'openRegister'])->middleware('auth:sanctum');
-Route::middleware('auth:sanctum')->group(function () {
+
+Route::middleware(['auth:sanctum', 'feature:reports_shift'])->group(function () {
     Route::get('/staff/shift-history', [StaffController::class, 'shiftHistory']);
 });
 
@@ -45,7 +45,6 @@ Route::post('/auth/emergency-system-override', [AuthController::class, 'emergenc
 Route::post('/login', [AuthController::class, 'login']);
 
 // store registration route
-
 Route::post('/pos-terminals/resolve', [PosTerminalController::class, 'resolve'])
     ->middleware('throttle:60,1');
 
@@ -174,10 +173,6 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::put('/products/{id}', [ProductController::class, 'update']);
     Route::delete('/products/{id}', [ProductController::class, 'destroy']);
     Route::get('/products/{id}/barcode', [ProductController::class, 'barcodeImage']);
-
-    // Expired products (Discart)
-    Route::get('/expired-products', [ProductController::class, 'getExpiredStock']);
-
     Route::put('/inventory/{inventoryId}/selling-price', [ProductController::class, 'updateSellingPrice']);
 });
 
@@ -254,6 +249,9 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_purchase'])->group(function () {
     Route::post('/reports/purchase', [ReportController::class, 'purchaseSummary']);
     Route::get('/reports/purchase-report', [PurchaseReportController::class, 'index']);
+});
+
+Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:price_override'])->group(function () {
     Route::get('price-override-report', [PriceOverrideController::class, 'index']);
 });
 
@@ -264,12 +262,16 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:stock_alerts'])->group(function () {
-    Route::get('/reports/stock-summary', [ReportController::class, 'stockSummary']);
+    Route::get('/expired-products', [ProductController::class, 'getExpiredStock']);
     Route::get('/reports/expiry-details', [ReportController::class, 'getExpiryReport']);
     Route::get('/stock-expiry-alerts', [StockExpiryController::class, 'stockExpiryAlerts']);
     Route::get('/stock-alerts', [StockAlertController::class, 'index']);
 });
 
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:customers'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_stock'])->group(function () {
+    Route::get('/reports/stock-summary', [ReportController::class, 'stockSummary']);
+});
+
+Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:advance_payments'])->group(function () {
     Route::get('/reports/advance-payments', [CustomerController::class, 'advanceReport']);
 });

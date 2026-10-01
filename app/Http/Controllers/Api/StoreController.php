@@ -96,11 +96,6 @@ class StoreController extends Controller
             $logoPath = null;
 
             if ($request->hasFile('logo')) {
-                // if (!empty($store->logo)) {
-                //     if (file_exists($store->logo)) {
-                //         unlink($store->logo);
-                //     }
-                // }
                 $file = $request->file('logo');
                 $filename = time().'_'.$file->getClientOriginalName();
                 $file->move('storage/store_logos/', $filename);
@@ -130,7 +125,7 @@ class StoreController extends Controller
                 'is_active' => true,
             ]);
 
-            FeatureService::setStoreFeatures($store->id, $validated['features']);
+            FeatureService::setStoreFeatures($store->id, $validated['features'] ?? []);
 
             DB::commit();
 
@@ -216,15 +211,13 @@ class StoreController extends Controller
                 $validated['logo'] = 'store_logos/'.$filename;
             }
 
-            $storeFeatures = $validated['features'] ?? null;
+            $storeFeatures = $validated['features'] ?? [];
             unset($validated['features']);
             $store->update($validated);
 
             if ($user->role === 'superadmin' && $storeFeatures !== null) {
                 FeatureService::setStoreFeatures($store->id, $storeFeatures);
             }
-
-            $store->update($validated);
 
             DB::commit();
 
