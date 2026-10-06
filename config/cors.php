@@ -9,7 +9,8 @@ return [
     'allowed_origins' => [
         'http://localhost:3000',
         'http://127.0.0.1:3000',
-        'https://loyality.theaditech.in', // Add your frontend URL here
+        'https://loyality.theaditech.in',
+        'https://pos.vakaro.in',
     ],
 
     'allowed_origins_patterns' => [],
