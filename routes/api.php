@@ -184,6 +184,15 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::put('/purchase-bill/{id}', [PurchaseBillController::class, 'update']);
     Route::get('/purchase-line', [PurchaseLineController::class, 'index']);
     Route::delete('purchase-bill/{id}', [PurchaseBillController::class, 'destroy']);
+
+     
+});
+
+Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_suplier'])->group(function () {
+
+ //suplier tracking
+     Route::get('/supplier-tracking', [PurchaseBillController::class, 'supplierRanking']);
+    Route::get('/supplier-tracking/{supplier}', [PurchaseBillController::class, 'supplierDetail']);
 });
 
 // Purchasebill return routes
@@ -194,6 +203,8 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     // purchase replacement
     Route::post('/purchase-replacement', [PurchaseReturnController::class, 'purchaseReplacement']);
     Route::post('/purchase-return', [PurchaseReturnController::class, 'purchaseReturn']);
+
+  
 });
 
 // Salesbill routes
@@ -275,3 +286,4 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:advance_payments'])->group(function () {
     Route::get('/reports/advance-payments', [CustomerController::class, 'advanceReport']);
 });
+

@@ -36,4 +36,5 @@ return [
     'reports_financial' => ['label' => 'Financial Report', 'group' => 'Reports'],
     'reports_gst'       => ['label' => 'GST Reports (Output, GSTR-3B, GSTR1)', 'group' => 'Reports'],
     'reports_shift'     => ['label' => 'Shift History Report', 'group' => 'Reports'],
+    'reports_suplier'   =>['label' => 'Suplier Tracking Report','group' => 'Reports']
 ];
