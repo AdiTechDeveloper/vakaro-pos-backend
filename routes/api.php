@@ -26,6 +26,7 @@ use App\Http\Controllers\Api\StockAlertController;
 use App\Http\Controllers\Api\StockExpiryController;
 use App\Http\Controllers\Api\StoreController;
 use App\Http\Controllers\Api\SupplierController;
+use App\Http\Controllers\CustomerPortalController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/staff/register-status', [App\Http\Controllers\Api\StaffController::class, 'getRegisterStatus'])
@@ -275,3 +276,16 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:advance_payments'])->group(function () {
     Route::get('/reports/advance-payments', [CustomerController::class, 'advanceReport']);
 });
+
+Route::post('/customer-portal/send-otp', [
+    CustomerPortalController::class,
+    'sendOtp',
+]);
+Route::post('/customer-portal/verify-otp', [
+    CustomerPortalController::class,
+    'verifyOtp',
+]);
+Route::get('/customer-portal/dashboard', [
+    CustomerPortalController::class,
+    'dashboard',
+]);
