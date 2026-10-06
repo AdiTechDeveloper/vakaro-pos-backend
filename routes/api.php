@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Api\AiInsightController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\BranchController;
 use App\Http\Controllers\Api\BrandController;
@@ -274,4 +275,10 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:advance_payments'])->group(function () {
     Route::get('/reports/advance-payments', [CustomerController::class, 'advanceReport']);
+});
+
+Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:ai_insights'])->group(function () {
+    Route::get('/ai-insights/branches', [AiInsightController::class, 'branches']);
+    Route::get('/ai-insights', [AiInsightController::class, 'latest']);
+    Route::post('/ai-insights/refresh', [AiInsightController::class, 'refresh']);
 });

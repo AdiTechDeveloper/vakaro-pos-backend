@@ -27,9 +27,11 @@ return Application::configure(basePath: dirname(__DIR__))
     ->withCommands([
         App\Console\Commands\DeleteExpiredTokens::class,
         App\Console\Commands\GenerateStockExpiryAlerts::class,
+        App\Console\Commands\GenerateAiInsights::class,
     ])
     ->withSchedule(function (\Illuminate\Console\Scheduling\Schedule $schedule) {
         $schedule->command('tokens:cleanup')->daily();
         $schedule->command('app:generate-stock-expiry-alerts')->daily();
+        $schedule->command('app:generate-ai-insights')->dailyAt('23:55');
     })
     ->create();
