@@ -1414,4 +1414,87 @@ class PurchaseBillController extends Controller
             ], 500);
         }
     }
+
+    public function supplierRanking(Request $request)
+    {
+        $query = PurchaseBill::query()
+            ->select(
+                'supplier_id',
+                DB::raw('SUM(total_amount) as total_amount'),
+                DB::raw('SUM(total_tax) as total_tax'),
+                DB::raw('COUNT(*) as bill_count')
+            )
+            ->groupBy('supplier_id');
+
+        if ($request->filled('date_from') && $request->filled('date_to')) {
+            $query->whereBetween('bill_date', [$request->date_from, $request->date_to]);
+        }
+        if ($request->filled('branch_id')) {
+            $query->where('branch_id', $request->branch_id);
+        }
+        if ($request->filled('store_id')) {
+            $query->where('store_id', $request->store_id);
+        }
+
+        $rows = $query->get();
+        $grandTotal = $rows->sum('total_amount');
+
+        $suppliers = Supplier::whereIn('id', $rows->pluck('supplier_id'))
+            ->pluck('name', 'id');
+
+        $result = $rows->map(function ($row) use ($suppliers, $grandTotal) {
+            return [
+                'supplier_id' => $row->supplier_id,
+                'supplier_name' => $suppliers[$row->supplier_id] ?? 'Unknown Supplier',
+                'total_amount' => (float) $row->total_amount,
+                'total_tax' => (float) $row->total_tax,
+                'bill_count' => (int) $row->bill_count,
+                'share_pct' => $grandTotal > 0
+                    ? round(($row->total_amount / $grandTotal) * 100, 1)
+                    : 0,
+            ];
+        })->sortByDesc('total_amount')->values();
+
+        return response()->json([
+            'suppliers' => $result,
+            'grand_total' => $grandTotal,
+        ]);
+    }
+
+    public function supplierDetail(Request $request, $Supplier)
+    {
+        $year = $request->get('year', now()->year);
+
+        $query = PurchaseBill::query()
+            ->where('supplier_id', $supplier)
+            ->whereYear('bill_date', $year);
+
+        if ($request->filled('branch_id')) {
+            $query->where('branch_id', $request->branch_id);
+        }
+        if ($request->filled('store_id')) {
+            $query->where('store_id', $request->store_id);
+        }
+
+        $bills = $query->orderByDesc('bill_date')->get([
+            'id', 'bill_no', 'bill_date', 'taxable_value', 'total_tax', 'total_amount', 'received',
+        ]);
+
+        $monthly = $bills
+            ->groupBy(fn ($b) => (int) date('n', strtotime($b->bill_date)))
+            ->map(fn ($group) => $group->sum('total_amount'));
+
+        $monthlyData = collect(range(1, 12))->map(fn ($m) => [
+            'month' => $m,
+            'total' => (float) ($monthly[$m] ?? 0),
+        ]);
+
+        return response()->json([
+            'supplier_name' => Supplier::find($supplier)?->name,
+            'year' => (int) $year,
+            'yearly_total' => (float) $bills->sum('total_amount'),
+            'monthly' => $monthlyData,
+            'bills' => $bills,
+        ]);
+    }
 }

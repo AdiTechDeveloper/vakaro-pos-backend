@@ -27,6 +27,7 @@ use App\Http\Controllers\Api\StockAlertController;
 use App\Http\Controllers\Api\StockExpiryController;
 use App\Http\Controllers\Api\StoreController;
 use App\Http\Controllers\Api\SupplierController;
+use App\Http\Controllers\CustomerPortalController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/staff/register-status', [App\Http\Controllers\Api\StaffController::class, 'getRegisterStatus'])
@@ -185,6 +186,14 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::put('/purchase-bill/{id}', [PurchaseBillController::class, 'update']);
     Route::get('/purchase-line', [PurchaseLineController::class, 'index']);
     Route::delete('purchase-bill/{id}', [PurchaseBillController::class, 'destroy']);
+
+});
+
+Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_suplier'])->group(function () {
+
+    // suplier tracking
+    Route::get('/supplier-tracking', [PurchaseBillController::class, 'supplierRanking']);
+    Route::get('/supplier-tracking/{supplier}', [PurchaseBillController::class, 'supplierDetail']);
 });
 
 // Purchasebill return routes
@@ -195,6 +204,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     // purchase replacement
     Route::post('/purchase-replacement', [PurchaseReturnController::class, 'purchaseReplacement']);
     Route::post('/purchase-return', [PurchaseReturnController::class, 'purchaseReturn']);
+
 });
 
 // Salesbill routes
@@ -282,3 +292,15 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::get('/ai-insights', [AiInsightController::class, 'latest']);
     Route::post('/ai-insights/refresh', [AiInsightController::class, 'refresh']);
 });
+Route::post('/customer-portal/send-otp', [
+    CustomerPortalController::class,
+    'sendOtp',
+]);
+Route::post('/customer-portal/verify-otp', [
+    CustomerPortalController::class,
+    'verifyOtp',
+]);
+Route::get('/customer-portal/dashboard', [
+    CustomerPortalController::class,
+    'dashboard',
+]);
