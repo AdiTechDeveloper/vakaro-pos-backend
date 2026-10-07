@@ -37,4 +37,30 @@ class SalesReportController extends Controller
             'filters_applied' => $filters,
         ]);
     }
+    public function monthlySales(Request $request): JsonResponse
+{
+    $request->validate([
+        'year' => 'nullable|integer|min:2000|max:2100',
+        'store_id' => 'nullable|integer',
+        'branch_id' => 'nullable|integer',
+        'bill_status' => 'nullable|string|in:all,pending,completed,cancelled',
+    ]);
+
+    $year = (int) ($request->input('year') ?: now()->year);
+
+    $filters = $this->service->resolveFilters([
+        'date_range' => 'custom',
+        'date_from' => "{$year}-01-01",
+        'date_to' => "{$year}-12-31",
+        'store_id' => $request->input('store_id'),
+        'branch_id' => $request->input('branch_id'),
+        'bill_status' => $request->input('bill_status', 'all'),
+    ]);
+
+    return response()->json([
+        'year' => $year,
+        'monthly_sales' => $this->service->getMonthlySales($filters),
+        'filters_applied' => $filters,
+    ]);
+}
 }

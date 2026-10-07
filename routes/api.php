@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Api\AiInsightController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\BranchController;
 use App\Http\Controllers\Api\BrandController;
@@ -186,13 +187,12 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::get('/purchase-line', [PurchaseLineController::class, 'index']);
     Route::delete('purchase-bill/{id}', [PurchaseBillController::class, 'destroy']);
 
-     
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_suplier'])->group(function () {
 
- //suplier tracking
-     Route::get('/supplier-tracking', [PurchaseBillController::class, 'supplierRanking']);
+    // suplier tracking
+    Route::get('/supplier-tracking', [PurchaseBillController::class, 'supplierRanking']);
     Route::get('/supplier-tracking/{supplier}', [PurchaseBillController::class, 'supplierDetail']);
 });
 
@@ -205,7 +205,6 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::post('/purchase-replacement', [PurchaseReturnController::class, 'purchaseReplacement']);
     Route::post('/purchase-return', [PurchaseReturnController::class, 'purchaseReturn']);
 
-  
 });
 
 // Salesbill routes
@@ -256,6 +255,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::post('/reports/sales-summary', [ReportController::class, 'salesSummary']);
     Route::post('/reports/sales-analytics', [ReportController::class, 'salesAnalytics']);
     Route::get('/reports/sales-report', [SalesReportController::class, 'index']);
+    Route::get('/reports/monthly-sales', [SalesReportController::class, 'monthlySales']);
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_purchase'])->group(function () {
@@ -288,6 +288,11 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::get('/reports/advance-payments', [CustomerController::class, 'advanceReport']);
 });
 
+Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:ai_insights'])->group(function () {
+    Route::get('/ai-insights/branches', [AiInsightController::class, 'branches']);
+    Route::get('/ai-insights', [AiInsightController::class, 'latest']);
+    Route::post('/ai-insights/refresh', [AiInsightController::class, 'refresh']);
+});
 Route::post('/customer-portal/send-otp', [
     CustomerPortalController::class,
     'sendOtp',
