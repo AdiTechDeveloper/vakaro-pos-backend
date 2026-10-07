@@ -1461,7 +1461,7 @@ class PurchaseBillController extends Controller
         ]);
     }
 
-    public function supplierDetail(Request $request, $Supplier)
+    public function supplierDetail(Request $request, $supplier)
     {
         $year = $request->get('year', now()->year);
 

@@ -17,7 +17,6 @@ class ReportController extends Controller
     {
         $user = Auth::user();
 
-        // Date range (default: today)
         $from = $request->filled('from_date')
             ? Carbon::parse($request->from_date)->startOfDay()
             : Carbon::today()->startOfDay();
@@ -26,34 +25,84 @@ class ReportController extends Controller
             ? Carbon::parse($request->to_date)->endOfDay()
             : Carbon::today()->endOfDay();
 
-        // Base query
         $query = DB::table('sales_bill_lines')
             ->whereBetween('created_at', [$from, $to]);
 
-        // Role-based branch filtering
+        /*
+        |--------------------------------------------------------------------------
+        | MANAGER
+        |--------------------------------------------------------------------------
+        */
+
         if ($user->role === 'manager') {
 
             $managerBranchIds = $user->branches()
                 ->pluck('branch_id')
                 ->toArray();
 
-            // Safety check
             if (! empty($managerBranchIds)) {
                 $query->whereIn('branch_id', $managerBranchIds);
             } else {
-                // Manager with no branches → no data
+                // Manager has no assigned branches
                 $query->whereRaw('1 = 0');
-            }
-        } elseif ($user->role === 'admin') {
-
-            // Admin selected a specific branch
-            if ($request->filled('branch_id')) {
-                $query->where('branch_id', $request->branch_id);
             }
         }
 
-        // Aggregation
-        $data = $query->selectRaw('
+        /*
+        |--------------------------------------------------------------------------
+        | ADMIN
+        |--------------------------------------------------------------------------
+        */
+
+        elseif ($user->role === 'admin') {
+
+            /*
+            |--------------------------------------------------------------------------
+            | Admin can see ONLY branches belonging to their store
+            |--------------------------------------------------------------------------
+            */
+
+            $adminBranchQuery = DB::table('branches')
+                ->where('store_id', $user->store_id);
+
+            /*
+            |--------------------------------------------------------------------------
+            | If admin selected a branch
+            |--------------------------------------------------------------------------
+            |
+            | We still verify that the selected branch belongs
+            | to the logged-in admin's store.
+            |
+            */
+
+            if ($request->filled('branch_id')) {
+
+                $adminBranchQuery->where('id', $request->branch_id);
+            }
+
+            $allowedBranchIds = $adminBranchQuery
+                ->pluck('id')
+                ->toArray();
+
+            if (! empty($allowedBranchIds)) {
+
+                $query->whereIn('branch_id', $allowedBranchIds);
+
+            } else {
+
+                // No valid branch = no data
+                $query->whereRaw('1 = 0');
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | AGGREGATION
+        |--------------------------------------------------------------------------
+        */
+
+        $data = $query
+            ->selectRaw('
             COALESCE(SUM(amount), 0) AS total_sales,
             COALESCE(SUM(cogs), 0) AS total_cogs,
             COALESCE(SUM(profit), 0) AS total_profit
@@ -63,11 +112,16 @@ class ReportController extends Controller
         return response()->json([
             'from_date' => $from->toDateString(),
             'to_date' => $to->toDateString(),
+
             'branch_id' => $request->branch_id ?? 'ALL',
-            'sales' => round($data->total_sales, 2),
-            'cogs' => round($data->total_cogs, 2),
-            'profit' => round($data->total_profit, 2),
-            'status' => $data->total_profit >= 0 ? 'profit' : 'loss',
+
+            'sales' => round((float) $data->total_sales, 2),
+            'cogs' => round((float) $data->total_cogs, 2),
+            'profit' => round((float) $data->total_profit, 2),
+
+            'status' => $data->total_profit >= 0
+                ? 'profit'
+                : 'loss',
         ]);
     }
 
