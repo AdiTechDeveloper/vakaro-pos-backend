@@ -255,6 +255,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::post('/reports/sales-summary', [ReportController::class, 'salesSummary']);
     Route::post('/reports/sales-analytics', [ReportController::class, 'salesAnalytics']);
     Route::get('/reports/sales-report', [SalesReportController::class, 'index']);
+    Route::get('/reports/monthly-sales', [SalesReportController::class, 'monthlySales']);
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_purchase'])->group(function () {
