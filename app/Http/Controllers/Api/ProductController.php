@@ -14,66 +14,123 @@ use Milon\Barcode\Facades\DNS1DFacade as DNS1D;
 
 class ProductController extends Controller
 {
+    // public function getAllProducts(Request $request)
+    // {
+    //     $user = Auth::user();
+    //     $role = $user->role;
+    //     $storeId = $user->store_id;
+
+    //     $query = Product::where('store_id', $storeId)->with('brand', 'category', 'gstRate');
+
+    //     // if ($role === 'manager') {
+    //     //     $assignedBranchIds = DB::table('branch_staff')
+    //     //         ->where('user_id', $user->id)
+    //     //         ->pluck('branch_id')
+    //     //         ->toArray();
+
+    //     //     if (empty($assignedBranchIds)) {
+    //     //         return response()->json(['status' => true, 'products' => []], 200);
+    //     //     }
+
+    //     //     if ($request->filled('branch_id')) {
+    //     //         $requestedBranchId = (int) $request->branch_id;
+
+    //     //         if (! in_array($requestedBranchId, $assignedBranchIds)) {
+    //     //             return response()->json([
+    //     //                 'status' => false,
+    //     //                 'message' => 'Unauthorized access to this branch products.',
+    //     //             ], 403);
+    //     //         }
+
+    //     //         $targetBranchIds = [$requestedBranchId];
+    //     //     } else {
+    //     //         $targetBranchIds = $assignedBranchIds;
+    //     //     }
+
+    //     //     $staffUserIds = DB::table('branch_staff')
+    //     //         ->whereIn('branch_id', $targetBranchIds)
+    //     //         ->pluck('user_id')
+    //     //         ->toArray();
+
+    //     //     $query->whereIn('created_by', $staffUserIds);
+    //     // } elseif ($role === 'admin') {
+    //     //     if ($request->filled('branch_id')) {
+    //     //         $requestedBranchId = $request->branch_id;
+
+    //     //         $staffUserIds = DB::table('branch_staff')
+    //     //             ->where('branch_id', $requestedBranchId)
+    //     //             ->pluck('user_id')
+    //     //             ->toArray();
+
+    //     //         $query->whereIn('created_by', $staffUserIds);
+    //     //     }
+    //     // }
+
+    //     $products = $query->get();
+
+    //     return response()->json([
+    //         'status' => true,
+    //         'products' => $products,
+    //     ], 200);
+    // }
     public function getAllProducts(Request $request)
-    {
-        $user = Auth::user();
-        $role = $user->role;
-        $storeId = $user->store_id;
+{
+    $user = Auth::user();
+    $role = $user->role;
+    $storeId = $user->store_id;
 
-        $query = Product::where('store_id', $storeId)->with('brand', 'category', 'gstRate');
+    $query = Product::where('store_id', $storeId)
+        ->with([
+            'brand',
+            'category',
+            'gstRate',
+        ]);
 
-        // if ($role === 'manager') {
-        //     $assignedBranchIds = DB::table('branch_staff')
-        //         ->where('user_id', $user->id)
-        //         ->pluck('branch_id')
-        //         ->toArray();
+    $branchId = null;
 
-        //     if (empty($assignedBranchIds)) {
-        //         return response()->json(['status' => true, 'products' => []], 200);
-        //     }
+    // Manager ko sirf apni assigned branch ka stock milega
+    if ($role === 'manager') {
+        $branchId = $user->branch_id;
 
-        //     if ($request->filled('branch_id')) {
-        //         $requestedBranchId = (int) $request->branch_id;
+        if (!$branchId) {
+            $branchId = DB::table('branch_staff')
+                ->where('user_id', $user->id)
+                ->value('branch_id');
+        }
 
-        //         if (! in_array($requestedBranchId, $assignedBranchIds)) {
-        //             return response()->json([
-        //                 'status' => false,
-        //                 'message' => 'Unauthorized access to this branch products.',
-        //             ], 403);
-        //         }
-
-        //         $targetBranchIds = [$requestedBranchId];
-        //     } else {
-        //         $targetBranchIds = $assignedBranchIds;
-        //     }
-
-        //     $staffUserIds = DB::table('branch_staff')
-        //         ->whereIn('branch_id', $targetBranchIds)
-        //         ->pluck('user_id')
-        //         ->toArray();
-
-        //     $query->whereIn('created_by', $staffUserIds);
-        // } elseif ($role === 'admin') {
-        //     if ($request->filled('branch_id')) {
-        //         $requestedBranchId = $request->branch_id;
-
-        //         $staffUserIds = DB::table('branch_staff')
-        //             ->where('branch_id', $requestedBranchId)
-        //             ->pluck('user_id')
-        //             ->toArray();
-
-        //         $query->whereIn('created_by', $staffUserIds);
-        //     }
-        // }
-
-        $products = $query->get();
-
-        return response()->json([
-            'status' => true,
-            'products' => $products,
-        ], 200);
+        if (!$branchId) {
+            return response()->json([
+                'status' => true,
+                'products' => [],
+            ], 200);
+        }
     }
 
+    // Admin selected branch ke according stock dekhega
+    elseif ($role === 'admin') {
+        if ($request->filled('branch_id')) {
+            $branchId = (int) $request->branch_id;
+        }
+    }
+
+    $query->with([
+        'inventories' => function ($inventoryQuery) use ($branchId) {
+            if ($branchId) {
+                $inventoryQuery->where(
+                    'branch_id',
+                    $branchId
+                );
+            }
+        },
+    ]);
+
+    $products = $query->get();
+
+    return response()->json([
+        'status' => true,
+        'products' => $products,
+    ], 200);
+}
     public function index(Request $request)
     {
         $user = Auth::user();
@@ -81,7 +138,7 @@ class ProductController extends Controller
         if ($user->role === 'admin') {
             $storeBranchIds = Branch::where('store_id', $storeId)
                 ->pluck('id')
-                ->map(fn ($id) => (int) $id)
+                ->map(fn($id) => (int) $id)
                 ->toArray();
 
             if ($request->filled('branch_id')) {
@@ -104,7 +161,7 @@ class ProductController extends Controller
                 $q->where('brand_id', $request->brand_id);
             })
             ->when($request->search, function ($q) use ($request) {
-                $q->where('name', 'like', '%'.$request->search.'%');
+                $q->where('name', 'like', '%' . $request->search . '%');
             })
             ->with(['store', 'brand', 'category', 'gstRate'])
             ->with(['inventories' => function ($q) use ($branchIds) {
@@ -176,7 +233,7 @@ class ProductController extends Controller
                 ];
             })->values();
 
-            $prices = $batches->pluck('selling_price')->filter(fn ($p) => ! is_null($p));
+            $prices = $batches->pluck('selling_price')->filter(fn($p) => ! is_null($p));
 
             $data = $product->toArray();
             $data['min_price'] = $prices->min();
@@ -228,7 +285,7 @@ class ProductController extends Controller
         $checkDigit = (10 - ($sum % 10)) % 10;
 
         // Final barcode
-        return $base.$checkDigit;
+        return $base . $checkDigit;
     }
 
     public function store(Request $request)
@@ -299,7 +356,7 @@ class ProductController extends Controller
             $request->validate([
                 'name' => 'required|string',
                 'is_price_override' => 'nullable|boolean',
-                'barcode' => 'nullable|string|unique:products,barcode,'.$id,
+                'barcode' => 'nullable|string|unique:products,barcode,' . $id,
             ]);
 
             $user = Auth::user();
@@ -415,7 +472,6 @@ class ProductController extends Controller
                 // From PRODUCTS table
                 'is_price_override' => (int) $product->is_price_override,
             ], 200);
-
         } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
