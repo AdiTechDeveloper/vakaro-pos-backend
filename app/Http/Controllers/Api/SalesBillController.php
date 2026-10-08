@@ -127,7 +127,7 @@ class SalesBillController extends Controller
         ]);
     }
 
-    public function index()
+    public function index(Request $request)
     {
         $user = Auth::user();
 
@@ -154,6 +154,10 @@ class SalesBillController extends Controller
                         'message' => 'No branch assigned to this manager.',
                     ], 400);
                 }
+            }
+
+            if ($request->has('limit')) {
+                $query->limit((int) $request->query('limit'));
             }
 
             $bills = $query->get();
