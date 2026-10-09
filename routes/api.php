@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\AIController;
 use App\Http\Controllers\Api\AiInsightController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\BranchController;
@@ -305,3 +306,13 @@ Route::get('/customer-portal/dashboard', [
     CustomerPortalController::class,
     'dashboard',
 ]);
+
+
+
+
+// ai api
+Route::middleware(['auth:sanctum'])->group(function () {
+
+    Route::post('/ai/chat', [AIController::class, 'chat']);
+
+});
