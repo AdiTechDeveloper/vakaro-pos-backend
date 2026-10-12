@@ -22,12 +22,12 @@ class CustomerAdvanceDeposit extends Model
 
     public function user()
     {
-        return $this->belongsTo(User::class);
+        return $this->belongsTo(User::class)->withTrashed();
     }
 
     public function receivedBy()
     {
-        return $this->belongsTo(User::class, 'received_by');
+        return $this->belongsTo(User::class, 'received_by')->withTrashed();
     }
 
     public function branch()

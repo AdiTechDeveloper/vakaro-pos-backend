@@ -75,6 +75,16 @@ class AuthController extends Controller
                 ->where('is_active', true)
                 ->first();
 
+            if (! $user) {
+                $trashed = User::onlyTrashed()->where('username', $request->username)->first();
+
+                if ($trashed && Hash::check($request->password, (string) $trashed->password)) {
+                    return response()->json(['message' => 'Your account has been removed. Please contact admin.'], 403);
+                }
+
+                return response()->json(['message' => 'Invalid credentials'], 401);
+            }
+
             if (! $user || ! Hash::check($request->password, $user->password)) {
                 return response()->json(['message' => 'Invalid credentials'], 401);
             }
