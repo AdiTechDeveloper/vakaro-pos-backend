@@ -1,7 +1,9 @@
 <?php
 
+use App\Http\Controllers\Api\AiSalesReportDownloadController;
 use App\Http\Controllers\AIController;
 use App\Http\Controllers\Api\AiInsightController;
+use App\Http\Controllers\Api\AiReportDownloadController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\BranchController;
 use App\Http\Controllers\Api\BrandController;
@@ -266,6 +268,11 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::post('/reports/sales-analytics', [ReportController::class, 'salesAnalytics']);
     Route::get('/reports/sales-report', [SalesReportController::class, 'index']);
     Route::get('/reports/monthly-sales', [SalesReportController::class, 'monthlySales']);
+    Route::post(
+    '/reports/ai-sales-download',
+    [AiSalesReportDownloadController::class, 'download']
+);
+Route::post('/reports/ai-report-download', [AiReportDownloadController::class, 'download']);
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_purchase'])->group(function () {

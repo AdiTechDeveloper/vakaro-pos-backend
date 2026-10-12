@@ -64,16 +64,16 @@ class PosTestDataSeeder extends Seeder
             $categoryIds = $categories->values()->all();
             $brandIds = $brands->values()->all();
 
-           $gst5Record = $gstRates->firstWhere('rate', '5.00')
-    ?? $gstRates->firstWhere('rate', 5)
-    ?? $gstRates->first();
+            $gst5Record = $gstRates->firstWhere('rate', '5.00')
+                ?? $gstRates->firstWhere('rate', 5)
+                ?? $gstRates->first();
 
-$gst3Record = $gstRates->firstWhere('rate', '3.00')
-    ?? $gstRates->firstWhere('rate', 3)
-    ?? $gst5Record;
+            $gst3Record = $gstRates->firstWhere('rate', '3.00')
+                ?? $gstRates->firstWhere('rate', 3)
+                ?? $gst5Record;
 
-$gst5 = $gst5Record->id;
-$gst3 = $gst3Record->id;
+            $gst5 = $gst5Record->id;
+            $gst3 = $gst3Record->id;
 
             $suppliers = [
                 ['name' => 'Ahmedabad Wholesale Traders', 'gstin' => '24ABCDE1234F1Z5', 'contact' => '9876501001'],
@@ -143,39 +143,39 @@ $gst3 = $gst3Record->id;
                 ['name' => 'Bluetooth Speaker', 'sku' => 'DEMO-SPK-001', 'barcode' => '8901000000010', 'mrp' => 1999, 'price' => 1699, 'cost' => 1250, 'gst' => $gst3, 'category' => 0, 'brand' => 1],
             ];
 
-           
-foreach ($products as $index => $product) {
-    $categoryId = $product['category'] == 1
-        ? 3
-        : 2;
 
-    $brandId = $product['brand'] == 1
-        ? 1
-        : 2;
+            foreach ($products as $index => $product) {
+                $categoryId = $product['category'] == 1
+                    ? 3
+                    : 2;
 
-    DB::table('products')->updateOrInsert(
-        ['sku' => $product['sku']],
-        [
-            'store_id' => $storeId,
-            'barcode' => $product['barcode'],
-            'name' => $product['name'],
-            'brand_id' => $brandId,
-            'category_id' => $categoryId,
-            'hsn_code' => $categoryId == 3 ? '190590' : '847160',
-            'gst_rate_id' => $product['gst'],
-            'mrp' => $product['mrp'],
-            'selling_price' => $product['price'],
-            'cost_price' => $product['cost'],
-            'created_by' => $userId,
-            'updated_by' => $userId,
-            'stock' => 0,
-            'gst_inclusive' => 1,
-            'is_price_override' => 0,
-            'created_at' => $now,
-            'updated_at' => $now,
-        ]
-    );
-}
+                $brandId = $product['brand'] == 1
+                    ? 1
+                    : 2;
+
+                DB::table('products')->updateOrInsert(
+                    ['sku' => $product['sku']],
+                    [
+                        'store_id' => $storeId,
+                        'barcode' => $product['barcode'],
+                        'name' => $product['name'],
+                        'brand_id' => $brandId,
+                        'category_id' => $categoryId,
+                        'hsn_code' => $categoryId == 3 ? '190590' : '847160',
+                        'gst_rate_id' => $product['gst'],
+                        'mrp' => $product['mrp'],
+                        'selling_price' => $product['price'],
+                        'cost_price' => $product['cost'],
+                        'created_by' => $userId,
+                        'updated_by' => $userId,
+                        'stock' => 0,
+                        'gst_inclusive' => 1,
+                        'is_price_override' => 0,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ]
+                );
+            }
 
             // Create purchase bills and inventory batches
             $demoProducts = DB::table('products')

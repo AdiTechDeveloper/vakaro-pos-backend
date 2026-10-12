@@ -12,7 +12,6 @@ use Carbon\Carbon;
 class AIController extends Controller
 {
 
-   
 public function chat(
     Request $request,
     SalesReportService $salesReportService,
@@ -58,13 +57,23 @@ public function chat(
     // Deterministically fetch product names for list-style inventory questions.
     // This avoids depending on the LLM to decide whether to call the inventory tool.
     $latestMessage = trim((string) $request->input('message', ''));
+
+    // Report/download requests must go to the AI + report tool, not the product list shortcut.
+    $isReportRequest = preg_match(
+        '/\b(report|download|export|pdf|excel|xlsx)\b/iu',
+        $latestMessage
+    ) === 1;
+
     $isProductListRequest = preg_match(
         '/\b(saare|sare|sabhi|sab|all|list|show|naam|names?)\b.{0,80}\b(products?|items?|inventory)\b|\b(products?|items?)\b.{0,80}\b(naam|names?|list|saare|sare|sabhi|sab|all)\b/iu',
         $latestMessage
     ) === 1;
 
-    if ($isProductListRequest) {
+    if ($isProductListRequest && !$isReportRequest) {
         try {
+            // Shortcut replies are fixed text, so pick English vs Hinglish from the user's message.
+            $isEnglish = str_contains($this->languageDirective($latestMessage), 'English only');
+
             $inventory = $this->getProductStockDetails(
                 $user,
                 $branchId,
@@ -82,7 +91,9 @@ public function chat(
             if (empty($products)) {
                 return response()->json([
                     'status' => true,
-                    'message' => 'Aapke selected data scope mein koi product nahi mila.',
+                    'message' => $isEnglish
+                        ? 'No products were found in your selected data scope.'
+                        : 'Aapke selected data scope mein koi product nahi mila.',
                     'data' => $inventory,
                 ]);
             }
@@ -100,9 +111,13 @@ public function chat(
             }
 
             $total = (int) ($inventory['total_products'] ?? count($products));
-            $message = "Aapke selected data scope mein total {$total} products hain.\n\n" . $table;
+            $message = ($isEnglish
+                ? "There are {$total} products in your selected data scope.\n\n"
+                : "Aapke selected data scope mein total {$total} products hain.\n\n") . $table;
             if (($inventory['total_pages'] ?? 1) > 1) {
-                $message .= "\nYe pehle 100 products hain. Total pages: " . $inventory['total_pages'] . '. Agli list ke liye next page maangiye.';
+                $message .= $isEnglish
+                    ? "\nThese are the first 100 products. Total pages: " . $inventory['total_pages'] . '. Ask for the next page to see more.'
+                    : "\nYe pehle 100 products hain. Total pages: " . $inventory['total_pages'] . '. Agli list ke liye next page maangiye.';
             }
 
             return response()->json([
@@ -139,7 +154,11 @@ public function chat(
         [
             [
                 'role' => 'user',
-                'content' => $request->message,
+                // The language directive is only sent to the AI. The user never sees it
+                // and the original message is what gets saved in the chat history.
+                'content' => $request->message
+                    . "\n\n(Instruction for the assistant, never mention it: "
+                    . $this->languageDirective((string) $request->message) . ')',
             ],
         ]
     );
@@ -169,6 +188,70 @@ public function chat(
                         ],
                     ],
                     'required' => ['date_range'],
+                ],
+            ],
+        ],
+        [
+            'type' => 'function',
+            'function' => [
+                'name' => 'prepare_sales_report_download',
+                'description' => 'Use ONLY when the user explicitly asks to download/export/get a sales report file. Prepares a download button for the frontend. Do not use for normal sales questions.',
+                'parameters' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'format' => [
+                            'type' => 'string',
+                            'enum' => ['pdf', 'excel'],
+                            'description' => 'Use excel ONLY if the user said excel/xlsx/sheet. Otherwise use pdf.',
+                        ],
+                        'date_range' => [
+                            'type' => 'string',
+                            'enum' => ['today', 'yesterday', 'last_7_days', 'this_month', 'last_month', 'custom'],
+                            'description' => 'Use custom for a specific month, year or date range, and then fill date_from and date_to.',
+                        ],
+                        'date_from' => [
+                            'type' => 'string',
+                            'description' => 'YYYY-MM-DD, only for custom.',
+                        ],
+                        'date_to' => [
+                            'type' => 'string',
+                            'description' => 'YYYY-MM-DD, only for custom.',
+                        ],
+                    ],
+                    'required' => ['date_range'],
+                ],
+            ],
+        ],
+        [
+            'type' => 'function',
+            'function' => [
+                'name' => 'prepare_report_download',
+                'description' => 'Use ONLY when the user explicitly asks to download/export a NON-sales report file: stock/inventory report, low stock report, out of stock report, supplier dues report, top selling products report, or purchase suggestions report. Prepares a download button for the frontend. For SALES reports use prepare_sales_report_download instead.',
+                'parameters' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'report_type' => [
+                            'type' => 'string',
+                            'enum' => ['inventory', 'low_stock', 'out_of_stock', 'supplier_dues', 'top_selling', 'purchase_suggestions', 'product_profit', 'branch_comparison', 'purchase_report'],
+                            'description' => 'inventory = full stock list, low_stock = products running low, out_of_stock = zero stock products, supplier_dues = supplier purchase/paid/outstanding, top_selling = best selling products for a period, purchase_suggestions = what to reorder, product_profit = product-wise revenue and profit for a period, branch_comparison = all branches sales/profit comparison for a period (admin only), purchase_report = purchase bills with paid and due for a period.',
+                        ],
+                        'format' => [
+                            'type' => 'string',
+                            'enum' => ['pdf', 'excel'],
+                            'description' => 'Use excel ONLY if the user said excel/xlsx/sheet. Otherwise use pdf.',
+                        ],
+                        'date_range' => [
+                            'type' => 'string',
+                            'enum' => ['today', 'yesterday', 'last_7_days', 'this_month', 'last_month', 'custom'],
+                            'description' => 'Only for top_selling, product_profit, branch_comparison and purchase_report (default this_month). Other reports are current snapshots and ignore this.',
+                        ],
+                        'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for period reports with custom range.'],
+                        'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for period reports with custom range.'],
+                        'threshold' => ['type' => 'integer', 'description' => 'Only for low_stock. Default 10.'],
+                        'limit' => ['type' => 'integer', 'description' => 'Only for top_selling. Number of products, default 20, max 100.'],
+                        'cover_days' => ['type' => 'integer', 'description' => 'Only for purchase_suggestions. Default 7.'],
+                    ],
+                    'required' => ['report_type'],
                 ],
             ],
         ],
@@ -416,6 +499,7 @@ public function chat(
         ],
     ];
 
+    $download = null;
     $maxToolRounds = 4;
 
     for ($round = 0; $round <= $maxToolRounds; $round++) {
@@ -461,6 +545,8 @@ public function chat(
             return response()->json([
                 'status' => true,
                 'message' => $assistantMessage['content'] ?? '',
+                // Only set when the user actually asked for a report file.
+                'download' => $download,
             ]);
         }
 
@@ -504,6 +590,13 @@ public function chat(
                 ];
             }
 
+            if (
+                in_array($functionName, ['prepare_sales_report_download', 'prepare_report_download'], true)
+                && !empty($toolResult['download'])
+            ) {
+                $download = $toolResult['download'];
+            }
+
             $messages[] = [
                 'role' => 'tool',
                 'tool_call_id' => $toolCall['id'] ?? '',
@@ -523,6 +616,36 @@ public function chat(
 }
 
 
+    /**
+     * Decides which language/script the AI must reply in, based ONLY on the user's latest message.
+     * The result is appended to the user message (AI-only) so the model cannot drift
+     * to the language of earlier history or of the system prompt examples.
+     */
+    private function languageDirective(string $text): string
+    {
+        // Gujarati script
+        if (preg_match('/\p{Gujarati}/u', $text)) {
+            return 'Reply language: Gujarati, written in Gujarati script.';
+        }
+
+        // Hindi / Marathi etc. in Devanagari
+        if (preg_match('/\p{Devanagari}/u', $text)) {
+            return 'Reply language: the same language as this message (Hindi/Marathi), written in Devanagari script.';
+        }
+
+        // Any other non-Latin script (Tamil, Bengali, Arabic, ...)
+        if (preg_match('/(?!\p{Latin})\p{L}/u', $text)) {
+            return 'Reply language: the same language and script as this message.';
+        }
+
+        // Hindi / Gujarati / other Indian language typed in Roman letters
+        if (preg_match('/\b(hai|hain|kya|kitna|kitni|kitne|aaj|aaje|kal|batao|bataiye|dikhao|dikha|mujhe|mere|meri|mera|kaise|kyun|kyu|nahi|nahin|haan|chahiye|karo|karna|mein|aur|wala|wali|sabhi|saare|chhe|chho|ketli|ketla|kem|tame|maru|tamaru|mare|mane|shu|joie|batavo)\b/iu', $text)) {
+            return 'Reply language: the same language as this message (Hinglish or another Indian language typed in Roman letters), written in Roman letters only. Do not switch to English or to a native script.';
+        }
+
+        return 'Reply language: English only. Do not use Hindi, Hinglish or Gujarati words, even if earlier messages in this conversation were in another language.';
+    }
+
     private function executeBusinessTool(
         string $functionName,
         array $arguments,
@@ -534,6 +657,18 @@ public function chat(
             case 'get_sales_summary':
                 return $this->getSalesSummary(
                     $salesReportService,
+                    $user,
+                    $branchId,
+                    $arguments
+                );
+            case 'prepare_sales_report_download':
+                return $this->prepareSalesReportDownload(
+                    $user,
+                    $branchId,
+                    $arguments
+                );
+            case 'prepare_report_download':
+                return $this->prepareReportDownload(
                     $user,
                     $branchId,
                     $arguments
@@ -589,6 +724,177 @@ public function chat(
             default:
                 return ['error' => 'Unknown business tool.'];
         }
+    }
+
+    /**
+     * Prepares the data the frontend needs to show a download button.
+     * Format is excel only if the user asked for it, otherwise pdf.
+     */
+    private function prepareSalesReportDownload(
+        $user,
+        ?int $branchId,
+        array $arguments
+     ): array {
+        if ($user->role === 'manager' && !$branchId) {
+            return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
+        }
+
+        $format = ($arguments['format'] ?? 'pdf') === 'excel' ? 'excel' : 'pdf';
+        $range = $arguments['date_range'] ?? 'this_month';
+        $today = Carbon::today();
+
+        switch ($range) {
+            case 'today':
+                $from = $today->copy();
+                $to = $today->copy();
+                break;
+            case 'yesterday':
+                $from = $today->copy()->subDay();
+                $to = $from->copy();
+                break;
+            case 'last_7_days':
+                $from = $today->copy()->subDays(6);
+                $to = $today->copy();
+                break;
+            case 'last_month':
+                $from = $today->copy()->subMonthNoOverflow()->startOfMonth();
+                $to = $from->copy()->endOfMonth();
+                break;
+            case 'custom':
+                try {
+                    $from = Carbon::createFromFormat(
+                        'Y-m-d',
+                        (string) ($arguments['date_from'] ?? '')
+                    )->startOfDay();
+                    $to = Carbon::createFromFormat(
+                        'Y-m-d',
+                        (string) ($arguments['date_to'] ?? '')
+                    )->startOfDay();
+                } catch (\Throwable $e) {
+                    return ['error' => 'Valid date range nahi mili. Month ya dates batayein.'];
+                }
+                if ($from->gt($to)) {
+                    return ['error' => 'Start date end date se badi nahi ho sakti.'];
+                }
+                break;
+            default: // this_month
+                $from = $today->copy()->startOfMonth();
+                $to = $today->copy();
+                break;
+        }
+
+        return [
+            'download' => [
+                'report_type' => 'sales',
+                'title' => 'Sales Report',
+                'format' => $format,
+                'date_from' => $from->toDateString(),
+                'date_to' => $to->toDateString(),
+                'branch_id' => $branchId ?? 0,
+            ],
+            'message' => 'Download button user ko dikhaya jayega. Short confirmation do, report ka data chat mein paste mat karo.',
+        ];
+    }
+
+    /**
+     * Prepares a download button for non-sales reports.
+     * Snapshot reports (stock etc.) use today's date; top_selling uses the requested period.
+     */
+    private function prepareReportDownload(
+        $user,
+        ?int $branchId,
+        array $arguments
+     ): array {
+        if ($user->role === 'manager' && !$branchId) {
+            return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
+        }
+
+        $titles = [
+            'inventory' => 'Stock Report',
+            'low_stock' => 'Low Stock Report',
+            'out_of_stock' => 'Out of Stock Report',
+            'supplier_dues' => 'Supplier Dues Report',
+            'top_selling' => 'Top Selling Products Report',
+            'purchase_suggestions' => 'Purchase Suggestions Report',
+            'product_profit' => 'Profit Report (Product-wise)',
+            'branch_comparison' => 'Branch Comparison Report',
+            'purchase_report' => 'Purchase Report',
+        ];
+
+        $type = (string) ($arguments['report_type'] ?? '');
+        if (!isset($titles[$type])) {
+            return ['error' => 'Ye report type supported nahi hai.'];
+        }
+
+        if ($type === 'purchase_suggestions' && !$branchId) {
+            return ['error' => 'Purchase suggestions report ke liye pehle ek branch select karein.'];
+        }
+
+        $format = ($arguments['format'] ?? 'pdf') === 'excel' ? 'excel' : 'pdf';
+        $today = Carbon::today();
+        $from = $today->copy();
+        $to = $today->copy();
+
+        if ($type === 'branch_comparison' && $user->role !== 'admin') {
+            return ['error' => 'Branch comparison report sirf admin download kar sakta hai.'];
+        }
+
+        if (in_array($type, ['top_selling', 'product_profit', 'branch_comparison', 'purchase_report'], true)) {
+            $range = $arguments['date_range'] ?? 'this_month';
+            switch ($range) {
+                case 'today':
+                    break;
+                case 'yesterday':
+                    $from = $today->copy()->subDay();
+                    $to = $from->copy();
+                    break;
+                case 'last_7_days':
+                    $from = $today->copy()->subDays(6);
+                    break;
+                case 'last_month':
+                    $from = $today->copy()->subMonthNoOverflow()->startOfMonth();
+                    $to = $from->copy()->endOfMonth();
+                    break;
+                case 'custom':
+                    try {
+                        $from = Carbon::createFromFormat('Y-m-d', (string) ($arguments['date_from'] ?? ''))->startOfDay();
+                        $to = Carbon::createFromFormat('Y-m-d', (string) ($arguments['date_to'] ?? ''))->startOfDay();
+                    } catch (\Throwable $e) {
+                        return ['error' => 'Valid date range nahi mili. Month ya dates batayein.'];
+                    }
+                    if ($from->gt($to)) {
+                        return ['error' => 'Start date end date se badi nahi ho sakti.'];
+                    }
+                    break;
+                default: // this_month
+                    $from = $today->copy()->startOfMonth();
+                    break;
+            }
+        }
+
+        $options = [];
+        if ($type === 'low_stock') {
+            $options['threshold'] = max(0, min((int) ($arguments['threshold'] ?? 10), 100000));
+        }
+        if ($type === 'top_selling') {
+            $options['limit'] = max(1, min((int) ($arguments['limit'] ?? 20), 100));
+        }
+        if ($type === 'purchase_suggestions') {
+            $options['cover_days'] = max(1, min((int) ($arguments['cover_days'] ?? 7), 30));
+        }
+
+        return [
+            'download' => [
+                'report_type' => $type,
+                'title' => $titles[$type],
+                'format' => $format,
+                'date_from' => $from->toDateString(),
+                'date_to' => $to->toDateString(),
+                'branch_id' => $branchId ?? 0,
+                'options' => $options,
+            ],
+            'message' => 'Download button user ko dikhaya jayega. Short confirmation do, report ka data chat mein paste mat karo.',
+        ];
     }
 
     private function getSalesSummary(
@@ -1540,7 +1846,7 @@ public function chat(
             'note' => 'Historical rates only, not current quotations. Aggregates are based on the latest 500 matching purchase rows returned by the query.',
         ];
     }
-  
+
 public function scanPurchaseBill(
     Request $request,
     \App\Services\AIProviderService $aiProviderService
@@ -1685,28 +1991,29 @@ PROMPT;
         $scope = $user->role === 'manager'
             ? "The user is a manager and can only access branch {$branchId}."
             : 'The user is an admin and can access all branches belonging to their store. If no specific branch is explicitly requested, aggregate data across ALL branches in the store.';
+        $today = Carbon::today()->toDateString();
         return <<<PROMPT
-                You are the AI Business Assistant for a POS system.
+       You are the AI Business Assistant for a POS system.
                 You answer questions about the user's actual business data.
+                Today's date: {$today}
                 Important rules:
         1. Never invent sales, stock, purchase, profit or financial numbers.
         2. When the user asks about actual business data, use the available business tools.
         3. The database result is the source of truth.
         4. Give concise, clear and easy-to-understand answers.
-        5. LANGUAGE RULE: Always respond in the same language as the user's latest message.
-        6. If the user asks in English, respond entirely in English.
-        7. If the user asks in Hindi or Hinglish, respond in Roman Hindi / Hinglish using English letters only.
-        8. NEVER use Hindi/Devanagari script in any response. This rule is mandatory.
-        9. For Hindi questions written in English letters, answer naturally in Roman Hinglish. Do not translate the answer into Devanagari.
-        10. For mixed English and Hindi questions, respond in the language that dominates the user's latest message.
-        11. Before sending the final answer, check that no Devanagari characters are present. If any appear, rewrite the response in Roman Hinglish or English according to the user's language.
+        5. LANGUAGE RULE (mandatory): Reply in the same language AND the same script as the user's latest message. Decide this only from the user's latest message, never from earlier history, tool results or these instructions.
+        6. Mapping: English message -> English reply. Hinglish (Hindi typed in Roman letters) -> Hinglish in Roman letters. Hindi typed in Devanagari -> Hindi in Devanagari. Gujarati typed in Gujarati script -> Gujarati script. Gujarati typed in Roman letters -> Gujarati language written in Roman letters (never switch to English or Hindi). The same applies to Marathi, Punjabi, Bengali, Tamil, Telugu, Kannada, Malayalam, Urdu and any other language: same language, same script as the user typed.
+        7. If the user explicitly asks for a language (for example "Gujarati mein batao" or "answer in Hindi"), use that language. Write it in the script the user is typing in: Roman letters if the message is in Roman letters, native script if the message is in native script.
+        8. For mixed messages, use the language that dominates the message. Very short follow-ups such as "ok", "yes", "haan", "1" keep the language and script of your previous reply.
+        9. Never translate or change data returned by tools: product names, branch names, supplier names, SKUs, dates, numbers and amounts stay exactly as returned. Table headings and all explanation text follow the user's language. Markdown tables must stay valid.
+        10. Short confirmations (for example report ready), "data not found" messages and error explanations must also follow the user's language and script.
+        11. Before sending the final answer, silently check that the language and script match the user's latest message. If not, rewrite the answer.
         12. Examples:
-            - User: "HOW MUCH SALE TODAY?"
-            Answer: "Today's total sales are ₹0.00. No bills were processed today."
-            - User: "AAJ KI SALE KITNI HAI?"
-            Answer: "Aaj ki total sale ₹0.00 hai. Aaj koi bill process nahi hua."
-            - User: "Mere low stock products batao."
-            Answer: "Ye aapke low-stock products hain..."
+            - User: "HOW MUCH SALE TODAY?" -> "Today's total sales are ₹0.00. No bills were processed today."
+            - User: "AAJ KI SALE KITNI HAI?" -> "Aaj ki total sale ₹0.00 hai. Aaj koi bill process nahi hua."
+            - User: "आज की सेल कितनी है?" -> "आज की कुल सेल ₹0.00 है। आज कोई बिल नहीं बना।"
+            - User: "આજની સેલ કેટલી છે?" -> "આજની કુલ સેલ ₹0.00 છે. આજે કોઈ બિલ બન્યું નથી."
+            - User: "Aaj ni sale ketli chhe?" (Gujarati in Roman letters) -> "Aaj ni total sale ₹0.00 chhe. Aaje koi bill banyu nathi."
         13. For zero available stock, always call get_out_of_stock_products.
         14. For reorder suggestions, always call get_purchase_suggestions. Explain that recommendations are estimates based on the last 30 days of sales. Purchase suggestions require one branch because inventory and demand are branch-specific. If an admin names a branch, pass that exact branch name in branch_name; never ask for a numeric ID. If no branch is named, ask which branch by its NAME, not numeric ID. Never silently choose a branch or combine branches for purchase suggestions. Managers use their assigned branch, regardless of any branch name in the message. Distinguish the product name from the branch name: if the user says 'XYZ-EDITED ke liye product purchase suggestion', treat XYZ-EDITED as product_name, not branch_name. If product name is given but no branch is given, ask which branch name to use.
         14a. If the user asks how many branches they have or asks to list branch names, call get_branches and answer from its count/list. Do not say there is no branch-listing tool.
@@ -1736,7 +2043,11 @@ PROMPT;
         37. When the user asks for detailed inventory, all product names with quantities, or product-wise stock, always call get_product_stock_details. Present product_name and available_qty clearly. Never answer these questions using only aggregate stock totals.
         38. If the inventory tool returns multiple pages, explain the total product count and offer to show the next page. Never claim that one page contains every product if more pages exist.
         39. When the user asks for product name, selling price and quantity in a table, call get_product_stock_details and return a Markdown table with Product Name, Selling Price, and Available Quantity. Use only values returned by the tool.
-        
+        40. When the user asks to download, export or get a sales REPORT (file), call prepare_sales_report_download. Use format "excel" only if the user mentioned Excel/xlsx/sheet; otherwise use "pdf". For a month or year (for example "September 2026" or "2026"), use date_range "custom" with exact date_from and date_to. If no period is mentioned, use this_month. After the tool call, reply in one short line in the user's language and script (for example, English: "Your sales report is ready, download it using the button below.") and never paste the report data. If the user asks for CSV or Word, say only PDF and Excel are supported and prepare a PDF. If the tool returns an error, report it honestly and do not claim a download is ready.
+        41. For normal sales questions (how much sold, today's sales etc.) do NOT call prepare_sales_report_download.
+        42. For downloading/exporting stock or inventory, low stock, out of stock, supplier dues, top selling products, purchase suggestions, product-wise profit, branch comparison or purchase bills as a file, call prepare_report_download with the matching report_type (use prepare_sales_report_download only for SALES reports). Choose format "excel" only if the user mentioned Excel/xlsx/sheet, otherwise "pdf". After the tool call reply in one short line in the user's language and script and never paste the report data. Only call it when the user asks for a downloadable report/file; for normal questions like "which products are low on stock" use the normal tools and answer in chat.
+        43. SUPPORTED downloadable reports (PDF or Excel): Sales report, Stock report, Low stock report, Out of stock report, Supplier dues report, Top selling products report, Purchase suggestions report, Profit report (product-wise), Branch comparison report (admin only), Purchase report. If the user asks to download a report that is NOT in this list (for example GST report, customer report, expense report, expiry report, staff report, payment method report, or any other custom report), do NOT call any tool and do NOT invent data. Reply briefly in the user's language and script that this report is not available for download yet, and list the available reports above so they can pick one. If the user asks for Word or CSV, say only PDF and Excel are supported. If the nearest available report could still help, suggest it.
+
         **TABLE FORMATTING RULES**
 
         1. When the user asks for data in a table, always format the response as a clean Markdown table.
@@ -1749,6 +2060,16 @@ PROMPT;
         8. After the table, provide a short summary with important totals when the backend provides them.
         9. If the user asks for a table, do not return the same data only as a paragraph or bullet list.
         10. Use Markdown table syntax and keep the response readable on desktop and mobile.
+
+        11. Every Markdown table must contain:
+            - One header row
+            - One separator row, such as |---|---:|---|
+            - One data row per record
+        12. Never output table rows without a valid header separator.
+        13. Never wrap Markdown tables in code fences.
+        14. Keep the table as raw Markdown in the response text.
+        15. Do not replace table formatting with pipe-separated plain text.
+
             User role:
             {$user->role}
             Store ID:

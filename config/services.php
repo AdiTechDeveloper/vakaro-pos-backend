@@ -55,21 +55,19 @@ return [
     'gemini' => [
         'api_key' => env('GEMINI_API_KEY'),
         'base_url' => 'https://generativelanguage.googleapis.com/v1beta/openai',
-        'model' => env('GEMINI_MODEL', 'gemini-3.5-flash-lite'),
-        'vision_model' => env(
-            'GEMINI_VISION_MODEL',
-            'gemini-3.1-flash-lite'
-        ),
+        'models' => [
+            'chat'   => [env('GEMINI_TEXT_PRIMARY'), env('GEMINI_TEXT_SECONDARY')],
+            'vision' => [env('GEMINI_VISION_PRIMARY'), env('GEMINI_VISION_SECONDARY')],
+        ],
     ],
 
     'groq' => [
         'api_key' => env('GROQ_API_KEY'),
         'base_url' => 'https://api.groq.com/openai/v1',
-        'model' => env('GROQ_MODEL', 'openai/gpt-oss-20b'),
-        'vision_model' => env(
-            'GROQ_VISION_MODEL',
-            'qwen/qwen3.8-27b'
-        ),
+        'models' => [
+            'chat'   => [env('GROQ_TEXT_PRIMARY'), env('GROQ_TEXT_SECONDARY')],
+            'vision' => [env('GROQ_VISION_PRIMARY'), env('GROQ_VISION_SECONDARY')],
+        ],
     ],
 
 
