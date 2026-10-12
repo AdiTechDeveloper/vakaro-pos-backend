@@ -89,7 +89,6 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'check.a
     Route::put('/staff/{id}', [StaffController::class, 'update']);
     Route::delete('/staff/{id}', [StaffController::class, 'destroy']);
     Route::patch('/staff/{id}/toggle-status', [StaffController::class, 'toggleActive']);
-
 });
 
 // --- core / always-allowed (cashier's own register + password change) ---
@@ -155,6 +154,14 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::post('/suppliers', [SupplierController::class, 'store']);
     Route::put('/suppliers/{id}', [SupplierController::class, 'update']);
     Route::delete('/suppliers/{id}', [SupplierController::class, 'destroy']);
+    Route::get('/suppliers/{id}/purchase-history', [
+    SupplierController::class,
+    'purchaseHistory',
+]);
+Route::get(
+    '/suppliers/rate-comparison',
+    [SupplierController::class, 'rateComparison']
+);
 });
 
 // GST Rate routes
@@ -187,7 +194,10 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::put('/purchase-bill/{id}', [PurchaseBillController::class, 'update']);
     Route::get('/purchase-line', [PurchaseLineController::class, 'index']);
     Route::delete('purchase-bill/{id}', [PurchaseBillController::class, 'destroy']);
-
+    Route::post('/purchase-bill/scan', [
+    AIController::class,
+    'scanPurchaseBill'
+])->middleware('throttle:10,1');
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_suplier'])->group(function () {
@@ -205,7 +215,6 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     // purchase replacement
     Route::post('/purchase-replacement', [PurchaseReturnController::class, 'purchaseReplacement']);
     Route::post('/purchase-return', [PurchaseReturnController::class, 'purchaseReturn']);
-
 });
 
 // Salesbill routes
@@ -294,18 +303,14 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::get('/ai-insights', [AiInsightController::class, 'latest']);
     Route::post('/ai-insights/refresh', [AiInsightController::class, 'refresh']);
 });
-Route::post('/customer-portal/send-otp', [
-    CustomerPortalController::class,
-    'sendOtp',
-]);
-Route::post('/customer-portal/verify-otp', [
-    CustomerPortalController::class,
-    'verifyOtp',
-]);
-Route::get('/customer-portal/dashboard', [
-    CustomerPortalController::class,
-    'dashboard',
-]);
+
+
+
+Route::prefix('customer-portal')->group(function () {
+    Route::post('/send-otp', [CustomerPortalController::class, 'sendOtp']);
+    Route::post('/verify-otp', [CustomerPortalController::class, 'verifyOtp']);
+    Route::get('/dashboard', [CustomerPortalController::class, 'dashboard']);
+});
 
 
 
@@ -314,5 +319,4 @@ Route::get('/customer-portal/dashboard', [
 Route::middleware(['auth:sanctum'])->group(function () {
 
     Route::post('/ai/chat', [AIController::class, 'chat']);
-
 });

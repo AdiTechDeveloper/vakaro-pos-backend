@@ -8,13 +8,17 @@ class CustomerPortalOtp extends Model
 {
     protected $fillable = [
         'mobile',
-        'otp',
+        'otp_hash',
         'expires_at',
         'verified_at',
+        'attempts',
     ];
 
-    protected $casts = [
-        'expires_at' => 'datetime',
-        'verified_at' => 'datetime',
-    ];
+    protected function casts(): array
+    {
+        return [
+            'expires_at' => 'datetime',
+            'verified_at' => 'datetime',
+        ];
+    }
 }

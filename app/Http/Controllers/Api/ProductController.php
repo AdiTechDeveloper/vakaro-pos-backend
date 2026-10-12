@@ -10,6 +10,7 @@ use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
+
 use Milon\Barcode\Facades\DNS1DFacade as DNS1D;
 
 class ProductController extends Controller
@@ -481,43 +482,117 @@ class ProductController extends Controller
         }
     }
 
+    // public function destroy($id)
+    // {
+    //     try {
+    //         $user = Auth::user();
+
+    //         if (! in_array($user->role, ['admin', 'manager'])) {
+    //             return response()->json([
+    //                 'status' => false,
+    //                 'message' => 'Unauthorized',
+    //             ], 403);
+    //         }
+
+    //         $storeId = Auth::user()->store_id;
+
+    //         $product = Product::where('store_id', $storeId)->where('id', $id)->first();
+
+    //         if (! $product) {
+    //             return response()->json([
+    //                 'status' => false,
+    //                 'message' => 'Product not found',
+    //             ], 404);
+    //         }
+
+    //         $product->delete();
+
+    //         return response()->json([
+    //             'status' => true,
+    //             'message' => 'Product deleted successfully',
+    //         ], 200);
+    //     } catch (\Exception $e) {
+    //         return response()->json([
+    //             'status' => false,
+    //             'message' => 'An error occurred while deleting the product.',
+    //             'error' => $e->getMessage(),
+    //         ], 500);
+    //     }
+    // }
+
     public function destroy($id)
-    {
-        try {
-            $user = Auth::user();
+{
+    try {
+        $user = Auth::user();
 
-            if (! in_array($user->role, ['admin', 'manager'])) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Unauthorized',
-                ], 403);
-            }
-
-            $storeId = Auth::user()->store_id;
-
-            $product = Product::where('store_id', $storeId)->where('id', $id)->first();
-
-            if (! $product) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Product not found',
-                ], 404);
-            }
-
-            $product->delete();
-
-            return response()->json([
-                'status' => true,
-                'message' => 'Product deleted successfully',
-            ], 200);
-        } catch (\Exception $e) {
+        if (! in_array($user->role, ['admin', 'manager'])) {
             return response()->json([
                 'status' => false,
-                'message' => 'An error occurred while deleting the product.',
-                'error' => $e->getMessage(),
-            ], 500);
+                'message' => 'Unauthorized',
+            ], 403);
         }
+
+        $storeId = $user->store_id;
+
+        $product = Product::where('store_id', $storeId)
+            ->where('id', $id)
+            ->first();
+
+        if (! $product) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Product not found',
+            ], 404);
+        }
+
+        $hasInventory = DB::table('inventories')
+            ->where('product_id', $product->id)
+            ->exists();
+
+        $hasPurchaseHistory = DB::table('purchase_lines')
+            ->where('product_id', $product->id)
+            ->exists();
+
+        $hasSalesHistory = DB::table('sales_bill_lines')
+            ->where('product_id', $product->id)
+            ->exists();
+
+        $hasSalesReturnHistory = DB::table('sales_return_lines')
+            ->where('product_id', $product->id)
+            ->exists();
+
+        $hasPurchaseReturnHistory = DB::table('purchase_return_lines')
+            ->where('product_id', $product->id)
+            ->exists();
+
+        if (
+            $hasInventory ||
+            $hasPurchaseHistory ||
+            $hasSalesHistory ||
+            $hasSalesReturnHistory ||
+            $hasPurchaseReturnHistory
+        ) {
+            return response()->json([
+                'status' => false,
+                'message' => 'This product has inventory or transaction history and cannot be permanently deleted. Mark it inactive instead.',
+            ], 409);
+        }
+
+        $product->delete();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Product deleted successfully',
+        ], 200);
+
+    } catch (\Exception $e) {
+        return response()->json([
+            'status' => false,
+            'message' => 'An error occurred while deleting the product.',
+            'error' => $e->getMessage(),
+        ], 500);
     }
+}
 
     public function barcodeImage($id)
     {
