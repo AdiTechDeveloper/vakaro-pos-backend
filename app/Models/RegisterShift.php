@@ -31,7 +31,7 @@ class RegisterShift extends Model
     // Relationship: A shift belongs to a user (staff/cashier)
     public function user()
     {
-        return $this->belongsTo(\App\Models\User::class, 'user_id');
+        return $this->belongsTo(\App\Models\User::class, 'user_id')->withTrashed();
     }
 
     // Relationship: A shift belongs to a branch

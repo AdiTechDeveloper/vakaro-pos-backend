@@ -10,7 +10,6 @@ use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
-
 use Milon\Barcode\Facades\DNS1DFacade as DNS1D;
 
 class ProductController extends Controller
@@ -75,63 +74,76 @@ class ProductController extends Controller
     //     ], 200);
     // }
     public function getAllProducts(Request $request)
-{
-    $user = Auth::user();
-    $role = $user->role;
-    $storeId = $user->store_id;
+    {
+        $user = Auth::user();
+        $role = $user->role;
+        $storeId = $user->store_id;
 
-    $query = Product::where('store_id', $storeId)
-        ->with([
-            'brand',
-            'category',
-            'gstRate',
+        $query = Product::where('store_id', $storeId)
+            ->with([
+                'brand',
+                'category',
+                'gstRate',
+            ]);
+
+        $branchId = null;
+
+        if ($role === 'manager') {
+            $branchId = $user->branch_id;
+
+            if (! $branchId) {
+                $branchId = DB::table('branch_staff')
+                    ->where('user_id', $user->id)
+                    ->value('branch_id');
+            }
+
+            if (! $branchId) {
+                return response()->json([
+                    'status' => true,
+                    'products' => [],
+                ], 200);
+            }
+        } elseif ($role === 'admin') {
+            if ($request->filled('branch_id')) {
+                $branchId = (int) $request->branch_id;
+            }
+        }
+
+        $query->addSelect([
+            'total_stock' => Inventory::selectRaw('COALESCE(SUM(qty - sold_qty), 0)')
+                ->whereColumn('inventories.product_id', 'products.id')
+                ->whereNull('inventories.deleted_at')
+                ->when($branchId, fn ($q) => $q->where('inventories.branch_id', $branchId))
+                ->whereColumn('inventories.sold_qty', '<', 'inventories.qty')
+                ->where(function ($q) {
+                    $q->whereNull('inventories.expiry_date')
+                        ->orWhere('inventories.expiry_date', '>=', now()->toDateString());
+                }),
         ]);
 
-    $branchId = null;
+        $query->with([
+            'inventories' => function ($inventoryQuery) use ($branchId) {
+                $inventoryQuery->whereNull('deleted_at')
+                    ->whereColumn('sold_qty', '<', 'qty')
+                    ->where(function ($q) {
+                        $q->whereNull('expiry_date')
+                            ->orWhere('expiry_date', '>=', now()->toDateString());
+                    });
 
-    // Manager ko sirf apni assigned branch ka stock milega
-    if ($role === 'manager') {
-        $branchId = $user->branch_id;
+                if ($branchId) {
+                    $inventoryQuery->where('branch_id', $branchId);
+                }
+            },
+        ]);
 
-        if (!$branchId) {
-            $branchId = DB::table('branch_staff')
-                ->where('user_id', $user->id)
-                ->value('branch_id');
-        }
+        $products = $query->get();
 
-        if (!$branchId) {
-            return response()->json([
-                'status' => true,
-                'products' => [],
-            ], 200);
-        }
+        return response()->json([
+            'status' => true,
+            'products' => $products,
+        ], 200);
     }
 
-    // Admin selected branch ke according stock dekhega
-    elseif ($role === 'admin') {
-        if ($request->filled('branch_id')) {
-            $branchId = (int) $request->branch_id;
-        }
-    }
-
-    $query->with([
-        'inventories' => function ($inventoryQuery) use ($branchId) {
-            if ($branchId) {
-                $inventoryQuery->where(
-                    'branch_id',
-                    $branchId
-                );
-            }
-        },
-    ]);
-
-    $products = $query->get();
-
-    return response()->json([
-        'status' => true,
-        'products' => $products,
-    ], 200);
-}
     public function index(Request $request)
     {
         $user = Auth::user();
@@ -139,7 +151,7 @@ class ProductController extends Controller
         if ($user->role === 'admin') {
             $storeBranchIds = Branch::where('store_id', $storeId)
                 ->pluck('id')
-                ->map(fn($id) => (int) $id)
+                ->map(fn ($id) => (int) $id)
                 ->toArray();
 
             if ($request->filled('branch_id')) {
@@ -162,7 +174,7 @@ class ProductController extends Controller
                 $q->where('brand_id', $request->brand_id);
             })
             ->when($request->search, function ($q) use ($request) {
-                $q->where('name', 'like', '%' . $request->search . '%');
+                $q->where('name', 'like', '%'.$request->search.'%');
             })
             ->with(['store', 'brand', 'category', 'gstRate'])
             ->with(['inventories' => function ($q) use ($branchIds) {
@@ -234,7 +246,7 @@ class ProductController extends Controller
                 ];
             })->values();
 
-            $prices = $batches->pluck('selling_price')->filter(fn($p) => ! is_null($p));
+            $prices = $batches->pluck('selling_price')->filter(fn ($p) => ! is_null($p));
 
             $data = $product->toArray();
             $data['min_price'] = $prices->min();
@@ -286,7 +298,7 @@ class ProductController extends Controller
         $checkDigit = (10 - ($sum % 10)) % 10;
 
         // Final barcode
-        return $base . $checkDigit;
+        return $base.$checkDigit;
     }
 
     public function store(Request $request)
@@ -357,7 +369,7 @@ class ProductController extends Controller
             $request->validate([
                 'name' => 'required|string',
                 'is_price_override' => 'nullable|boolean',
-                'barcode' => 'nullable|string|unique:products,barcode,' . $id,
+                'barcode' => 'nullable|string|unique:products,barcode,'.$id,
             ]);
 
             $user = Auth::user();
@@ -521,78 +533,78 @@ class ProductController extends Controller
     // }
 
     public function destroy($id)
-{
-    try {
-        $user = Auth::user();
+    {
+        try {
+            $user = Auth::user();
 
-        if (! in_array($user->role, ['admin', 'manager'])) {
+            if (! in_array($user->role, ['admin', 'manager'])) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Unauthorized',
+                ], 403);
+            }
+
+            $storeId = $user->store_id;
+
+            $product = Product::where('store_id', $storeId)
+                ->where('id', $id)
+                ->first();
+
+            if (! $product) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Product not found',
+                ], 404);
+            }
+
+            $hasInventory = DB::table('inventories')
+                ->where('product_id', $product->id)
+                ->exists();
+
+            $hasPurchaseHistory = DB::table('purchase_lines')
+                ->where('product_id', $product->id)
+                ->exists();
+
+            $hasSalesHistory = DB::table('sales_bill_lines')
+                ->where('product_id', $product->id)
+                ->exists();
+
+            $hasSalesReturnHistory = DB::table('sales_return_lines')
+                ->where('product_id', $product->id)
+                ->exists();
+
+            $hasPurchaseReturnHistory = DB::table('purchase_return_lines')
+                ->where('product_id', $product->id)
+                ->exists();
+
+            if (
+                $hasInventory ||
+                $hasPurchaseHistory ||
+                $hasSalesHistory ||
+                $hasSalesReturnHistory ||
+                $hasPurchaseReturnHistory
+            ) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'This product has inventory or transaction history and cannot be permanently deleted. Mark it inactive instead.',
+                ], 409);
+            }
+
+            $product->delete();
+
+            return response()->json([
+                'status' => true,
+                'message' => 'Product deleted successfully',
+            ], 200);
+
+        } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
-                'message' => 'Unauthorized',
-            ], 403);
+                'message' => 'An error occurred while deleting the product.',
+                'error' => $e->getMessage(),
+            ], 500);
         }
-
-        $storeId = $user->store_id;
-
-        $product = Product::where('store_id', $storeId)
-            ->where('id', $id)
-            ->first();
-
-        if (! $product) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Product not found',
-            ], 404);
-        }
-
-        $hasInventory = DB::table('inventories')
-            ->where('product_id', $product->id)
-            ->exists();
-
-        $hasPurchaseHistory = DB::table('purchase_lines')
-            ->where('product_id', $product->id)
-            ->exists();
-
-        $hasSalesHistory = DB::table('sales_bill_lines')
-            ->where('product_id', $product->id)
-            ->exists();
-
-        $hasSalesReturnHistory = DB::table('sales_return_lines')
-            ->where('product_id', $product->id)
-            ->exists();
-
-        $hasPurchaseReturnHistory = DB::table('purchase_return_lines')
-            ->where('product_id', $product->id)
-            ->exists();
-
-        if (
-            $hasInventory ||
-            $hasPurchaseHistory ||
-            $hasSalesHistory ||
-            $hasSalesReturnHistory ||
-            $hasPurchaseReturnHistory
-        ) {
-            return response()->json([
-                'status' => false,
-                'message' => 'This product has inventory or transaction history and cannot be permanently deleted. Mark it inactive instead.',
-            ], 409);
-        }
-
-        $product->delete();
-
-        return response()->json([
-            'status' => true,
-            'message' => 'Product deleted successfully',
-        ], 200);
-
-    } catch (\Exception $e) {
-        return response()->json([
-            'status' => false,
-            'message' => 'An error occurred while deleting the product.',
-            'error' => $e->getMessage(),
-        ], 500);
     }
-}
 
     public function barcodeImage($id)
     {
@@ -741,7 +753,8 @@ class ProductController extends Controller
             ], 200);
         }
 
-        $query = Inventory::with('product:id,name', 'branch:id,name')
+        $query = Inventory::with(['product' => fn ($q) => $q->withTrashed()->select('id', 'name'),
+            'branch:id,name', ])
             ->whereIn('branch_id', $branchIds)
             ->whereNotNull('expiry_date')
             ->whereColumn('sold_qty', '<', 'qty');

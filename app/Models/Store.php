@@ -28,6 +28,6 @@ class Store extends Model
 
     public function users()
     {
-        return $this->hasMany(User::class, 'store_id');
+        return $this->hasMany(User::class, 'store_id')->withTrashed();
     }
 }

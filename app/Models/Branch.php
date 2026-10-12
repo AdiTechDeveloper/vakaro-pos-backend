@@ -26,11 +26,11 @@ class Branch extends Model
 
     public function users()
     {
-        return $this->hasMany(User::class);
+        return $this->hasMany(User::class)->withTrashed();
     }
 
     public function staff(): BelongsToMany
     {
-        return $this->belongsToMany(User::class, 'branch_staff');
+        return $this->belongsToMany(User::class, 'branch_staff')->withTrashed();
     }
 }

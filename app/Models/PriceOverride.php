@@ -32,7 +32,7 @@ class PriceOverride extends Model
 
     public function overriddenBy()
     {
-        return $this->belongsTo(User::class, 'overridden_by');
+        return $this->belongsTo(User::class, 'overridden_by')->withTrashed();
     }
 
     // THIS WAS MISSING: Added branch relationship

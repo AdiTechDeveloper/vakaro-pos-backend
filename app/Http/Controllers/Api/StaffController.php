@@ -9,6 +9,7 @@ use App\Models\User;
 use App\Services\FeatureService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
@@ -162,7 +163,7 @@ class StaffController extends Controller
             return response()->json(['message' => 'Forbidden'], 403);
         }
 
-        $query = RegisterShift::with('user:id,name,username')
+        $query = RegisterShift::with(['user' => fn ($q) => $q->withTrashed()->select('id', 'name', 'username')])
             ->where('status', 'closed')
             ->orderBy('closed_at', 'desc');
 
@@ -355,7 +356,7 @@ class StaffController extends Controller
             if ($data['role'] === 'manager' && array_key_exists('features', $data)) {
                 FeatureService::setUserFeatures($staff, $data['features'] ?? []);
             }
-    
+
             return response()->json(['status' => true, 'message' => 'Staff updated', 'data' => $staff->load('branches')], 200);
         } catch (\Exception $e) {
             return response()->json(['status' => false, 'error' => $e->getMessage()], 500);
@@ -399,19 +400,50 @@ class StaffController extends Controller
     public function destroy($id)
     {
         $authUser = Auth::user();
-        $staff = User::find($id);
+
+        if (! in_array($authUser->role, ['admin', 'manager'], true)) {
+            return response()->json(['status' => false, 'message' => 'Forbidden'], 403);
+        }
+
+        $staff = User::where('store_id', $authUser->store_id)->find($id);
+
         if (! $staff) {
-            return response()->json(['message' => 'Staff not found'], 404);
+            return response()->json(['status' => false, 'message' => 'Staff not found'], 404);
         }
 
-        if ($authUser->store_id !== $staff->store_id) {
-            return response()->json(['message' => 'Staff not found'], 404);
+        if ($staff->id === $authUser->id) {
+            return response()->json(['status' => false, 'message' => 'You cannot delete your own account'], 422);
         }
 
-        $staff->branches()->detach();
-        $staff->delete();
+        if (! in_array($staff->role, ['manager', 'cashier'], true)) {
+            return response()->json(['status' => false, 'message' => 'This user cannot be deleted'], 403);
+        }
 
-        return response()->json(['status' => true, 'message' => 'Deleted successfully'], 200);
+        if ($authUser->role === 'manager') {
+            $managerBranchIds = $authUser->branches()->pluck('branches.id');
+            $sameBranch = $staff->role === 'cashier'
+                && $staff->branches()->whereIn('branches.id', $managerBranchIds)->exists();
+
+            if (! $sameBranch) {
+                return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
+            }
+        }
+
+        $hasOpenShift = RegisterShift::where('user_id', $staff->id)->where('status', 'open')->exists();
+        if ($hasOpenShift) {
+            return response()->json([
+                'status' => false,
+                'message' => 'This staff has an open register shift. Close it before deleting.',
+            ], 409);
+        }
+
+        DB::transaction(function () use ($staff, $authUser) {
+            $staff->tokens()->delete();
+            $staff->update(['deleted_by' => $authUser->id, 'is_active' => false]);
+            $staff->delete();
+        });
+
+        return response()->json(['status' => true, 'message' => 'Staff deleted successfully'], 200);
     }
 
     public function toggleActive(Request $request, $id)
