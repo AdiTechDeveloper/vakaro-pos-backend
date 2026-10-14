@@ -3,6 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Services\SalesReportService;
+use App\Models\AiConversation;
+use App\Models\AiMessage;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
@@ -19,6 +21,7 @@ public function chat(
  ) {
     $request->validate([
         'message' => ['required', 'string', 'max:2000'],
+        'conversation_id' => ['nullable', 'integer', 'min:1'],
         'branch_id' => ['nullable', 'integer', 'min:0'],
         'history' => ['nullable', 'array', 'max:20'],
         'history.*.role' => ['required', 'in:user,assistant'],
@@ -41,6 +44,22 @@ public function chat(
         ], 403);
     }
 
+    // Conversation must belong to the authenticated user.
+    $conversation = null;
+    if ($request->filled('conversation_id')) {
+        $conversation = AiConversation::query()
+            ->where('id', $request->integer('conversation_id'))
+            ->where('user_id', $user->id)
+            ->first();
+
+        if (!$conversation) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Conversation not found.',
+            ], 404);
+        }
+    }
+
     // Admin ke liye branch_id = 0 means all branches.
     $requestedBranchId = $request->input('branch_id');
 
@@ -52,6 +71,13 @@ public function chat(
         $user,
         $requestedBranchId
     );
+
+    if ($conversation && (int) ($conversation->branch_id ?? 0) !== (int) ($branchId ?? 0)) {
+        return response()->json([
+            'status' => false,
+            'message' => 'This conversation belongs to a different branch scope. Start a new chat for the selected branch.',
+        ], 422);
+    }
 
 
     // Deterministically fetch product names for list-style inventory questions.
@@ -89,7 +115,7 @@ public function chat(
 
             $products = $inventory['products'] ?? [];
             if (empty($products)) {
-                return response()->json([
+                return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
                     'status' => true,
                     'message' => $isEnglish
                         ? 'No products were found in your selected data scope.'
@@ -120,7 +146,7 @@ public function chat(
                     : "\nYe pehle 100 products hain. Total pages: " . $inventory['total_pages'] . '. Agli list ke liye next page maangiye.';
             }
 
-            return response()->json([
+            return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
                 'status' => true,
                 'message' => $message,
                 'data' => $inventory,
@@ -134,14 +160,104 @@ public function chat(
         }
     }
 
-    $history = collect($request->input('history', []))
-        ->take(-10)
-        ->map(fn ($item) => [
-            'role' => $item['role'],
-            'content' => $item['content'],
-        ])
-        ->values()
-        ->all();
+    // Deterministic shortcut for "how many branches / branch names" questions.
+    // The LLM was guessing (e.g. "0 branches") instead of calling get_branches,
+    // so this answers straight from the database. Branch IDs are NOT shown to the user.
+    $mentionsBranch = preg_match(
+        '/\b(branch|branches)\b/iu',
+        $latestMessage
+    ) === 1;
+
+    $asksBranchCountOrList = preg_match(
+        '/\b(how many|kitni|kitne|ketli|ketla|count|list|names?|naam)\b/iu',
+        $latestMessage
+    ) === 1;
+
+    // Do not hijack questions that are really about sales/stock/etc. of a branch.
+    $mentionsOtherTopic = preg_match(
+        '/\b(sales?|sale|stock|inventory|products?|items?|suppliers?|profit|purchase|payment|bills?|revenue|compare|comparison)\b/iu',
+        $latestMessage
+    ) === 1;
+
+    $isBranchRequest = $mentionsBranch
+        && $asksBranchCountOrList
+        && !$mentionsOtherTopic
+        && !$isReportRequest;
+
+    if ($isBranchRequest) {
+        try {
+            $result = $this->getBranches($user, $branchId);
+
+            if (!empty($result['error'])) {
+                return response()->json([
+                    'status' => false,
+                    'message' => $result['error'],
+                ], 422);
+            }
+
+            $isEnglish = str_contains($this->languageDirective($latestMessage), 'English only');
+            $count = (int) ($result['count'] ?? 0);
+
+            if ($count === 0) {
+                return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
+                    'status' => true,
+                    'message' => $isEnglish
+                        ? 'You do not have any branches in your store yet.'
+                        : 'Aapke store mein abhi koi branch nahi hai.',
+                    'data' => $result,
+                ]);
+            }
+
+            $message = $isEnglish
+                ? "You have {$count} branch(es) in your store.\n\n"
+                : "Aapke store mein total {$count} branch hain.\n\n";
+
+            $message .= "| Branch Name |\n|---|\n";
+            foreach ($result['branches'] as $b) {
+                $branchName = str_replace(['|', "\r", "\n"], ['\\|', ' ', ' '], (string) ($b['branch_name'] ?? ''));
+                $message .= "| {$branchName} |\n";
+            }
+
+            return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
+                'status' => true,
+                'message' => $message,
+                'data' => $result,
+            ]);
+        } catch (\Throwable $exception) {
+            report($exception);
+            return response()->json([
+                'status' => false,
+                'message' => 'Branch list load nahi ho payi. Server logs check karein.',
+            ], 500);
+        }
+    }
+
+    // When a database conversation is supplied, load history from MySQL rather
+    // than trusting client-provided history. Keep the old history path temporarily
+    // for the frontend until it is migrated in the next step.
+    if ($conversation) {
+        $history = $conversation->messages()
+            ->whereIn('role', ['user', 'assistant'])
+            ->orderByDesc('id')
+            ->limit(10)
+            ->get(['role', 'content'])
+            ->reverse()
+            ->map(fn ($item) => [
+                'role' => $item->role,
+                'content' => $item->content,
+            ])
+            ->values()
+            ->all();
+    } else {
+        $history = collect($request->input('history', []))
+            ->take(-10)
+            ->map(fn ($item) => [
+                'role' => $item['role'],
+                'content' => $item['content'],
+            ])
+            ->values()
+            ->all();
+    }
 
     $messages = array_merge(
         [
@@ -542,7 +658,7 @@ public function chat(
         $toolCalls = $assistantMessage['tool_calls'] ?? [];
 
         if (empty($toolCalls)) {
-            return response()->json([
+            return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
                 'status' => true,
                 'message' => $assistantMessage['content'] ?? '',
                 // Only set when the user actually asked for a report file.
@@ -615,6 +731,53 @@ public function chat(
     ], 502);
 }
 
+
+    /**
+     * Persist successful chat turns when the request is linked to a database conversation.
+     * Legacy frontend requests without conversation_id continue to work during migration.
+     */
+    private function persistSuccessfulChatResponse(?AiConversation $conversation, string $userMessage, array $payload)
+    {
+        if ($conversation && ($payload['status'] ?? false) === true) {
+            $answer = (string) ($payload['message'] ?? '');
+
+            DB::transaction(function () use ($conversation, $userMessage, $answer, $payload) {
+                $hasMessages = $conversation->messages()->exists();
+
+                $conversation->messages()->create([
+                    'role' => 'user',
+                    'content' => $userMessage,
+                ]);
+
+                $metadata = [];
+                if (!empty($payload['download']) && is_array($payload['download'])) {
+                    $metadata['download'] = $payload['download'];
+                }
+                if (array_key_exists('data', $payload)) {
+                    $metadata['data'] = $payload['data'];
+                }
+
+                $conversation->messages()->create([
+                    'role' => 'assistant',
+                    'content' => $answer,
+                    'metadata' => $metadata ?: null,
+                ]);
+
+                $conversation->last_message_at = now();
+                if (!$hasMessages && trim($conversation->title) === 'New chat') {
+                    $conversation->title = mb_substr(trim($userMessage), 0, 45);
+                    if (mb_strlen(trim($userMessage)) > 45) {
+                        $conversation->title .= '...';
+                    }
+                }
+                $conversation->save();
+            });
+
+            $payload['conversation_id'] = $conversation->id;
+        }
+
+        return response()->json($payload);
+    }
 
     /**
      * Decides which language/script the AI must reply in, based ONLY on the user's latest message.
@@ -1064,6 +1227,26 @@ public function chat(
             ->exists();
         if (!$exists) {
             abort(403, 'Invalid branch access.');
+        }
+    }
+
+    /**
+     * Returns the name of the user's store so the AI never has to guess it.
+     * NOTE: change the table/column below if your schema is different.
+     */
+    private function getStoreName($user): string
+    {
+        try {
+            $name = DB::table('stores')
+                ->where('id', $user->store_id)
+                ->value('name');
+
+            $name = trim((string) $name);
+
+            return $name !== '' ? $name : 'Not available';
+        } catch (\Throwable $e) {
+            report($e);
+            return 'Not available';
         }
     }
 
@@ -1992,6 +2175,7 @@ PROMPT;
             ? "The user is a manager and can only access branch {$branchId}."
             : 'The user is an admin and can access all branches belonging to their store. If no specific branch is explicitly requested, aggregate data across ALL branches in the store.';
         $today = Carbon::today()->toDateString();
+        $storeName = $this->getStoreName($user);
         return <<<PROMPT
        You are the AI Business Assistant for a POS system.
                 You answer questions about the user's actual business data.
@@ -2016,7 +2200,7 @@ PROMPT;
             - User: "Aaj ni sale ketli chhe?" (Gujarati in Roman letters) -> "Aaj ni total sale ₹0.00 chhe. Aaje koi bill banyu nathi."
         13. For zero available stock, always call get_out_of_stock_products.
         14. For reorder suggestions, always call get_purchase_suggestions. Explain that recommendations are estimates based on the last 30 days of sales. Purchase suggestions require one branch because inventory and demand are branch-specific. If an admin names a branch, pass that exact branch name in branch_name; never ask for a numeric ID. If no branch is named, ask which branch by its NAME, not numeric ID. Never silently choose a branch or combine branches for purchase suggestions. Managers use their assigned branch, regardless of any branch name in the message. Distinguish the product name from the branch name: if the user says 'XYZ-EDITED ke liye product purchase suggestion', treat XYZ-EDITED as product_name, not branch_name. If product name is given but no branch is given, ask which branch name to use.
-        14a. If the user asks how many branches they have or asks to list branch names, call get_branches and answer from its count/list. Do not say there is no branch-listing tool.
+        14a. For ANY question about the number of branches, branch names, or the structure of the store, you MUST call get_branches in this turn, even if earlier messages in the history already answered it. Never answer branch counts or branch names from conversation history or from memory. Do not say there is no branch-listing tool.
         15. For date or branch comparisons, always call get_sales_comparison.
         16. For payment method breakdown or outstanding dues, always call get_payment_summary.
         17. Never invent product names, sales values, payment amounts, or reorder quantities.
@@ -2047,6 +2231,10 @@ PROMPT;
         41. For normal sales questions (how much sold, today's sales etc.) do NOT call prepare_sales_report_download.
         42. For downloading/exporting stock or inventory, low stock, out of stock, supplier dues, top selling products, purchase suggestions, product-wise profit, branch comparison or purchase bills as a file, call prepare_report_download with the matching report_type (use prepare_sales_report_download only for SALES reports). Choose format "excel" only if the user mentioned Excel/xlsx/sheet, otherwise "pdf". After the tool call reply in one short line in the user's language and script and never paste the report data. Only call it when the user asks for a downloadable report/file; for normal questions like "which products are low on stock" use the normal tools and answer in chat.
         43. SUPPORTED downloadable reports (PDF or Excel): Sales report, Stock report, Low stock report, Out of stock report, Supplier dues report, Top selling products report, Purchase suggestions report, Profit report (product-wise), Branch comparison report (admin only), Purchase report. If the user asks to download a report that is NOT in this list (for example GST report, customer report, expense report, expiry report, staff report, payment method report, or any other custom report), do NOT call any tool and do NOT invent data. Reply briefly in the user's language and script that this report is not available for download yet, and list the available reports above so they can pick one. If the user asks for Word or CSV, say only PDF and Excel are supported. If the nearest available report could still help, suggest it.
+        44. The user's store name is given below under Store Name. If the user asks for the store name or "my store", answer from it. Never say the store name is unspecified or unknown, unless Store Name below says "Not available".
+        45. You only have access to the user's own store. If the user asks about any other store, company or name that does not match the Store Name below or a branch name returned by get_branches, do NOT call any tool and do NOT give any numbers. Reply that you can only show data of their own store (mention the Store Name) and ask whether they meant their own store or one of their branches.
+        46. Never attach a store name or branch name to tool results unless that exact name was returned by a tool or is given in Store Name below. Never guess what an unknown name refers to.
+        47. Never show numeric IDs (branch_id, product_id, supplier_id, store id) to the user. Always refer to branches, products and suppliers by name only. Use IDs only internally when calling tools.
 
         **TABLE FORMATTING RULES**
 
@@ -2074,6 +2262,8 @@ PROMPT;
             {$user->role}
             Store ID:
             {$user->store_id}
+            Store Name:
+            {$storeName}
             Data access:
             {$scope}
       PROMPT;
