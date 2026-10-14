@@ -12,8 +12,9 @@ class PurchaseReportService
         $range = $input['date_range'] ?? 'this_month';
         $storeId = $input['store_id'] ?? null;
         $branchId = $input['branch_id'] ?? null;
+        $branchIds = $input['branch_ids'] ?? null;
         $supplierId = $input['supplier_id'] ?? null;
-        $isLost = $input['is_lost'] ?? null; 
+        $isLost = $input['is_lost'] ?? null;
 
         [$from, $to] = match ($range) {
             'today' => [
@@ -38,20 +39,28 @@ class PurchaseReportService
             ],
         };
 
-        return compact('from', 'to', 'range', 'storeId', 'branchId', 'supplierId', 'isLost');
+        return compact('from', 'to', 'range', 'storeId', 'branchId', 'branchIds', 'supplierId', 'isLost');
     }
 
     private function applyBillFilters(\Illuminate\Database\Query\Builder $query, array $f): void
     {
         $query->whereBetween('pb.bill_date', [$f['from'], $f['to']]);
 
-        if ($f['storeId']) {
-            $query->where('pb.store_id', $f['storeId']);
+        if (empty($f['storeId'])) {
+            $query->whereRaw('1 = 0');
+
+            return;
         }
-        if ($f['branchId']) {
+
+        $query->where('pb.store_id', $f['storeId']);
+
+        if (! empty($f['branchId'])) {
             $query->where('pb.branch_id', $f['branchId']);
+        } elseif (! empty($f['branchIds'])) {
+            $query->whereIn('pb.branch_id', $f['branchIds']);
         }
-        if ($f['supplierId']) {
+
+        if (! empty($f['supplierId'])) {
             $query->where('pb.supplier_id', $f['supplierId']);
         }
         if (! is_null($f['isLost'])) {
@@ -72,8 +81,8 @@ class PurchaseReportService
                 COALESCE(SUM(pb.sgst_amount), 0)      AS total_sgst,
                 COALESCE(SUM(pb.igst_amount), 0)      AS total_igst,
                 COALESCE(SUM(pb.cess_amount), 0)      AS total_cess,
-                SUM(pb.is_lost)                       AS lost_bills,
-                SUM(pb.received)                      AS received_bills
+                COALESCE(SUM(pb.is_lost), 0)          AS lost_bills,
+                COALESCE(SUM(pb.received), 0)         AS received_bills
             ')
             ->first();
 

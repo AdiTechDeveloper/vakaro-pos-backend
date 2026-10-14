@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Services\SalesReportService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class SalesReportController extends Controller
 {
@@ -17,13 +18,15 @@ class SalesReportController extends Controller
             'date_range' => 'nullable|string|in:today,yesterday,last_7_days,this_month,custom',
             'date_from' => 'nullable|date|required_if:date_range,custom',
             'date_to' => 'nullable|date|required_if:date_range,custom',
-            'store_id' => 'nullable|integer',
-            'branch_id' => 'nullable|integer',
+            'branch_id' => 'nullable|integer|min:0',
             'bill_status' => 'nullable|string|in:all,pending,completed,cancelled',
         ]);
 
-        $filters = $this->service->resolveFilters($request->only(
-            'date_range', 'date_from', 'date_to', 'store_id', 'branch_id', 'bill_status'
+        $scope = $this->resolveScope($request);
+
+        $filters = $this->service->resolveFilters(array_merge(
+            $request->only('date_range', 'date_from', 'date_to', 'bill_status'),
+            $scope
         ));
 
         return response()->json([
@@ -37,30 +40,83 @@ class SalesReportController extends Controller
             'filters_applied' => $filters,
         ]);
     }
+
     public function monthlySales(Request $request): JsonResponse
-{
-    $request->validate([
-        'year' => 'nullable|integer|min:2000|max:2100',
-        'store_id' => 'nullable|integer',
-        'branch_id' => 'nullable|integer',
-        'bill_status' => 'nullable|string|in:all,pending,completed,cancelled',
-    ]);
+    {
+        $request->validate([
+            'year' => 'nullable|integer|min:2000|max:2100',
+            'branch_id' => 'nullable|integer|min:0',
+            'bill_status' => 'nullable|string|in:all,pending,completed,cancelled',
+        ]);
 
-    $year = (int) ($request->input('year') ?: now()->year);
+        $year = (int) ($request->input('year') ?: now()->year);
 
-    $filters = $this->service->resolveFilters([
-        'date_range' => 'custom',
-        'date_from' => "{$year}-01-01",
-        'date_to' => "{$year}-12-31",
-        'store_id' => $request->input('store_id'),
-        'branch_id' => $request->input('branch_id'),
-        'bill_status' => $request->input('bill_status', 'all'),
-    ]);
+        $scope = $this->resolveScope($request);
 
-    return response()->json([
-        'year' => $year,
-        'monthly_sales' => $this->service->getMonthlySales($filters),
-        'filters_applied' => $filters,
-    ]);
-}
+        $filters = $this->service->resolveFilters(array_merge($scope, [
+            'date_range' => 'custom',
+            'date_from' => "{$year}-01-01",
+            'date_to' => "{$year}-12-31",
+            'bill_status' => $request->input('bill_status', 'all'),
+        ]));
+
+        return response()->json([
+            'year' => $year,
+            'monthly_sales' => $this->service->getMonthlySales($filters),
+            'filters_applied' => $filters,
+        ]);
+    }
+
+    private function resolveScope(Request $request): array
+    {
+        $user = $request->user();
+
+        if (! $user || ! in_array($user->role, ['admin', 'manager'], true)) {
+            abort(403, 'You are not authorized to view sales reports.');
+        }
+
+        $requestedBranchId = (int) $request->input('branch_id', 0);
+
+        if ($user->role === 'admin') {
+            if ($requestedBranchId > 0) {
+                $belongs = DB::table('branches')
+                    ->where('id', $requestedBranchId)
+                    ->where('store_id', $user->store_id)
+                    ->exists();
+
+                abort_unless($belongs, 403, 'Invalid branch access.');
+
+                return [
+                    'store_id' => $user->store_id,
+                    'branch_id' => $requestedBranchId,
+                ];
+            }
+
+            return [
+                'store_id' => $user->store_id,
+                'branch_id' => null,
+            ];
+        }
+
+        $allowed = $user->branches()->pluck('branches.id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        abort_if(empty($allowed), 403, 'No branch assigned to this manager.');
+
+        if ($requestedBranchId > 0) {
+            abort_unless(in_array($requestedBranchId, $allowed, true), 403, 'Invalid branch access.');
+
+            return [
+                'store_id' => $user->store_id,
+                'branch_id' => $requestedBranchId,
+            ];
+        }
+
+        return [
+            'store_id' => $user->store_id,
+            'branch_id' => null,
+            'branch_ids' => $allowed,
+        ];
+    }
 }

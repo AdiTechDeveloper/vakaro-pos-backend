@@ -16,10 +16,24 @@ use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
 use Milon\Barcode\Facades\DNS1DFacade as DNS1D;
 
 class SalesBillController extends Controller
 {
+    private function authorizeBillAccess(SalesBill $bill, $user): void
+    {
+        abort_unless((int) $bill->store_id === (int) $user->store_id, 404, 'Sales bill not found.');
+
+        if ($user->role !== 'admin') {
+            abort_unless(
+                in_array((int) $bill->branch_id, $this->allowedCustomerBranchIds($user), true),
+                403,
+                'You are not allowed to access bills from another branch.'
+            );
+        }
+    }
+
     public function scanBarcode(Request $request)
     {
         $request->validate(['barcode' => 'required', 'branch_id' => 'nullable|integer']);
@@ -132,46 +146,38 @@ class SalesBillController extends Controller
         $user = Auth::user();
 
         try {
-            $query = SalesBill::with([
-                'store',
-                'branch',
-                'user',
-                'lines.product',
-                'lines',
-                'payments',
-            ])->orderBy('id', 'desc');
+            $query = SalesBill::with(['store', 'branch', 'user', 'lines.product', 'lines', 'payments'])
+                ->where('store_id', $user->store_id)
+                ->orderBy('id', 'desc');
 
             if ($user->role === 'cashier') {
                 $query->where('user_id', $user->id);
             } elseif ($user->role === 'manager') {
                 $branchIds = $user->branches->pluck('id')->toArray();
 
-                if (! empty($branchIds)) {
-                    $query->whereIn('branch_id', $branchIds);
-                } else {
+                if (empty($branchIds)) {
                     return response()->json([
                         'status' => false,
                         'message' => 'No branch assigned to this manager.',
                     ], 400);
                 }
+
+                $query->whereIn('branch_id', $branchIds);
+            } elseif ($user->role === 'admin' && $request->filled('branch_id')) {
+                $query->where('branch_id', (int) $request->query('branch_id'));
             }
 
             if ($request->has('limit')) {
                 $query->limit((int) $request->query('limit'));
             }
 
-            $bills = $query->get();
-
             return response()->json([
                 'status' => true,
                 'message' => 'Sales bills fetched successfully',
-                'data' => $bills,
+                'data' => $query->get(),
             ]);
         } catch (\Exception $e) {
-            return response()->json([
-                'status' => false,
-                'error' => $e->getMessage(),
-            ], 500);
+            return response()->json(['status' => false, 'error' => $e->getMessage()], 500);
         }
     }
 
@@ -185,6 +191,8 @@ class SalesBillController extends Controller
                 'lines',
                 'payments',
             ])->find($id);
+
+            $this->authorizeBillAccess($bill, $user);
 
             if (! $bill) {
                 return response()->json([
@@ -224,343 +232,6 @@ class SalesBillController extends Controller
         }
     }
 
-    // public function store(Request $request)
-    // {
-    //     $idempotencyKey = $request->header('Idempotency-Key');
-
-    //     if (! $idempotencyKey) {
-    //         return response()->json(['error' => 'Missing Idempotency Key'], 400);
-    //     }
-
-    //     // Prevent duplicate bill creation
-    //     $existing = SalesBill::where('last_idempotency_key_store', $idempotencyKey)->first();
-    //     if ($existing) {
-    //         return response()->json([
-    //             'success' => true,
-    //             'message' => 'Duplicate Store Request Ignored',
-    //             'data' => $existing,
-    //         ], 200);
-    //     }
-
-    //     $request->validate([
-    //         'lines' => 'required|array|min:1',
-    //         'lines.*.product_id' => 'required|integer',
-    //         'lines.*.inventory_id' => 'required|integer',
-    //         'lines.*.qty' => 'required|numeric|min:0.01',
-
-    //         'customer_id' => 'nullable|exists:customers,id',
-    //         'customer' => 'required|array',
-    //         'customer.name' => 'nullable|string|max:255',
-    //         'customer.mobile' => 'required|string|max:15',
-    //         'branch_id' => 'nullable|integer',
-    //         'payment_type' => 'required|in:cash,online,split,credit,wallet',
-    //         'cash_received' => 'nullable|numeric|min:0',
-    //         'online_received' => 'nullable|numeric|min:0',
-    //         'balance_return' => 'nullable|numeric|min:0',
-    //         'lines.*.selling_price' => 'nullable|numeric|min:0',
-    //         'lines.*.original_price' => 'nullable|numeric|min:0',
-    //         'lines.*.is_price_overridden' => 'nullable|boolean',
-    //         'selected_date' => 'nullable|date',
-    //     ]);
-
-    //     try {
-    //         DB::beginTransaction();
-
-    //         $user = Auth::user();
-    //         $branchId = $this->resolveCustomerBranchId($request->branch_id, $user);
-
-    //         if (! $branchId) {
-    //             return response()->json([
-    //                 'status' => false,
-    //                 'message' => 'User has no branch assigned.',
-    //             ], 400);
-    //         }
-
-    //         // Determine Target Date First
-    //         $billDate = $request->filled('selected_date')
-    //             ? Carbon::parse($request->input('selected_date'))->setTimeFrom(now())
-    //             : now();
-
-    //         $datePrefix = $billDate->format('ymd');
-
-    //         // Count existing bills specifically for the target date
-    //         $todayCount = SalesBill::where('store_id', $user->store_id)
-    //             ->where('branch_id', $branchId)
-    //             ->whereDate('created_at', $billDate->toDateString())
-    //             ->count();
-
-    //         $sequence = str_pad($todayCount + 1, 4, '0', STR_PAD_LEFT);
-
-    //         $storePad = str_pad($user->store_id, 2, '0', STR_PAD_LEFT);
-    //         $branchPad = str_pad($branchId, 2, '0', STR_PAD_LEFT);
-    //         $userPad = str_pad($user->id, 2, '0', STR_PAD_LEFT);
-
-    //         $billNo = $storePad.$branchPad.$userPad.$datePrefix.$sequence;
-
-    //         // Create Sales Bill Record
-    //         $bill = SalesBill::create([
-    //             'store_id' => $user->store_id,
-    //             'branch_id' => $branchId,
-    //             'user_id' => $user->id,
-    //             'bill_no' => $billNo,
-    //             'bill_status' => 'pending',
-    //             'payment_status' => 'unpaid',
-    //             'created_by' => $user->id,
-    //             'last_idempotency_key_store' => $idempotencyKey,
-    //             'customer_id' => $request->customer_id,
-    //             'payment_type' => $request->payment_type,
-    //             'created_at' => $billDate,
-    //         ]);
-
-    //         $subtotal = 0;
-    //         $totalGst = 0;
-    //         $totalSaved = 0;
-    //         $totalCogs = 0;
-    //         $totalProfit = 0;
-    //         $processedProducts = [];
-
-    //         foreach ($request->lines as $lineData) {
-    //             $product = Product::with('gstRate')->findOrFail($lineData['product_id']);
-
-    //             // Get specific batch info from inventory table
-    //             $selectedInventory = Inventory::where('id', $lineData['inventory_id'])
-    //                 ->where('branch_id', $branchId)
-    //                 ->firstOrFail();
-
-    //             $batchBarcode = $selectedInventory->batch_barcode;
-    //             $inventoryPrice = (float) $selectedInventory->selling_price;
-    //             $isOverridden = ! empty($lineData['is_price_overridden']) && $lineData['is_price_overridden'] == true;
-    //             $price = $isOverridden && isset($lineData['selling_price'])
-    //                 ? (float) $lineData['selling_price']
-    //                 : $inventoryPrice;
-
-    //             $originalPrice = (float) ($lineData['original_price'] ?? $inventoryPrice);
-    //             $overridePrice = $isOverridden ? $price : null;
-    //             $mrp = (float) $selectedInventory->mrp;
-
-    //             if ($selectedInventory->qty <= $selectedInventory->sold_qty) {
-    //                 throw new \Exception('Stock already exhausted for this batch.');
-    //             }
-
-    //             if ($price <= 0) {
-    //                 throw new \Exception("Invalid selling price for {$product->name} in this batch.");
-    //             }
-
-    //             $requiredQty = (float) $lineData['qty'];
-
-    //             // Fetch rows for this batch (using $billDate for expiry checks if backdating)
-    //             $batchRows = Inventory::where('product_id', $product->id)
-    //                 ->where('batch_barcode', $batchBarcode)
-    //                 ->where('branch_id', $branchId)
-    //                 ->whereColumn('sold_qty', '<', 'qty')
-    //                 ->where(function ($q) use ($billDate) {
-    //                     $q->whereNull('expiry_date')
-    //                         ->orWhere('expiry_date', '>=', $billDate);
-    //                 })
-    //                 ->orderBy('free', 'asc')
-    //                 ->lockForUpdate()
-    //                 ->get();
-
-    //             $availableStock = $batchRows->sum(fn ($inv) => $inv->qty - $inv->sold_qty);
-
-    //             if ($availableStock < $requiredQty) {
-    //                 throw new \Exception("Insufficient stock in batch {$selectedInventory->batch_no} for {$product->name}");
-    //             }
-
-    //             // COGS and Stock Deduction
-    //             $remaining = $requiredQty;
-    //             $totalLineCogs = 0;
-
-    //             foreach ($batchRows as $batch) {
-    //                 if ($remaining <= 0) {
-    //                     break;
-    //                 }
-    //                 $available = $batch->qty - $batch->sold_qty;
-    //                 if ($available <= 0) {
-    //                     continue;
-    //                 }
-
-    //                 $consume = min($available, $remaining);
-
-    //                 $purchaseRate = (float) $batch->cost_price;
-    //                 $gstRate = $product->gstRate->rate ?? 0;
-
-    //                 if ($batch->purchase_gst_inclusive && $gstRate > 0) {
-    //                     $purchaseRate = $purchaseRate * 100 / (100 + $product->gstRate->rate);
-    //                 }
-
-    //                 $totalLineCogs += ($purchaseRate * $consume);
-    //                 $batch->increment('sold_qty', $consume);
-    //                 $remaining -= $consume;
-    //             }
-
-    //             // Tax Logic
-    //             $gstRate = $product->gstRate->rate ?? 0;
-    //             if ($gstRate > 0) {
-    //                 if ($product->gst_inclusive) {
-    //                     $taxable = ($price * 100 / (100 + $gstRate)) * $requiredQty;
-    //                     $totalLineGst = ($price * $requiredQty) - $taxable;
-    //                 } else {
-    //                     $taxable = $price * $requiredQty;
-    //                     $totalLineGst = ($taxable * $gstRate) / 100;
-    //                 }
-    //             } else {
-    //                 $taxable = $price * $requiredQty;
-    //                 $totalLineGst = 0;
-    //             }
-
-    //             // State-based Tax Split
-    //             $storeState = $user->store->state;
-    //             $branchState = $user->branches->first()->state;
-    //             $cgst = $sgst = $igst = 0;
-
-    //             if ($gstRate > 0) {
-    //                 if ($storeState == $branchState) {
-    //                     $cgst = $sgst = $totalLineGst / 2;
-    //                 } else {
-    //                     $igst = $totalLineGst;
-    //                 }
-    //             }
-
-    //             $lineAmount = $product->gst_inclusive ? ($price * $requiredQty) : ($taxable + $totalLineGst);
-
-    //             $netRevenue = $taxable;
-    //             $profit = $netRevenue - $totalLineCogs;
-
-    //             // Record Line
-    //             $salesLine = SalesBillLine::create([
-    //                 'sales_bill_id' => $bill->id,
-    //                 'product_id' => $product->id,
-    //                 'branch_id' => $branchId,
-    //                 'inventory_id' => $selectedInventory->id,
-    //                 'qty' => $requiredQty,
-    //                 'rate' => $price,
-    //                 'selling_price' => $price,
-    //                 'original_price' => $originalPrice,
-    //                 'override_price' => $overridePrice,
-    //                 'is_price_overridden' => $isOverridden ? 1 : 0,
-    //                 'taxable_amount' => $taxable,
-    //                 'amount' => $lineAmount,
-    //                 'cgst' => $cgst,
-    //                 'sgst' => $sgst,
-    //                 'igst' => $igst,
-    //                 'total_gst' => $totalLineGst,
-    //                 'cogs' => $totalLineCogs,
-    //                 'profit' => $profit,
-    //                 'created_at' => $billDate,
-    //             ]);
-
-    //             // Log price override for audit report
-    //             if ($isOverridden) {
-    //                 \App\Models\PriceOverride::create([
-    //                     'sale_bill_id' => $bill->id,
-    //                     'sale_bill_line_id' => $salesLine->id,
-    //                     'product_id' => $product->id,
-    //                     'branch_id' => $branchId,
-    //                     'original_price' => $originalPrice,
-    //                     'override_price' => $price,
-    //                     'difference' => round($originalPrice - $price, 2),
-    //                     'qty' => $requiredQty,
-    //                     'total_loss' => round(($originalPrice - $price) * $requiredQty, 2),
-    //                     'overridden_by' => $user->id,
-    //                     'created_at' => $billDate,
-    //                 ]);
-    //             }
-
-    //             // GST Ledger Entry
-    //             if ($totalLineGst > 0) {
-    //                 GstOutputLedger::create([
-    //                     'sales_bill_id' => $bill->id,
-    //                     'sales_bill_line_id' => $salesLine->id,
-    //                     'product_id' => $product->id,
-    //                     'gst_rate_id' => $product->gst_rate_id,
-    //                     'cgst' => $cgst,
-    //                     'sgst' => $sgst,
-    //                     'igst' => $igst,
-    //                     'total_gst' => $totalLineGst,
-    //                     'created_at' => $billDate,
-    //                 ]);
-    //             }
-
-    //             $subtotal += $lineAmount;
-    //             $totalGst += $totalLineGst;
-    //             $totalCogs += $totalLineCogs;
-    //             $totalProfit += ($taxable - $totalLineCogs);
-    //             $totalSaved += ($mrp - $price) * $requiredQty;
-    //             $processedProducts[] = $product->id;
-    //         }
-
-    //         // Final Bill Update
-    //         $bill->update([
-    //             'subtotal' => $subtotal,
-    //             'total_gst' => $totalGst,
-    //             'total_amount' => $subtotal,
-    //             'total_saved' => $totalSaved,
-    //             'total_cogs' => $totalCogs,
-    //             'total_profit' => $totalProfit,
-    //             // 'cash_received' => $request->payment_type === 'credit' ? 0 : ($request->cash_received ?? 0),
-    //             // 'balance_return' => $request->payment_type === 'credit' ? 0 : ($request->balance_return ?? 0),
-    //         ]);
-
-    //         $customer = Customer::updateOrCreate(
-    //             [
-    //                 'branch_id' => $branchId,
-    //                 'mobile' => $request->customer['mobile'],
-    //             ],
-    //             [
-    //                 'name' => $request->customer['name'] ?? null,
-    //                 'add1' => $request->customer['add1'] ?? null,
-    //                 'add2' => $request->customer['add2'] ?? null,
-    //                 'area' => $request->customer['area'] ?? null,
-    //                 'city' => $request->customer['city'] ?? null,
-    //             ]
-    //         );
-
-    //         $bill->customer_id = $customer->id;
-
-    //         // Payment Logic
-    //         if ($request->payment_type === 'credit') {
-    //             $bill->paid_amount = 0;
-    //             $bill->due_amount = $subtotal;
-    //             $bill->payment_status = 'unpaid';
-    //         } else {
-    //             $cashReceived = (float) ($request->cash_received ?? 0);
-    //             $onlineReceived = (float) ($request->online_received ?? 0);
-    //             $paidAmount = min($cashReceived + $onlineReceived, $subtotal);
-
-    //             $bill->cash_received = $cashReceived;
-    //             $bill->online_received = $onlineReceived;
-    //             $bill->paid_amount = $paidAmount;
-    //             $bill->due_amount = max($subtotal - $paidAmount, 0);
-
-    //             if ($bill->due_amount == 0 && $paidAmount > 0) {
-    //                 $bill->payment_status = 'paid';
-    //             } elseif ($paidAmount > 0) {
-    //                 $bill->payment_status = 'partial';
-    //             } else {
-    //                 $bill->payment_status = 'unpaid';
-    //             }
-    //         }
-
-    //         $bill->save();
-
-    //         DB::commit();
-
-    //         return response()->json([
-    //             'status' => true,
-    //             'message' => 'Sales bill created successfully',
-    //             'data' => $bill->load('lines'),
-    //         ]);
-    //     } catch (\Exception $e) {
-    //         DB::rollBack();
-
-    //         return response()->json([
-    //             'status' => false,
-    //             'message' => $e->getMessage(),
-    //         ], 500);
-    //     }
-    // }
-
     public function store(Request $request)
     {
         $idempotencyKey = $request->header('Idempotency-Key');
@@ -598,7 +269,7 @@ class SalesBillController extends Controller
             'lines.*.original_price' => 'nullable|numeric|min:0',
             'lines.*.is_price_overridden' => 'nullable|boolean',
             'selected_date' => 'nullable|date',
-            'points_redeemed' => 'nullable|numeric|min:0', // NEW: loyalty points customer wants to redeem
+            'points_redeemed' => 'nullable|numeric|min:0',
         ]);
 
         try {
@@ -614,14 +285,12 @@ class SalesBillController extends Controller
                 ], 400);
             }
 
-            // Determine Target Date First
             $billDate = $request->filled('selected_date')
                 ? Carbon::parse($request->input('selected_date'))->setTimeFrom(now())
                 : now();
 
             $datePrefix = $billDate->format('ymd');
 
-            // Count existing bills specifically for the target date
             $todayCount = SalesBill::where('store_id', $user->store_id)
                 ->where('branch_id', $branchId)
                 ->whereDate('created_at', $billDate->toDateString())
@@ -686,7 +355,6 @@ class SalesBillController extends Controller
 
                 $requiredQty = (float) $lineData['qty'];
 
-                // Fetch rows for this batch (using $billDate for expiry checks if backdating)
                 $batchRows = Inventory::where('product_id', $product->id)
                     ->where('batch_barcode', $batchBarcode)
                     ->where('branch_id', $branchId)
@@ -856,11 +524,7 @@ class SalesBillController extends Controller
 
             $bill->customer_id = $customer->id;
 
-            // ============================================================
             // Loyalty Points — Redemption + Earning
-            // ============================================================
-            // Lock customer row so concurrent bills for same customer
-            // can't both read a stale points balance (race condition safety)
             $customer = Customer::where('id', $customer->id)->lockForUpdate()->first();
 
             $loyaltyBalance = (float) $customer->loyalty_points;
@@ -930,11 +594,7 @@ class SalesBillController extends Controller
             $bill->points_redeemed = $pointsRedeemed;
             $bill->points_discount_amount = $pointsDiscountAmount;
             $bill->points_earned = $pointsEarned;
-            // ============================================================
-            // END Loyalty Points
-            // ============================================================
 
-            // Payment Logic (uses $payableAmount, already net of points discount)
             if ($request->payment_type === 'credit') {
                 $bill->paid_amount = 0;
                 $bill->due_amount = $payableAmount;
@@ -1001,6 +661,7 @@ class SalesBillController extends Controller
         }
 
         $bill = SalesBill::findOrFail($request->sales_bill_id);
+        $this->authorizeBillAccess($bill, Auth::user());
 
         // prevent duplicate
         if ($bill->last_idempotency_key_payment === $idempotencyKey) {
@@ -1044,9 +705,6 @@ class SalesBillController extends Controller
                 ]);
             }
 
-            // NEW: net payable amount = bill total minus loyalty points discount.
-            // All due/paid/balance_return math below must use this, not raw total_amount,
-            // otherwise a redeemed bill will always show a false "due" amount.
             $payableAmount = max((float) $bill->total_amount - (float) $bill->points_discount_amount, 0);
 
             $totalPaid = 0;
@@ -1118,8 +776,13 @@ class SalesBillController extends Controller
 
     public function collectPayment(Request $request)
     {
+        $user = Auth::user();
+
         $request->validate([
-            'sales_bill_id' => 'required|exists:sales_bills,id',
+            'sales_bill_id' => [
+                'required',
+                Rule::exists('sales_bills', 'id')->where('store_id', $user->store_id),
+            ],
             'amount' => 'required|numeric|min:0.01',
             'method' => 'required|string',
             'transaction_id' => 'nullable|string',
@@ -1139,6 +802,7 @@ class SalesBillController extends Controller
 
         try {
             $bill = SalesBill::lockForUpdate()->findOrFail($request->sales_bill_id);
+            $this->authorizeBillAccess($bill, $user);
 
             // Prevent duplicate request
             if ($bill->last_idempotency_key_payment === $idempotencyKey) {
@@ -1288,6 +952,8 @@ class SalesBillController extends Controller
 
     public function getPrintData(Request $request)
     {
+        $user = Auth::user();
+
         $ids = $request->id; // array [1,2]
 
         if (! is_array($ids) || empty($ids)) {
@@ -1297,7 +963,9 @@ class SalesBillController extends Controller
             ], 422);
         }
 
-        $bills = SalesBill::with([
+        $ids = array_values(array_filter(array_map('intval', $ids)));
+
+        $query = SalesBill::with([
             'store',
             'branch',
             'user',
@@ -1305,7 +973,15 @@ class SalesBillController extends Controller
             'lines.product',
             'lines.inventory',
             'lines.gstRate',
-        ])->whereIn('id', $ids)->get();
+        ])
+            ->where('store_id', $user->store_id)
+            ->whereIn('id', $ids);
+
+        if ($user->role !== 'admin') {
+            $query->whereIn('branch_id', $this->allowedCustomerBranchIds($user));
+        }
+
+        $bills = $query->get();
 
         if ($bills->isEmpty()) {
             return response()->json([
@@ -1313,15 +989,13 @@ class SalesBillController extends Controller
                 'message' => 'Bills not found',
             ], 404);
         }
-        // If you want multiple bills print data:
+
         $response = $bills->map(function ($bill) {
             $items = $bill->lines->map(function ($line) {
-                // Use override price if overridden, else inventory price
                 $sellingPrice = $line->is_price_overridden && $line->override_price
                     ? $line->override_price
                     : ($line->inventory->selling_price ?? $line->product->selling_price);
 
-                $originalPrice = $line->original_price ?? $sellingPrice;
                 $mrp = $line->inventory->mrp ?? $line->product->mrp;
 
                 return [
@@ -1329,7 +1003,7 @@ class SalesBillController extends Controller
                     'qty' => $line->qty,
                     'mrp' => round($mrp, 2),
                     'selling' => round($sellingPrice, 2),
-                    'original_price' => round($line->original_price ?? $sellingPrice, 2), // ← add
+                    'original_price' => round($line->original_price ?? $sellingPrice, 2),
                     'is_price_overridden' => (bool) $line->is_price_overridden,
                     'amount' => $line->amount,
                     'saved' => ($line->product->mrp - $line->product->selling_price) * $line->qty,
@@ -1391,7 +1065,13 @@ class SalesBillController extends Controller
         try {
             $user = Auth::user();
 
-            $query = GstOutputLedger::with('bill');
+            $query = GstOutputLedger::with('bill')->whereHas('bill', function ($q) use ($user) {
+                $q->where('store_id', $user->store_id);
+
+                if ($user->role !== 'admin') {
+                    $q->whereIn('branch_id', $this->allowedCustomerBranchIds($user));
+                }
+            });
 
             $branchId = $user->branches->pluck('id')->first();
 
@@ -1463,6 +1143,11 @@ class SalesBillController extends Controller
 
     public function customerPayDue(Request $request)
     {
+
+        $user = Auth::user();
+        $customer = Customer::whereIn('branch_id', $this->allowedCustomerBranchIds($user))
+            ->findOrFail($request->customer_id);
+
         $request->validate([
             'customer_id' => 'required|exists:customers,id',
             'amount' => 'required|numeric|min:0.01',
@@ -1476,7 +1161,7 @@ class SalesBillController extends Controller
         try {
             $remaining = $request->amount;
 
-            $bills = SalesBill::where('customer_id', $request->customer_id)
+            $bills = SalesBill::where('customer_id', $customer->id)
                 ->where('due_amount', '>', 0)
                 ->orderBy('created_at')
                 ->lockForUpdate()
@@ -1536,6 +1221,8 @@ class SalesBillController extends Controller
 
     public function changePayment(Request $request, $id)
     {
+        $user = Auth::user();
+
         $request->validate([
             'payments' => 'required|array|min:1',
             'payments.*.method' => 'required|string|in:cash,online,wallet',
@@ -1546,6 +1233,7 @@ class SalesBillController extends Controller
 
         try {
             $bill = SalesBill::lockForUpdate()->findOrFail($id);
+            $this->authorizeBillAccess($bill, $user);
 
             // Restriction: Only same day edit
             if ($bill->created_at->lt(now()->startOfDay())) {

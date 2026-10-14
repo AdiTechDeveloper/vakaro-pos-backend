@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Services\PurchaseReportService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class PurchaseReportController extends Controller
 {
@@ -17,15 +18,16 @@ class PurchaseReportController extends Controller
             'date_range' => 'nullable|string|in:today,yesterday,last_7_days,this_month,custom',
             'date_from' => 'nullable|date|required_if:date_range,custom',
             'date_to' => 'nullable|date|required_if:date_range,custom',
-            'store_id' => 'nullable|integer',
-            'branch_id' => 'nullable|integer',
+            'branch_id' => 'nullable|integer|min:0',
             'supplier_id' => 'nullable|integer',
             'is_lost' => 'nullable|boolean',
         ]);
 
-        $filters = $this->service->resolveFilters($request->only(
-            'date_range', 'date_from', 'date_to',
-            'store_id', 'branch_id', 'supplier_id', 'is_lost'
+        $scope = $this->resolveScope($request);
+
+        $filters = $this->service->resolveFilters(array_merge(
+            $request->only('date_range', 'date_from', 'date_to', 'supplier_id', 'is_lost'),
+            $scope
         ));
 
         return response()->json([
@@ -35,5 +37,59 @@ class PurchaseReportController extends Controller
             'supplier_breakdown' => $this->service->getSupplierBreakdown($filters),
             'filters_applied' => $filters,
         ]);
+    }
+
+    private function resolveScope(Request $request): array
+    {
+        $user = $request->user();
+
+        if (! $user || ! in_array($user->role, ['admin', 'manager'], true)) {
+            abort(403, 'You are not authorized to view purchase reports.');
+        }
+
+        $requestedBranchId = (int) $request->input('branch_id', 0);
+
+        if ($user->role === 'admin') {
+            if ($requestedBranchId > 0) {
+                $belongs = DB::table('branches')
+                    ->where('id', $requestedBranchId)
+                    ->where('store_id', $user->store_id)
+                    ->exists();
+
+                abort_unless($belongs, 403, 'Invalid branch access.');
+
+                return [
+                    'store_id' => $user->store_id,
+                    'branch_id' => $requestedBranchId,
+                ];
+            }
+
+            return [
+                'store_id' => $user->store_id,
+                'branch_id' => null,
+            ];
+        }
+
+        // Manager: sirf assigned branches
+        $allowed = $user->branches()->pluck('branches.id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        abort_if(empty($allowed), 403, 'No branch assigned to this manager.');
+
+        if ($requestedBranchId > 0) {
+            abort_unless(in_array($requestedBranchId, $allowed, true), 403, 'Invalid branch access.');
+
+            return [
+                'store_id' => $user->store_id,
+                'branch_id' => $requestedBranchId,
+            ];
+        }
+
+        return [
+            'store_id' => $user->store_id,
+            'branch_id' => null,
+            'branch_ids' => $allowed,
+        ];
     }
 }

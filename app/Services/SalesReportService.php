@@ -13,6 +13,7 @@ class SalesReportService
         $billStatus = $input['bill_status'] ?? 'all';
         $storeId = $input['store_id'] ?? null;
         $branchId = $input['branch_id'] ?? null;
+        $branchIds = $input['branch_ids'] ?? null;
 
         [$from, $to] = match ($range) {
             'today' => [
@@ -41,28 +42,35 @@ class SalesReportService
             ],
         };
 
-        return compact('from', 'to', 'range', 'billStatus', 'storeId', 'branchId');
+        return compact('from', 'to', 'range', 'billStatus', 'storeId', 'branchId', 'branchIds');
     }
 
     private function applyBillFilters(\Illuminate\Database\Query\Builder $query, array $f): void
     {
         $query->whereBetween('sb.created_at', [$f['from'], $f['to']]);
 
+        if (empty($f['storeId'])) {
+            $query->whereRaw('1 = 0');
+
+            return;
+        }
+
+        $query->where('sb.store_id', $f['storeId']);
+
         if ($f['billStatus'] !== 'all') {
             $query->where('sb.bill_status', $f['billStatus']);
         }
-        if ($f['storeId']) {
-            $query->where('sb.store_id', $f['storeId']);
-        }
-        if ($f['branchId']) {
+        if (! empty($f['branchId'])) {
             $query->where('sb.branch_id', $f['branchId']);
+        } elseif (! empty($f['branchIds'])) {
+            $query->whereIn('sb.branch_id', $f['branchIds']);
         }
     }
 
     public function getKpis(array $f): array
     {
         $bill = DB::table('sales_bills as sb')
-            ->when(true, fn($q) => $this->applyBillFilters($q, $f))
+            ->when(true, fn ($q) => $this->applyBillFilters($q, $f))
             ->selectRaw('
                 COUNT(sb.id)                         AS total_bills,
                 COALESCE(SUM(sb.total_amount), 0)   AS gross_sales,
@@ -76,7 +84,7 @@ class SalesReportService
 
         $tax = DB::table('sales_bills as sb')
             ->join('sales_bill_lines as sbl', 'sbl.sales_bill_id', '=', 'sb.id')
-            ->when(true, fn($q) => $this->applyBillFilters($q, $f))
+            ->when(true, fn ($q) => $this->applyBillFilters($q, $f))
             ->selectRaw('
                 COALESCE(SUM(sbl.cgst), 0)      AS total_cgst,
                 COALESCE(SUM(sbl.sgst), 0)      AS total_sgst,
@@ -109,7 +117,7 @@ class SalesReportService
     public function getMonthlySales(array $f): array
     {
         $rows = DB::table('sales_bills as sb')
-            ->when(true, fn($q) => $this->applyBillFilters($q, $f))
+            ->when(true, fn ($q) => $this->applyBillFilters($q, $f))
             ->selectRaw('
             MONTH(sb.created_at) AS month,
             COALESCE(SUM(sb.total_amount), 0) AS total_sales
@@ -126,6 +134,7 @@ class SalesReportService
 
         return $monthlySales;
     }
+
     public function getInvoiceTable(array $f): array
     {
         $rows = DB::table('sales_bills as sb')
@@ -134,7 +143,7 @@ class SalesReportService
                 $join->on('sb.id', '=', 'sbp.sales_bill_id')
                     ->where('sbp.status', '=', 'success');
             })
-            ->when(true, fn($q) => $this->applyBillFilters($q, $f))
+            ->when(true, fn ($q) => $this->applyBillFilters($q, $f))
             ->select([
                 'sb.id',
                 'sb.bill_no',
@@ -187,7 +196,7 @@ class SalesReportService
         $rows = DB::table('sales_bills as sb')
             ->join('sales_bill_lines as sbl', 'sbl.sales_bill_id', '=', 'sb.id')
             ->join('products as p', 'p.id', '=', 'sbl.product_id')
-            ->when(true, fn($q) => $this->applyBillFilters($q, $f))
+            ->when(true, fn ($q) => $this->applyBillFilters($q, $f))
             ->groupBy('p.id', 'p.name', 'p.sku', 'p.hsn_code')
             ->selectRaw('
                 p.id AS product_id,
@@ -216,7 +225,7 @@ class SalesReportService
     {
         $rows = DB::table('sales_bills as sb')
             ->join('sales_bill_payments as sbp', 'sbp.sales_bill_id', '=', 'sb.id')
-            ->when(true, fn($q) => $this->applyBillFilters($q, $f))
+            ->when(true, fn ($q) => $this->applyBillFilters($q, $f))
             ->where('sbp.status', 'success')        // Only successful payments
             ->groupBy('sbp.method')
             ->selectRaw('
@@ -238,7 +247,7 @@ class SalesReportService
         });
 
         $dueAmount = DB::table('sales_bills as sb')
-            ->when(true, fn($q) => $this->applyBillFilters($q, $f))
+            ->when(true, fn ($q) => $this->applyBillFilters($q, $f))
             ->where('sb.due_amount', '>', 0)
             ->selectRaw('COALESCE(SUM(sb.due_amount), 0) AS total_due')
             ->first();
@@ -257,7 +266,7 @@ class SalesReportService
                 $join->on('sb.id', '=', 'sbp.sales_bill_id')
                     ->where('sbp.status', '=', 'success');
             })
-            ->when(true, fn($q) => $this->applyBillFilters($q, $f))
+            ->when(true, fn ($q) => $this->applyBillFilters($q, $f))
             ->select(
                 'sb.id',
                 'sb.bill_no',
@@ -304,7 +313,7 @@ class SalesReportService
         $rows = DB::table('sales_bills as sb')
             ->join('sales_bill_lines as sbl', 'sbl.sales_bill_id', '=', 'sb.id')
             ->join('products as p', 'p.id', '=', 'sbl.product_id')
-            ->when(true, fn($q) => $this->applyBillFilters($q, $f))
+            ->when(true, fn ($q) => $this->applyBillFilters($q, $f))
             ->where('sbl.is_price_overridden', 1)
             ->selectRaw('
                 sb.bill_no,
@@ -330,7 +339,7 @@ class SalesReportService
     public function getSalesExtremes(array $f): array
     {
         $rows = DB::table('sales_bills as sb')
-            ->when(true, fn($q) => $this->applyBillFilters($q, $f))
+            ->when(true, fn ($q) => $this->applyBillFilters($q, $f))
             ->selectRaw('
             DATE(sb.created_at) as sale_date,
             SUM(sb.total_amount) as total_sales

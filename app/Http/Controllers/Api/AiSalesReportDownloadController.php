@@ -5,11 +5,11 @@ namespace App\Http\Controllers\Api;
 use App\Exports\SalesReportExport;
 use App\Http\Controllers\Controller;
 use App\Services\SalesReportService;
+use Barryvdh\DomPDF\Facade\Pdf;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Maatwebsite\Excel\Facades\Excel;
-use Barryvdh\DomPDF\Facade\Pdf;
 
 class AiSalesReportDownloadController extends Controller
 {
@@ -30,7 +30,7 @@ class AiSalesReportDownloadController extends Controller
 
         $user = $request->user();
 
-        if (!in_array($user->role, ['admin', 'manager'], true)) {
+        if (! in_array($user->role, ['admin', 'manager'], true)) {
             return response()->json([
                 'message' => 'You are not authorized to download sales reports.',
             ], 403);
@@ -67,25 +67,25 @@ class AiSalesReportDownloadController extends Controller
                 'rows' => $rows,
             ])->setPaper('a4', 'landscape');
 
-            return $pdf->download($filename . '.pdf');
+            return $pdf->download($filename.'.pdf');
         }
 
         return Excel::download(
             new SalesReportExport($rows),
-            $filename . '.xlsx'
+            $filename.'.xlsx'
         );
     }
 
     private function resolveAuthorizedBranch($user, ?int $requestedBranchId): ?int
     {
         if ($user->role === 'manager') {
-            $branchId = !empty($user->branch_id)
+            $branchId = ! empty($user->branch_id)
                 ? (int) $user->branch_id
                 : DB::table('branch_staff')
                     ->where('user_id', $user->id)
                     ->value('branch_id');
 
-            if (!$branchId) {
+            if (! $branchId) {
                 abort(403, 'Manager ki assigned branch resolve nahi hui.');
             }
 
@@ -95,7 +95,7 @@ class AiSalesReportDownloadController extends Controller
         }
 
         // Admin: null or 0 means all branches in their own store.
-        if (!$requestedBranchId || $requestedBranchId === 0) {
+        if (! $requestedBranchId || $requestedBranchId === 0) {
             return null;
         }
 
@@ -111,7 +111,7 @@ class AiSalesReportDownloadController extends Controller
             ->where('store_id', $user->store_id)
             ->exists();
 
-        if (!$exists) {
+        if (! $exists) {
             abort(403, 'Invalid branch access.');
         }
     }

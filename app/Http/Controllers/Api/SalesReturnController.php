@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Branch;
 use App\Models\Inventory;
 use App\Models\SalesBill;
 use App\Models\SalesBillLine;
@@ -10,6 +11,7 @@ use App\Models\SalesReturn;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
 
 class SalesReturnController extends Controller
 {
@@ -20,29 +22,31 @@ class SalesReturnController extends Controller
         try {
             $query = SalesReturn::with([
                 'store', 'branch', 'salesBill', 'customer', 'returnLines',
-            ])->orderBy('id', 'desc');
+            ])
+                ->where('store_id', $user->store_id)
+                ->orderBy('id', 'desc');
 
             if ($user->role === 'cashier') {
-                $query->where('user_id', $user->id);
+                $query->where('processed_by', $user->id);
             } elseif ($user->role === 'manager') {
-                $branchIds = $user->branches->pluck('id')->toArray();
+                $branchIds = $this->allowedBranchIds($user);
 
-                if (! empty($branchIds)) {
-                    $query->whereIn('branch_id', $branchIds);
-                } else {
+                if (empty($branchIds)) {
                     return response()->json([
                         'status' => false,
                         'message' => 'No branch assigned to this manager.',
                     ], 400);
                 }
-            }
 
-            $bills = $query->get();
+                $query->whereIn('branch_id', $branchIds);
+            } elseif ($user->role === 'admin' && request()->filled('branch_id')) {
+                $query->where('branch_id', (int) request('branch_id'));
+            }
 
             return response()->json([
                 'status' => true,
                 'message' => 'Sales return bills fetched successfully',
-                'data' => $bills,
+                'data' => $query->get(),
             ]);
 
         } catch (\Exception $e) {
@@ -62,10 +66,15 @@ class SalesReturnController extends Controller
         try {
             $user = Auth::user();
 
-            $bill = SalesBill::where('bill_no', $request->bill_no)
+            $query = SalesBill::where('bill_no', $request->bill_no)
                 ->where('store_id', $user->store_id)
-                ->with(['lines.product'])
-                ->first();
+                ->with(['lines.product']);
+
+            if ($user->role !== 'admin') {
+                $query->whereIn('branch_id', $this->allowedBranchIds($user));
+            }
+
+            $bill = $query->first();
 
             if (! $bill) {
                 return response()->json([
@@ -96,7 +105,8 @@ class SalesReturnController extends Controller
     public function processReturn(Request $request)
     {
         $user = Auth::user();
-        if (! in_array($user->role, ['manager', 'admin'])) {
+
+        if (! in_array($user->role, ['manager', 'admin'], true)) {
             return response()->json([
                 'status' => false,
                 'message' => 'Unauthorized: Only managers or system administrators can process sales returns.',
@@ -108,7 +118,10 @@ class SalesReturnController extends Controller
             return response()->json(['error' => 'Missing Idempotency_key_return'], 400);
         }
 
-        $existingReturn = SalesReturn::where('last_idempotency_key_return', $idempotencyKey)->first();
+        $existingReturn = SalesReturn::where('store_id', $user->store_id)
+            ->where('last_idempotency_key_return', $idempotencyKey)
+            ->first();
+
         if ($existingReturn) {
             return response()->json([
                 'success' => true,
@@ -118,7 +131,11 @@ class SalesReturnController extends Controller
         }
 
         $request->validate([
-            'sales_bill_id' => 'required|integer|exists:sales_bills,id',
+            'sales_bill_id' => [
+                'required',
+                'integer',
+                Rule::exists('sales_bills', 'id')->where('store_id', $user->store_id),
+            ],
             'refund_type' => 'required|in:cash,online,store_credit,credit_note',
             'notes' => 'nullable|string|max:500',
             'lines' => 'required|array|min:1',
@@ -127,20 +144,34 @@ class SalesReturnController extends Controller
             'lines.*.is_damaged' => 'required|boolean',
         ]);
 
+        $billCheck = SalesBill::where('id', $request->sales_bill_id)
+            ->where('store_id', $user->store_id)
+            ->first();
+
+        if (! $billCheck) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Sales bill not found.',
+            ], 404);
+        }
+
+        if ($user->role === 'manager'
+            && ! in_array((int) $billCheck->branch_id, $this->allowedBranchIds($user), true)) {
+            return response()->json([
+                'status' => false,
+                'message' => 'You are not allowed to process returns for another branch.',
+            ], 403);
+        }
+
         try {
             DB::beginTransaction();
 
-            $branchId = $user->branches->pluck('id')->first();
-            if (! $branchId) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'User has no branch assigned.',
-                ], 400);
-            }
-
-            $originalBill = SalesBill::where('id', $request->sales_bill_id)
+            $originalBill = SalesBill::where('id', $billCheck->id)
+                ->where('store_id', $user->store_id)
                 ->lockForUpdate()
                 ->firstOrFail();
+
+            $branchId = (int) $originalBill->branch_id;
 
             $storeId = str_pad($user->store_id, 2, '0', STR_PAD_LEFT);
             $brId = str_pad($branchId, 2, '0', STR_PAD_LEFT);
@@ -286,5 +317,19 @@ class SalesReturnController extends Controller
                 'message' => 'Transaction aborted: '.$e->getMessage(),
             ], 500);
         }
+    }
+
+    private function allowedBranchIds($user): array
+    {
+        if ($user->role === 'admin') {
+            return Branch::where('store_id', $user->store_id)
+                ->pluck('id')
+                ->map(fn ($id) => (int) $id)
+                ->all();
+        }
+
+        return $user->branches()->pluck('branches.id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
     }
 }

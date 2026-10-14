@@ -2,10 +2,13 @@
 
 namespace App\Models;
 
+use App\Models\Concerns\BelongsToStore;
 use Illuminate\Database\Eloquent\Model;
 
 class SalesBill extends Model
 {
+    use BelongsToStore;
+
     protected $fillable = [
         'store_id',
         'branch_id',

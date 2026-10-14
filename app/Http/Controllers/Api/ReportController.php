@@ -13,9 +13,52 @@ use Illuminate\Support\Facades\DB;
 
 class ReportController extends Controller
 {
-    public function profitLoss(Request $request)
+    private function resolveBranchIds(Request $request): array
     {
         $user = Auth::user();
+
+        abort_unless($user && in_array($user->role, ['admin', 'manager'], true), 403, 'Unauthorized');
+
+        if ($user->role === 'admin') {
+            $allowed = DB::table('branches')
+                ->where('store_id', $user->store_id)
+                ->pluck('id')
+                ->map(fn ($id) => (int) $id)
+                ->all();
+        } else {
+            $allowed = $user->branches()
+                ->pluck('branches.id')
+                ->map(fn ($id) => (int) $id)
+                ->all();
+        }
+
+        $requested = (int) $request->input('branch_id', 0);
+
+        if ($requested > 0) {
+            abort_unless(in_array($requested, $allowed, true), 403, 'Invalid branch access.');
+
+            return [$requested];
+        }
+
+        return $allowed;
+    }
+
+    private function dateRange(Request $request, ?string $defaultFrom = null, ?string $defaultTo = null): array
+    {
+        $request->validate([
+            'start_date' => 'nullable|date',
+            'end_date' => 'nullable|date',
+        ]);
+
+        $start = Carbon::parse($request->input('start_date', $defaultFrom ?? now()->startOfMonth()->toDateString()));
+        $end = Carbon::parse($request->input('end_date', $defaultTo ?? now()->toDateString()));
+
+        return [$start, $end];
+    }
+
+    public function profitLoss(Request $request)
+    {
+        $branchIds = $this->resolveBranchIds($request);
 
         $from = $request->filled('from_date')
             ? Carbon::parse($request->from_date)->startOfDay()
@@ -25,141 +68,40 @@ class ReportController extends Controller
             ? Carbon::parse($request->to_date)->endOfDay()
             : Carbon::today()->endOfDay();
 
-        $query = DB::table('sales_bill_lines')
-            ->whereBetween('created_at', [$from, $to]);
-
-        /*
-        |--------------------------------------------------------------------------
-        | MANAGER
-        |--------------------------------------------------------------------------
-        */
-
-        if ($user->role === 'manager') {
-
-            $managerBranchIds = $user->branches()
-                ->pluck('branch_id')
-                ->toArray();
-
-            if (! empty($managerBranchIds)) {
-                $query->whereIn('branch_id', $managerBranchIds);
-            } else {
-                // Manager has no assigned branches
-                $query->whereRaw('1 = 0');
-            }
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | ADMIN
-        |--------------------------------------------------------------------------
-        */
-
-        elseif ($user->role === 'admin') {
-
-            /*
-            |--------------------------------------------------------------------------
-            | Admin can see ONLY branches belonging to their store
-            |--------------------------------------------------------------------------
-            */
-
-            $adminBranchQuery = DB::table('branches')
-                ->where('store_id', $user->store_id);
-
-            /*
-            |--------------------------------------------------------------------------
-            | If admin selected a branch
-            |--------------------------------------------------------------------------
-            |
-            | We still verify that the selected branch belongs
-            | to the logged-in admin's store.
-            |
-            */
-
-            if ($request->filled('branch_id')) {
-
-                $adminBranchQuery->where('id', $request->branch_id);
-            }
-
-            $allowedBranchIds = $adminBranchQuery
-                ->pluck('id')
-                ->toArray();
-
-            if (! empty($allowedBranchIds)) {
-
-                $query->whereIn('branch_id', $allowedBranchIds);
-
-            } else {
-
-                // No valid branch = no data
-                $query->whereRaw('1 = 0');
-            }
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | AGGREGATION
-        |--------------------------------------------------------------------------
-        */
-
-        $data = $query
+        $data = DB::table('sales_bill_lines')
+            ->whereBetween('created_at', [$from, $to])
+            ->whereIn('branch_id', $branchIds)
             ->selectRaw('
-            COALESCE(SUM(amount), 0) AS total_sales,
-            COALESCE(SUM(cogs), 0) AS total_cogs,
-            COALESCE(SUM(profit), 0) AS total_profit
-        ')
+                COALESCE(SUM(amount), 0) AS total_sales,
+                COALESCE(SUM(cogs), 0) AS total_cogs,
+                COALESCE(SUM(profit), 0) AS total_profit
+            ')
             ->first();
 
         return response()->json([
             'from_date' => $from->toDateString(),
             'to_date' => $to->toDateString(),
-
             'branch_id' => $request->branch_id ?? 'ALL',
-
             'sales' => round((float) $data->total_sales, 2),
             'cogs' => round((float) $data->total_cogs, 2),
             'profit' => round((float) $data->total_profit, 2),
-
-            'status' => $data->total_profit >= 0
-                ? 'profit'
-                : 'loss',
+            'status' => $data->total_profit >= 0 ? 'profit' : 'loss',
         ]);
     }
 
     public function topSellingProducts(Request $request)
     {
-        $user = Auth::user();
+        $branchIds = $this->resolveBranchIds($request);
 
-        if (! in_array($user->role, ['admin', 'manager'])) {
-            abort(403, 'Unauthorized');
-        }
-
-        $query = SalesBillLine::query()
+        return SalesBillLine::query()
             ->select([
                 'product_id',
                 DB::raw('SUM(qty) as total_qty'),
                 DB::raw('SUM(amount) as total_sales'),
                 DB::raw('SUM(profit) as total_profit'),
             ])
-            ->with('product:id,name,sku');
-
-        // ADMIN → only own store
-        if ($user->role === 'admin') {
-            $query->whereHas('branch', function ($q) use ($user) {
-                $q->where('store_id', $user->store_id);
-            });
-
-            if ($request->filled('branch_id')) {
-                $query->where('branch_id', $request->branch_id);
-            }
-        }
-
-        // MANAGER → only assigned branches
-        if ($user->role === 'manager') {
-            $branchIds = $user->branches()->pluck('branches.id');
-            $query->whereIn('branch_id', $branchIds);
-        }
-
-        return $query
+            ->with('product:id,name,sku')
+            ->whereIn('branch_id', $branchIds)
             ->groupBy('product_id')
             ->orderByDesc('total_qty')
             ->limit(10)
@@ -169,125 +111,110 @@ class ReportController extends Controller
     public function stockSummary(Request $request)
     {
         $user = Auth::user();
-        $storeId = $user->store_id;
+        $branchIds = $this->resolveBranchIds($request);
+        $storeId = (int) $user->store_id;
 
-        // Determine Branch ID based on Role
-        $branchId = null;
-        if ($user->role === 'admin') {
-            $branchId = $request->branch_id;
-        } elseif ($user->role === 'manager') {
-            $branchId = DB::table('branch_staff')
-                ->where('user_id', $user->id)
-                ->value('branch_id');
-
-            if (! $branchId) {
-                return response()->json([
-                    'status' => 'error',
-                    'message' => 'No branch assigned to this manager',
-                    'data' => [],
-                ], 403);
-            }
-        } else {
-            $branchId = $request->branch_id;
+        if ($user->role === 'manager' && empty($branchIds)) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'No branch assigned to this manager',
+                'data' => [],
+            ], 403);
         }
 
-        // Date handling
-        $startDate = $request->start_date ?? now()->startOfMonth()->toDateString();
-        $endDate = $request->end_date ?? now()->endOfMonth()->toDateString();
+        [$startC, $endC] = $this->dateRange(
+            $request,
+            now()->startOfMonth()->toDateString(),
+            now()->endOfMonth()->toDateString()
+        );
 
-        $lastStart = \Carbon\Carbon::parse($startDate)->subMonth()->startOfMonth()->toDateString();
-        $lastEnd = \Carbon\Carbon::parse($startDate)->subMonth()->endOfMonth()->toDateString();
+        $startDate = $startC->toDateString();
+        $endDate = $endC->toDateString();
+        $lastStart = $startC->copy()->subMonth()->startOfMonth()->toDateString();
+        $lastEnd = $startC->copy()->subMonth()->endOfMonth()->toDateString();
 
         $perPage = (int) ($request->per_page ?? 10);
 
-        // Subquery bindings helpers
-        $branchWherePb = $branchId ? "AND pb.branch_id = {$branchId}" : '';
-        $branchWhereSb = $branchId ? "AND sb.branch_id = {$branchId}" : '';
-        $branchWhereInv = $branchId ? "WHERE branch_id = {$branchId}" : '';
+        $idList = ! empty($branchIds) ? implode(',', $branchIds) : '0';
 
-        // Main Query
+        $branchWherePb = "AND pb.store_id = {$storeId} AND pb.branch_id IN ({$idList})";
+        $branchWhereSb = "AND sb.store_id = {$storeId} AND sb.branch_id IN ({$idList})";
+        $branchWhereInv = "WHERE branch_id IN ({$idList})";
+
         $query = DB::table('products as p')
             ->selectRaw('
-            p.id as product_id,
-            p.name as product_name,
-            p.barcode as barcode,
-            COALESCE(pur_before.total_purchase, 0) - COALESCE(sal_before.total_sale, 0) as opening_stock,
-            COALESCE(pur_month.total_purchase, 0) as purchased,
-            COALESCE(sal_month.total_sale, 0) as sold,
-            COALESCE(inv.stock, 0) as closing_stock,
-            COALESCE(sal_last.total_sale, 0) as last_month_sold
-        ')
+                p.id as product_id,
+                p.name as product_name,
+                p.barcode as barcode,
+                COALESCE(pur_before.total_purchase, 0) - COALESCE(sal_before.total_sale, 0) as opening_stock,
+                COALESCE(pur_month.total_purchase, 0) as purchased,
+                COALESCE(sal_month.total_sale, 0) as sold,
+                COALESCE(inv.stock, 0) as closing_stock,
+                COALESCE(sal_last.total_sale, 0) as last_month_sold
+            ')
             ->where('p.store_id', $storeId)
             ->when($request->search, fn ($q) => $q->where('p.name', 'like', "%{$request->search}%"))
-            ->when($request->product_id, fn ($q) => $q->where('p.id', $request->product_id));
+            ->when($request->product_id, fn ($q) => $q->where('p.id', (int) $request->product_id));
 
-        // Filter products by branch stock
-        if ($branchId) {
-            $query->whereExists(function ($q) use ($branchId) {
+        // Specific branch (manager ya admin ne branch choose ki) ho to sirf us branch ka stock wale products
+        if ($user->role === 'manager' || (int) $request->input('branch_id', 0) > 0) {
+            $query->whereExists(function ($q) use ($branchIds) {
                 $q->select(DB::raw(1))
                     ->from('inventories as i')
                     ->whereColumn('i.product_id', 'p.id')
-                    ->where('i.branch_id', $branchId);
+                    ->whereIn('i.branch_id', $branchIds);
             });
         }
 
-        // Purchase BEFORE
         $query->leftJoin(DB::raw("(
-        SELECT pl.product_id, SUM(pl.qty + pl.free_qty) AS total_purchase
-        FROM purchase_lines pl
-        JOIN purchase_bills pb ON pb.id = pl.purchase_bill_id
-        WHERE pb.bill_date < '{$startDate}' {$branchWherePb}
-        GROUP BY pl.product_id
-    ) AS pur_before"), 'pur_before.product_id', '=', 'p.id');
+            SELECT pl.product_id, SUM(pl.qty + pl.free_qty) AS total_purchase
+            FROM purchase_lines pl
+            JOIN purchase_bills pb ON pb.id = pl.purchase_bill_id
+            WHERE pb.bill_date < '{$startDate}' {$branchWherePb}
+            GROUP BY pl.product_id
+        ) AS pur_before"), 'pur_before.product_id', '=', 'p.id');
 
-        // Sales BEFORE
         $query->leftJoin(DB::raw("(
-        SELECT sl.product_id, SUM(sl.qty) AS total_sale
-        FROM sales_bill_lines sl
-        JOIN sales_bills sb ON sb.id = sl.sales_bill_id
-        WHERE sb.created_at < '{$startDate}' {$branchWhereSb}
-        GROUP BY sl.product_id
-    ) AS sal_before"), 'sal_before.product_id', '=', 'p.id');
+            SELECT sl.product_id, SUM(sl.qty) AS total_sale
+            FROM sales_bill_lines sl
+            JOIN sales_bills sb ON sb.id = sl.sales_bill_id
+            WHERE sb.created_at < '{$startDate}' {$branchWhereSb}
+            GROUP BY sl.product_id
+        ) AS sal_before"), 'sal_before.product_id', '=', 'p.id');
 
-        // Purchase THIS MONTH
         $query->leftJoin(DB::raw("(
-        SELECT pl.product_id, SUM(pl.qty + pl.free_qty) AS total_purchase
-        FROM purchase_lines pl
-        JOIN purchase_bills pb ON pb.id = pl.purchase_bill_id
-        WHERE pb.bill_date BETWEEN '{$startDate}' AND '{$endDate}' {$branchWherePb}
-        GROUP BY pl.product_id
-    ) AS pur_month"), 'pur_month.product_id', '=', 'p.id');
+            SELECT pl.product_id, SUM(pl.qty + pl.free_qty) AS total_purchase
+            FROM purchase_lines pl
+            JOIN purchase_bills pb ON pb.id = pl.purchase_bill_id
+            WHERE pb.bill_date BETWEEN '{$startDate}' AND '{$endDate}' {$branchWherePb}
+            GROUP BY pl.product_id
+        ) AS pur_month"), 'pur_month.product_id', '=', 'p.id');
 
-        // Sales THIS MONTH
         $query->leftJoin(DB::raw("(
-        SELECT sl.product_id, SUM(sl.qty) AS total_sale
-        FROM sales_bill_lines sl
-        JOIN sales_bills sb ON sb.id = sl.sales_bill_id
-        WHERE sb.created_at BETWEEN '{$startDate}' AND '{$endDate}' {$branchWhereSb}
-        GROUP BY sl.product_id
-    ) AS sal_month"), 'sal_month.product_id', '=', 'p.id');
+            SELECT sl.product_id, SUM(sl.qty) AS total_sale
+            FROM sales_bill_lines sl
+            JOIN sales_bills sb ON sb.id = sl.sales_bill_id
+            WHERE sb.created_at BETWEEN '{$startDate} 00:00:00' AND '{$endDate} 23:59:59' {$branchWhereSb}
+            GROUP BY sl.product_id
+        ) AS sal_month"), 'sal_month.product_id', '=', 'p.id');
 
-        // Sales LAST MONTH
         $query->leftJoin(DB::raw("(
-        SELECT sl.product_id, SUM(sl.qty) AS total_sale
-        FROM sales_bill_lines sl
-        JOIN sales_bills sb ON sb.id = sl.sales_bill_id
-        WHERE sb.created_at BETWEEN '{$lastStart}' AND '{$lastEnd}' {$branchWhereSb}
-        GROUP BY sl.product_id
-    ) AS sal_last"), 'sal_last.product_id', '=', 'p.id');
+            SELECT sl.product_id, SUM(sl.qty) AS total_sale
+            FROM sales_bill_lines sl
+            JOIN sales_bills sb ON sb.id = sl.sales_bill_id
+            WHERE sb.created_at BETWEEN '{$lastStart} 00:00:00' AND '{$lastEnd} 23:59:59' {$branchWhereSb}
+            GROUP BY sl.product_id
+        ) AS sal_last"), 'sal_last.product_id', '=', 'p.id');
 
-        // INVENTORY (Current Branch Stock)
         $query->leftJoin(DB::raw("(
-        SELECT product_id, SUM(qty - sold_qty - expired_qty) AS stock
-        FROM inventories
-        {$branchWhereInv}
-        GROUP BY product_id
-    ) AS inv"), 'inv.product_id', '=', 'p.id');
+            SELECT product_id, SUM(qty - sold_qty - expired_qty) AS stock
+            FROM inventories
+            {$branchWhereInv}
+            GROUP BY product_id
+        ) AS inv"), 'inv.product_id', '=', 'p.id');
 
-        // Execute Paginate with query string parameters attached
         $products = $query->paginate($perPage)->appends($request->all());
 
-        // Data Transformation
         $data = collect($products->items())->map(function ($item) {
             $totalAvailable = $item->opening_stock + $item->purchased;
             $percentage = $totalAvailable > 0
@@ -338,29 +265,21 @@ class ReportController extends Controller
     public function purchaseSummary(Request $request)
     {
         $user = Auth::user();
-        $storeId = $user->store_id;
+        $storeId = (int) $user->store_id;
+        $branchIds = $this->resolveBranchIds($request);
 
-        $branchId = null;
-        if ($user->role === 'admin') {
-            $branchId = $request->branch_id;
-        } elseif ($user->role === 'manager') {
-            $branchId = DB::table('branch_staff')
-                ->where('user_id', $user->id)
-                ->value('branch_id');
-
-            if (! $branchId) {
-                return response()->json([
-                    'status' => 'error',
-                    'message' => 'No branch assigned to this manager',
-                    'data' => [],
-                ], 403);
-            }
-        } else {
-            $branchId = $request->branch_id;
+        if ($user->role === 'manager' && empty($branchIds)) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'No branch assigned to this manager',
+                'data' => [],
+            ], 403);
         }
 
-        $start = $request->start_date;
-        $end = $request->end_date;
+        [$startC, $endC] = $this->dateRange($request);
+        $start = $startC->toDateString();
+        $end = $endC->toDateString();
+
         $groupBy = $request->group_by ?? 'date';
         $supplierId = $request->supplier_id;
         $brandId = $request->brand_id;
@@ -371,31 +290,17 @@ class ReportController extends Controller
             ->join('purchase_lines as pl', 'pl.purchase_bill_id', '=', 'pb.id')
             ->leftJoin('products as p', 'p.id', '=', 'pl.product_id')
             ->leftJoin('gst_rates as g', 'g.id', '=', 'pl.gst_rate_id')
-            ->where('pb.store_id', $storeId);
+            ->where('pb.store_id', $storeId)
+            ->whereIn('pb.branch_id', $branchIds)
+            ->whereDate('pb.bill_date', '>=', $start)
+            ->whereDate('pb.bill_date', '<=', $end);
 
-        if ($start === $end) {
-            $query->whereDate('pb.bill_date', $start);
-        } else {
-            $query->whereDate('pb.bill_date', '>=', $start)
-                ->whereDate('pb.bill_date', '<=', $end);
-        }
-
-        // Branch Filter
-        if (! empty($branchId)) {
-            $query->where('pb.branch_id', $branchId);
-        }
-
-        // Supplier Filter
         if (! empty($supplierId)) {
             $query->where('pb.supplier_id', $supplierId);
         }
-
-        // Brand Filter
         if (! empty($brandId)) {
             $query->where('p.brand_id', $brandId);
         }
-
-        // Product Filter
         if (! empty($productId)) {
             $query->where('pl.product_id', $productId);
         }
@@ -442,10 +347,11 @@ class ReportController extends Controller
         $taxSlabs = DB::table('purchase_lines as pl')
             ->join('purchase_bills as pb', 'pb.id', '=', 'pl.purchase_bill_id')
             ->leftJoin('gst_rates as g', 'g.id', '=', 'pl.gst_rate_id')
-            ->leftJoin('products as p', 'p.id', '=', 'pl.product_id') // Added for brand filtering
+            ->leftJoin('products as p', 'p.id', '=', 'pl.product_id')
             ->where('pb.store_id', $storeId)
-            ->when($start === $end, fn ($q) => $q->whereDate('pb.bill_date', $start), fn ($q) => $q->whereBetween('pb.bill_date', [$start, $end]))
-            ->when($branchId, fn ($q) => $q->where('pb.branch_id', $branchId))
+            ->whereIn('pb.branch_id', $branchIds)
+            ->whereDate('pb.bill_date', '>=', $start)
+            ->whereDate('pb.bill_date', '<=', $end)
             ->when($supplierId, fn ($q) => $q->where('pb.supplier_id', $supplierId))
             ->when($brandId, fn ($q) => $q->where('p.brand_id', $brandId))
             ->when($productId, fn ($q) => $q->where('pl.product_id', $productId))
@@ -460,10 +366,10 @@ class ReportController extends Controller
             $bills = DB::table('purchase_bills as pb')
                 ->leftJoin('suppliers as s', 's.id', '=', 'pb.supplier_id')
                 ->where('pb.store_id', $storeId)
-                ->when($start === $end, fn ($q) => $q->whereDate('pb.bill_date', $start), fn ($q) => $q->whereBetween('pb.bill_date', [$start, $end]))
-                ->when($branchId, fn ($q) => $q->where('pb.branch_id', $branchId))
+                ->whereIn('pb.branch_id', $branchIds)
+                ->whereDate('pb.bill_date', '>=', $start)
+                ->whereDate('pb.bill_date', '<=', $end)
                 ->when($supplierId, fn ($q) => $q->where('pb.supplier_id', $supplierId))
-                // Only show bills containing the specific product/brand if filtered
                 ->when($productId || $brandId, function ($q) use ($productId, $brandId) {
                     $q->whereExists(function ($sq) use ($productId, $brandId) {
                         $sq->select(DB::raw(1))
@@ -486,7 +392,7 @@ class ReportController extends Controller
                 'start_date' => $start,
                 'end_date' => $end,
                 'group_by' => $groupBy,
-                'branch_id' => $branchId,
+                'branch_id' => $request->input('branch_id'),
             ],
             'report' => $report,
             'tax_slabs' => $taxSlabs,
@@ -496,22 +402,22 @@ class ReportController extends Controller
 
     public function salesSummary(Request $request)
     {
-        $query = SalesBill::from('sales_bills as sb');
+        $user = Auth::user();
+        $branchIds = $this->resolveBranchIds($request);
 
-        /* DATE RANGE */
+        $query = SalesBill::from('sales_bills as sb')
+            ->where('sb.store_id', $user->store_id)
+            ->whereIn('sb.branch_id', $branchIds);
+
         if ($request->start_date && $request->end_date) {
+            [$startC, $endC] = $this->dateRange($request);
+
             $query->whereBetween('sb.created_at', [
-                $request->start_date.' 00:00:00',
-                $request->end_date.' 23:59:59',
+                $startC->toDateString().' 00:00:00',
+                $endC->toDateString().' 23:59:59',
             ]);
         }
 
-        /* BRANCH FILTER */
-        if (! empty($request->branch_id)) {
-            $query->where('sb.branch_id', $request->branch_id);
-        }
-
-        /* AGGREGATED DAILY SALES */
         $data = $query
             ->selectRaw('DATE(sb.created_at) as date')
             ->selectRaw('COUNT(sb.id) as bills')
@@ -533,15 +439,30 @@ class ReportController extends Controller
 
     public function salesAnalytics(Request $request)
     {
-        $start = $request->start_date.' 00:00:00';
-        $end = $request->end_date.' 23:59:59';
+        $user = Auth::user();
+        $storeId = (int) $user->store_id;
+        $branchIds = $this->resolveBranchIds($request);
 
-        $branchId = $request->branch_id;
+        [$startC, $endC] = $this->dateRange($request);
+        $start = $startC->toDateString().' 00:00:00';
+        $end = $endC->toDateString().' 23:59:59';
+
+        $branchId = $request->input('branch_id');
+
+        // Reusable base queries: store + branch scope hamesha lagega
+        $bills = fn () => DB::table('sales_bills')
+            ->where('store_id', $storeId)
+            ->whereIn('branch_id', $branchIds)
+            ->whereBetween('created_at', [$start, $end]);
+
+        $lines = fn () => DB::table('sales_bill_lines as l')
+            ->join('sales_bills as b', 'b.id', '=', 'l.sales_bill_id')
+            ->where('b.store_id', $storeId)
+            ->whereIn('b.branch_id', $branchIds)
+            ->whereBetween('b.created_at', [$start, $end]);
 
         // DAILY SALES SUMMARY
-        $daily = DB::table('sales_bills')
-            ->when($branchId, fn ($q) => $q->where('branch_id', $branchId))
-            ->whereBetween('created_at', [$start, $end])
+        $daily = $bills()
             ->selectRaw('DATE(created_at) as date')
             ->selectRaw('COUNT(id) as bills')
             ->selectRaw('SUM(subtotal) as total_taxable')
@@ -555,9 +476,7 @@ class ReportController extends Controller
             ->get();
 
         // HOURLY SALES HEATMAP
-        $hourly = DB::table('sales_bills')
-            ->when($branchId, fn ($q) => $q->where('branch_id', $branchId))
-            ->whereBetween('created_at', [$start, $end])
+        $hourly = $bills()
             ->selectRaw('HOUR(created_at) as hour')
             ->selectRaw('SUM(total_amount) as sales')
             ->groupBy('hour')
@@ -565,11 +484,8 @@ class ReportController extends Controller
             ->pluck('sales', 'hour');
 
         // TOP 10 BEST-SELLING PRODUCTS
-        $topProducts = DB::table('sales_bill_lines as l')
-            ->join('sales_bills as b', 'b.id', '=', 'l.sales_bill_id')
+        $topProducts = $lines()
             ->join('products as p', 'p.id', '=', 'l.product_id')
-            ->when($branchId, fn ($q) => $q->where('l.branch_id', $branchId))
-            ->whereBetween('b.created_at', [$start, $end])
             ->select('p.id', 'p.name')
             ->selectRaw('SUM(l.qty) as total_qty')
             ->selectRaw('SUM(l.amount) as total_amount')
@@ -579,11 +495,8 @@ class ReportController extends Controller
             ->get();
 
         // SLOW MOVING PRODUCTS (bottom 10)
-        $slowProducts = DB::table('sales_bill_lines as l')
-            ->join('sales_bills as b', 'b.id', '=', 'l.sales_bill_id')
+        $slowProducts = $lines()
             ->join('products as p', 'p.id', '=', 'l.product_id')
-            ->when($branchId, fn ($q) => $q->where('l.branch_id', $branchId))
-            ->whereBetween('b.created_at', [$start, $end])
             ->select('p.id', 'p.name')
             ->selectRaw('SUM(l.qty) as sold_qty')
             ->groupBy('p.id', 'p.name')
@@ -592,16 +505,18 @@ class ReportController extends Controller
             ->get();
 
         // PAYMENT METHOD BREAKDOWN
-        $payments = DB::table('sales_bill_payments')
-            ->whereBetween('created_at', [$start, $end])
-            ->selectRaw('method, SUM(amount) as total')
-            ->groupBy('method')
+        $payments = DB::table('sales_bill_payments as sbp')
+            ->join('sales_bills as b', 'b.id', '=', 'sbp.sales_bill_id')
+            ->where('b.store_id', $storeId)
+            ->whereIn('b.branch_id', $branchIds)
+            ->where('sbp.status', 'success')
+            ->whereBetween('sbp.created_at', [$start, $end])
+            ->selectRaw('sbp.method, SUM(sbp.amount) as total')
+            ->groupBy('sbp.method')
             ->pluck('total', 'method');
 
         // HIGHEST SALE DAY
-        $highestDay = DB::table('sales_bills')
-            ->when($branchId, fn ($q) => $q->where('branch_id', $branchId))
-            ->whereBetween('created_at', [$start, $end])
+        $highestDay = $bills()
             ->selectRaw('DATE(created_at) as date')
             ->selectRaw('SUM(total_amount) as sale')
             ->groupBy('date')
@@ -609,9 +524,7 @@ class ReportController extends Controller
             ->first();
 
         // LOWEST SALE DAY
-        $lowestDay = DB::table('sales_bills')
-            ->when($branchId, fn ($q) => $q->where('branch_id', $branchId))
-            ->whereBetween('created_at', [$start, $end])
+        $lowestDay = $bills()
             ->whereDate('created_at', '<', Carbon::today())
             ->selectRaw('DATE(created_at) as date')
             ->selectRaw('SUM(total_amount) as sale')
@@ -622,6 +535,8 @@ class ReportController extends Controller
         // BRANCHWISE PERFORMANCE
         $branchPerformance = DB::table('sales_bills as b')
             ->join('branches as br', 'br.id', '=', 'b.branch_id')
+            ->where('b.store_id', $storeId)
+            ->whereIn('b.branch_id', $branchIds)
             ->whereBetween('b.created_at', [$start, $end])
             ->select('br.name as branch')
             ->selectRaw('COUNT(b.id) as bills')
@@ -632,11 +547,9 @@ class ReportController extends Controller
             ->get();
 
         // BRAND / CATEGORY SALES
-        $brandSales = DB::table('sales_bill_lines as l')
-            ->join('sales_bills as b', 'b.id', '=', 'l.sales_bill_id')
+        $brandSales = $lines()
             ->join('products as p', 'p.id', '=', 'l.product_id')
             ->join('brands as br', 'br.id', '=', 'p.brand_id')
-            ->whereBetween('b.created_at', [$start, $end])
             ->select('br.id', 'br.name')
             ->selectRaw('SUM(l.qty) as qty')
             ->selectRaw('SUM(l.amount) as amount')
@@ -647,8 +560,8 @@ class ReportController extends Controller
         return response()->json([
             'success' => true,
             'meta' => [
-                'start_date' => $request->start_date,
-                'end_date' => $request->end_date,
+                'start_date' => $startC->toDateString(),
+                'end_date' => $endC->toDateString(),
                 'branch_id' => $branchId,
             ],
             'summary' => $daily,
@@ -673,19 +586,24 @@ class ReportController extends Controller
         ]);
     }
 
-    public function getExpiryReport()
+    public function getExpiryReport(Request $request)
     {
         try {
+            $branchIds = $this->resolveBranchIds($request);
+
             $expiryData = Inventory::with(['product:id,name'])
+                ->whereIn('branch_id', $branchIds)
                 ->whereNotNull('expiry_date')
-                ->where('qty', '>', 'sold_qty')
+                ->whereColumn('qty', '>', 'sold_qty')
                 ->orderBy('expiry_date', 'asc')
                 ->get([
                     'id',
                     'product_id',
+                    'branch_id',
                     'batch_no',
                     'expiry_date',
                     'qty',
+                    'sold_qty',
                 ]);
 
             $formattedData = $expiryData->map(function ($item) {
@@ -704,6 +622,8 @@ class ReportController extends Controller
                 'data' => $formattedData,
             ], 200);
 
+        } catch (\Symfony\Component\HttpKernel\Exception\HttpException $e) {
+            throw $e;
         } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
