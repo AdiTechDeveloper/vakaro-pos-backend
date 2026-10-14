@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\Api\AiSalesReportDownloadController;
 use App\Http\Controllers\AIController;
+use App\Http\Controllers\Api\AiConversationController;
 use App\Http\Controllers\Api\AiInsightController;
 use App\Http\Controllers\Api\AiReportDownloadController;
 use App\Http\Controllers\Api\AuthController;
@@ -151,19 +152,21 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response'])->group(
 
 // supplier routes
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:suppliers'])->group(function () {
+    Route::get('/suppliers/import-template', [SupplierController::class, 'downloadImportTemplate']);
+    Route::post('/suppliers/import', [SupplierController::class, 'importExcel']);
     Route::get('/suppliers', [SupplierController::class, 'index']);
     Route::get('/suppliers/{id}', [SupplierController::class, 'show']);
     Route::post('/suppliers', [SupplierController::class, 'store']);
     Route::put('/suppliers/{id}', [SupplierController::class, 'update']);
     Route::delete('/suppliers/{id}', [SupplierController::class, 'destroy']);
     Route::get('/suppliers/{id}/purchase-history', [
-    SupplierController::class,
-    'purchaseHistory',
-]);
-Route::get(
-    '/suppliers/rate-comparison',
-    [SupplierController::class, 'rateComparison']
-);
+        SupplierController::class,
+        'purchaseHistory',
+    ]);
+    Route::get(
+        '/suppliers/rate-comparison',
+        [SupplierController::class, 'rateComparison']
+    );
 });
 
 // GST Rate routes
@@ -178,6 +181,8 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 
 // Product routes
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:products'])->group(function () {
+    Route::post('/products/import', [ProductController::class, 'importExcel']);
+    Route::get('/products/import-template', [ProductController::class, 'downloadImportTemplate']);
     Route::get('/all-products', [ProductController::class, 'getAllProducts']);
     Route::get('/products', [ProductController::class, 'index']);
     Route::get('/products/{id}', [ProductController::class, 'show']);
@@ -197,9 +202,9 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::get('/purchase-line', [PurchaseLineController::class, 'index']);
     Route::delete('purchase-bill/{id}', [PurchaseBillController::class, 'destroy']);
     Route::post('/purchase-bill/scan', [
-    AIController::class,
-    'scanPurchaseBill'
-])->middleware('throttle:10,1');
+        AIController::class,
+        'scanPurchaseBill'
+    ])->middleware('throttle:10,1');
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_suplier'])->group(function () {
@@ -269,10 +274,10 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::get('/reports/sales-report', [SalesReportController::class, 'index']);
     Route::get('/reports/monthly-sales', [SalesReportController::class, 'monthlySales']);
     Route::post(
-    '/reports/ai-sales-download',
-    [AiSalesReportDownloadController::class, 'download']
-);
-Route::post('/reports/ai-report-download', [AiReportDownloadController::class, 'download']);
+        '/reports/ai-sales-download',
+        [AiSalesReportDownloadController::class, 'download']
+    );
+    Route::post('/reports/ai-report-download', [AiReportDownloadController::class, 'download']);
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_purchase'])->group(function () {
@@ -312,6 +317,28 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 });
 
 
+Route::middleware(['auth:sanctum'])->group(function () {
+    Route::get('/ai/conversations', [
+        AiConversationController::class,
+        'index',
+    ]);
+
+    Route::post('/ai/conversations', [
+        AiConversationController::class,
+        'store',
+    ]);
+
+    Route::get('/ai/conversations/{id}', [
+        AiConversationController::class,
+        'show',
+    ])->whereNumber('id');
+
+    Route::delete('/ai/conversations/{id}', [
+        AiConversationController::class,
+        'destroy',
+    ])->whereNumber('id');
+});
+
 
 Route::prefix('customer-portal')->group(function () {
     Route::post('/send-otp', [CustomerPortalController::class, 'sendOtp']);
@@ -327,3 +354,11 @@ Route::middleware(['auth:sanctum'])->group(function () {
 
     Route::post('/ai/chat', [AIController::class, 'chat']);
 });
+
+
+Route::get('/test-product-template', function () {
+    return \Maatwebsite\Excel\Facades\Excel::download(
+        new \App\Exports\ProductTemplateExport(),
+        'product-import-template.xlsx'
+    );
+})->middleware('auth:sanctum');
