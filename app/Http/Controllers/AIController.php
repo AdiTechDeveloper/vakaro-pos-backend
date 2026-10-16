@@ -14,722 +14,795 @@ use Carbon\Carbon;
 class AIController extends Controller
 {
 
-public function chat(
-    Request $request,
-    SalesReportService $salesReportService,
-    \App\Services\AIProviderService $aiProviderService
- ) {
-    $request->validate([
-        'message' => ['required', 'string', 'max:2000'],
-        'conversation_id' => ['nullable', 'integer', 'min:1'],
-        'branch_id' => ['nullable', 'integer', 'min:0'],
-        'history' => ['nullable', 'array', 'max:20'],
-        'history.*.role' => ['required', 'in:user,assistant'],
-        'history.*.content' => ['required', 'string', 'max:2000'],
-    ]);
+    public function chat(
+        Request $request,
+        SalesReportService $salesReportService,
+        \App\Services\AIProviderService $aiProviderService
+    ) {
+        $request->validate([
+            'message' => ['required', 'string', 'max:2000'],
+            'conversation_id' => ['nullable', 'integer', 'min:1'],
+            'branch_id' => ['nullable', 'integer', 'min:0'],
+            'history' => ['nullable', 'array', 'max:20'],
+            'history.*.role' => ['required', 'in:user,assistant'],
+            'history.*.content' => ['required', 'string', 'max:2000'],
+        ]);
 
-    $user = Auth::user();
+        $user = Auth::user();
 
-    if (!$user) {
-        return response()->json([
-            'status' => false,
-            'message' => 'Unauthenticated.',
-        ], 401);
-    }
-
-    if (!in_array($user->role, ['admin', 'manager'], true)) {
-        return response()->json([
-            'status' => false,
-            'message' => 'You are not authorized to use the AI business assistant.',
-        ], 403);
-    }
-
-    // Conversation must belong to the authenticated user.
-    $conversation = null;
-    if ($request->filled('conversation_id')) {
-        $conversation = AiConversation::query()
-            ->where('id', $request->integer('conversation_id'))
-            ->where('user_id', $user->id)
-            ->first();
-
-        if (!$conversation) {
+        if (!$user) {
             return response()->json([
                 'status' => false,
-                'message' => 'Conversation not found.',
-            ], 404);
+                'message' => 'Unauthenticated.',
+            ], 401);
         }
-    }
 
-    // Admin ke liye branch_id = 0 means all branches.
-    $requestedBranchId = $request->input('branch_id');
+        if (!in_array($user->role, ['admin', 'manager'], true)) {
+            return response()->json([
+                'status' => false,
+                'message' => 'You are not authorized to use the AI business assistant.',
+            ], 403);
+        }
 
-    if ($user->role === 'admin' && (int) $requestedBranchId === 0) {
-        $requestedBranchId = null;
-    }
+        // Conversation must belong to the authenticated user.
+        $conversation = null;
+        if ($request->filled('conversation_id')) {
+            $conversation = AiConversation::query()
+                ->where('id', $request->integer('conversation_id'))
+                ->where('user_id', $user->id)
+                ->first();
 
-    $branchId = $this->resolveBranchId(
-        $user,
-        $requestedBranchId
-    );
-
-    if ($conversation && (int) ($conversation->branch_id ?? 0) !== (int) ($branchId ?? 0)) {
-        return response()->json([
-            'status' => false,
-            'message' => 'This conversation belongs to a different branch scope. Start a new chat for the selected branch.',
-        ], 422);
-    }
-
-
-    // Deterministically fetch product names for list-style inventory questions.
-    // This avoids depending on the LLM to decide whether to call the inventory tool.
-    $latestMessage = trim((string) $request->input('message', ''));
-
-    // Report/download requests must go to the AI + report tool, not the product list shortcut.
-    $isReportRequest = preg_match(
-        '/\b(report|download|export|pdf|excel|xlsx)\b/iu',
-        $latestMessage
-    ) === 1;
-
-    $isProductListRequest = preg_match(
-        '/\b(saare|sare|sabhi|sab|all|list|show|naam|names?)\b.{0,80}\b(products?|items?|inventory)\b|\b(products?|items?)\b.{0,80}\b(naam|names?|list|saare|sare|sabhi|sab|all)\b/iu',
-        $latestMessage
-    ) === 1;
-
-    if ($isProductListRequest && !$isReportRequest) {
-        try {
-            // Shortcut replies are fixed text, so pick English vs Hinglish from the user's message.
-            $isEnglish = str_contains($this->languageDirective($latestMessage), 'English only');
-
-            $inventory = $this->getProductStockDetails(
-                $user,
-                $branchId,
-                ['page' => 1, 'per_page' => 100]
-            );
-
-            if (!empty($inventory['error'])) {
+            if (!$conversation) {
                 return response()->json([
                     'status' => false,
-                    'message' => $inventory['error'],
-                ], 422);
+                    'message' => 'Conversation not found.',
+                ], 404);
             }
-
-            $products = $inventory['products'] ?? [];
-            if (empty($products)) {
-                return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
-                    'status' => true,
-                    'message' => $isEnglish
-                        ? 'No products were found in your selected data scope.'
-                        : 'Aapke selected data scope mein koi product nahi mila.',
-                    'data' => $inventory,
-                ]);
-            }
-
-            $table = "| Product Name | Total Qty | Sold Qty | Expired Qty | Available Qty |\n";
-            $table .= "|---|---:|---:|---:|---:|\n";
-            foreach ($products as $product) {
-                $name = str_replace(['|', "\r", "\n"], ['\\|', ' ', ' '], (string) ($product['product_name'] ?? 'Unnamed product'));
-                $table .= '| ' . $name
-                    . ' | ' . ($product['total_qty'] ?? 0)
-                    . ' | ' . ($product['sold_qty'] ?? 0)
-                    . ' | ' . ($product['expired_qty'] ?? 0)
-                    . ' | ' . ($product['available_qty'] ?? 0)
-                    . " |\n";
-            }
-
-            $total = (int) ($inventory['total_products'] ?? count($products));
-            $message = ($isEnglish
-                ? "There are {$total} products in your selected data scope.\n\n"
-                : "Aapke selected data scope mein total {$total} products hain.\n\n") . $table;
-            if (($inventory['total_pages'] ?? 1) > 1) {
-                $message .= $isEnglish
-                    ? "\nThese are the first 100 products. Total pages: " . $inventory['total_pages'] . '. Ask for the next page to see more.'
-                    : "\nYe pehle 100 products hain. Total pages: " . $inventory['total_pages'] . '. Agli list ke liye next page maangiye.';
-            }
-
-            return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
-                'status' => true,
-                'message' => $message,
-                'data' => $inventory,
-            ]);
-        } catch (\Throwable $exception) {
-            report($exception);
-            return response()->json([
-                'status' => false,
-                'message' => 'Product inventory load nahi ho payi. Server logs mein database error check karein.',
-            ], 500);
-        }
-    }
-
-    // Deterministic shortcut for "how many branches / branch names" questions.
-    // The LLM was guessing (e.g. "0 branches") instead of calling get_branches,
-    // so this answers straight from the database. Branch IDs are NOT shown to the user.
-    $mentionsBranch = preg_match(
-        '/\b(branch|branches)\b/iu',
-        $latestMessage
-    ) === 1;
-
-    $asksBranchCountOrList = preg_match(
-        '/\b(how many|kitni|kitne|ketli|ketla|count|list|names?|naam)\b/iu',
-        $latestMessage
-    ) === 1;
-
-    // Do not hijack questions that are really about sales/stock/etc. of a branch.
-    $mentionsOtherTopic = preg_match(
-        '/\b(sales?|sale|stock|inventory|products?|items?|suppliers?|profit|purchase|payment|bills?|revenue|compare|comparison)\b/iu',
-        $latestMessage
-    ) === 1;
-
-    $isBranchRequest = $mentionsBranch
-        && $asksBranchCountOrList
-        && !$mentionsOtherTopic
-        && !$isReportRequest;
-
-    if ($isBranchRequest) {
-        try {
-            $result = $this->getBranches($user, $branchId);
-
-            if (!empty($result['error'])) {
-                return response()->json([
-                    'status' => false,
-                    'message' => $result['error'],
-                ], 422);
-            }
-
-            $isEnglish = str_contains($this->languageDirective($latestMessage), 'English only');
-            $count = (int) ($result['count'] ?? 0);
-
-            if ($count === 0) {
-                return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
-                    'status' => true,
-                    'message' => $isEnglish
-                        ? 'You do not have any branches in your store yet.'
-                        : 'Aapke store mein abhi koi branch nahi hai.',
-                    'data' => $result,
-                ]);
-            }
-
-            $message = $isEnglish
-                ? "You have {$count} branch(es) in your store.\n\n"
-                : "Aapke store mein total {$count} branch hain.\n\n";
-
-            $message .= "| Branch Name |\n|---|\n";
-            foreach ($result['branches'] as $b) {
-                $branchName = str_replace(['|', "\r", "\n"], ['\\|', ' ', ' '], (string) ($b['branch_name'] ?? ''));
-                $message .= "| {$branchName} |\n";
-            }
-
-            return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
-                'status' => true,
-                'message' => $message,
-                'data' => $result,
-            ]);
-        } catch (\Throwable $exception) {
-            report($exception);
-            return response()->json([
-                'status' => false,
-                'message' => 'Branch list load nahi ho payi. Server logs check karein.',
-            ], 500);
-        }
-    }
-
-    // When a database conversation is supplied, load history from MySQL rather
-    // than trusting client-provided history. Keep the old history path temporarily
-    // for the frontend until it is migrated in the next step.
-    if ($conversation) {
-        $history = $conversation->messages()
-            ->whereIn('role', ['user', 'assistant'])
-            ->orderByDesc('id')
-            ->limit(10)
-            ->get(['role', 'content'])
-            ->reverse()
-            ->map(fn ($item) => [
-                'role' => $item->role,
-                'content' => $item->content,
-            ])
-            ->values()
-            ->all();
-    } else {
-        $history = collect($request->input('history', []))
-            ->take(-10)
-            ->map(fn ($item) => [
-                'role' => $item['role'],
-                'content' => $item['content'],
-            ])
-            ->values()
-            ->all();
-    }
-
-    $messages = array_merge(
-        [
-            [
-                'role' => 'system',
-                'content' => $this->systemPrompt($user, $branchId),
-            ],
-        ],
-        $history,
-        [
-            [
-                'role' => 'user',
-                // The language directive is only sent to the AI. The user never sees it
-                // and the original message is what gets saved in the chat history.
-                'content' => $request->message
-                    . "\n\n(Instruction for the assistant, never mention it: "
-                    . $this->languageDirective((string) $request->message) . ')',
-            ],
-        ]
-    );
-
-    $tools = [
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_sales_summary',
-                'description' => 'Get actual POS sales data for a date range. Use this whenever the user asks about sales, revenue, business amount, number of bills, collected amount, due amount, profit, or similar sales performance information.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'date_range' => [
-                            'type' => 'string',
-                            'enum' => [
-                                'today',
-                                'yesterday',
-                                'last_7_days',
-                                'this_month',
-                            ],
-                            'description' => 'The period for which sales data is required.',
-                        ],
-                        'branch_id' => [
-                            'type' => 'integer',
-                            'description' => 'Optional branch ID. Use this only when the user explicitly asks about a specific branch.',
-                        ],
-                    ],
-                    'required' => ['date_range'],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'prepare_sales_report_download',
-                'description' => 'Use ONLY when the user explicitly asks to download/export/get a sales report file. Prepares a download button for the frontend. Do not use for normal sales questions.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'format' => [
-                            'type' => 'string',
-                            'enum' => ['pdf', 'excel'],
-                            'description' => 'Use excel ONLY if the user said excel/xlsx/sheet. Otherwise use pdf.',
-                        ],
-                        'date_range' => [
-                            'type' => 'string',
-                            'enum' => ['today', 'yesterday', 'last_7_days', 'this_month', 'last_month', 'custom'],
-                            'description' => 'Use custom for a specific month, year or date range, and then fill date_from and date_to.',
-                        ],
-                        'date_from' => [
-                            'type' => 'string',
-                            'description' => 'YYYY-MM-DD, only for custom.',
-                        ],
-                        'date_to' => [
-                            'type' => 'string',
-                            'description' => 'YYYY-MM-DD, only for custom.',
-                        ],
-                    ],
-                    'required' => ['date_range'],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'prepare_report_download',
-                'description' => 'Use ONLY when the user explicitly asks to download/export a NON-sales report file: stock/inventory report, low stock report, out of stock report, supplier dues report, top selling products report, or purchase suggestions report. Prepares a download button for the frontend. For SALES reports use prepare_sales_report_download instead.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'report_type' => [
-                            'type' => 'string',
-                            'enum' => ['inventory', 'low_stock', 'out_of_stock', 'supplier_dues', 'top_selling', 'purchase_suggestions', 'product_profit', 'branch_comparison', 'purchase_report'],
-                            'description' => 'inventory = full stock list, low_stock = products running low, out_of_stock = zero stock products, supplier_dues = supplier purchase/paid/outstanding, top_selling = best selling products for a period, purchase_suggestions = what to reorder, product_profit = product-wise revenue and profit for a period, branch_comparison = all branches sales/profit comparison for a period (admin only), purchase_report = purchase bills with paid and due for a period.',
-                        ],
-                        'format' => [
-                            'type' => 'string',
-                            'enum' => ['pdf', 'excel'],
-                            'description' => 'Use excel ONLY if the user said excel/xlsx/sheet. Otherwise use pdf.',
-                        ],
-                        'date_range' => [
-                            'type' => 'string',
-                            'enum' => ['today', 'yesterday', 'last_7_days', 'this_month', 'last_month', 'custom'],
-                            'description' => 'Only for top_selling, product_profit, branch_comparison and purchase_report (default this_month). Other reports are current snapshots and ignore this.',
-                        ],
-                        'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for period reports with custom range.'],
-                        'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for period reports with custom range.'],
-                        'threshold' => ['type' => 'integer', 'description' => 'Only for low_stock. Default 10.'],
-                        'limit' => ['type' => 'integer', 'description' => 'Only for top_selling. Number of products, default 20, max 100.'],
-                        'cover_days' => ['type' => 'integer', 'description' => 'Only for purchase_suggestions. Default 7.'],
-                    ],
-                    'required' => ['report_type'],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_low_stock_products',
-                'description' => 'Find products with low available stock in the permitted branch.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'threshold' => [
-                            'type' => 'integer',
-                            'description' => 'Available quantity threshold. Defaults to 10.',
-                        ],
-                    ],
-                    'required' => [],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_stock_summary',
-                'description' => 'Get inventory totals and available stock summary.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => new \stdClass(),
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_product_stock_details',
-                'description' => 'Get a detailed list of all products with their exact available stock quantities. Use this whenever the user asks for all products, product names with quantities, item-wise stock, or a detailed inventory list. Do not use only get_stock_summary for these requests.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'page' => [
-                            'type' => 'integer',
-                            'description' => 'Page number, default 1.',
-                        ],
-                        'per_page' => [
-                            'type' => 'integer',
-                            'description' => 'Products per page, maximum 100.',
-                        ],
-                        'search' => [
-                            'type' => 'string',
-                            'description' => 'Optional product name or SKU search.',
-                        ],
-                    ],
-                    'required' => [],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_top_selling_products',
-                'description' => 'Get top-selling products by quantity sold for each requested branch. Use branch_ids when comparing multiple branches.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'date_range' => [
-                            'type' => 'string',
-                            'enum' => [
-                                'today',
-                                'yesterday',
-                                'last_7_days',
-                                'this_month',
-                            ],
-                        ],
-                        'limit' => [
-                            'type' => 'integer',
-                            'description' => 'Number of products per branch, maximum 10.',
-                        ],
-                        'branch_ids' => [
-                            'type' => 'array',
-                            'items' => ['type' => 'integer'],
-                            'description' => 'Branch IDs to compare. Admin only, and only branches belonging to the users store.',
-                        ],
-                    ],
-                    'required' => ['date_range'],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_out_of_stock_products',
-                'description' => 'Find products with zero or negative available stock. Use this when user asks for out-of-stock or unavailable products.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'branch_ids' => [
-                            'type' => 'array',
-                            'items' => ['type' => 'integer'],
-                            'description' => 'Optional branch IDs for admin branch comparison.',
-                        ],
-                    ],
-                    'required' => [],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_purchase_suggestions',
-                'description' => 'Suggest products to reorder based on last 30 days sales and current available stock. Do not invent quantities.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'branch_id' => [
-                            'type' => ['integer', 'null'],
-                            'description' => 'Optional numeric branch ID, only when the user explicitly provides or selects an ID.',
-                        ],
-                        'branch_name' => [
-                            'type' => 'string',
-                            'description' => 'Branch name explicitly mentioned by the user, for example LOYALITY MART. For admins, backend resolves the name to an authorized branch ID within their store. Never ask for a numeric ID if a branch name was provided. If no branch was named, ask the user for a branch name, not a numeric ID.',
-                        ],
-                        'product_name' => [
-                            'type' => 'string',
-                            'description' => 'Optional product name the user wants reorder suggestions for, e.g. XYZ-EDITED. This is a product name, not a branch name.',
-                        ],
-                        'cover_days' => [
-                            'type' => 'integer',
-                            'description' => 'Suggested stock coverage days; default 7.',
-                        ],
-                    ],
-                    'required' => [],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_branches',
-                'description' => 'List/count branches belonging to the current admin store. Use whenever the user asks how many branches they have, branch names, or wants to identify a branch. Managers may only see their assigned branch.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => new \stdClass(),
-                    'required' => [],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_sales_comparison',
-                'description' => 'Compare current month with previous month, today with yesterday, or sales across authorized branches.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'comparison' => [
-                            'type' => 'string',
-                            'enum' => [
-                                'today_vs_yesterday',
-                                'this_month_vs_last_month',
-                                'branches',
-                            ],
-                        ],
-                        'branch_ids' => [
-                            'type' => 'array',
-                            'items' => ['type' => 'integer'],
-                        ],
-                    ],
-                    'required' => ['comparison'],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_payment_summary',
-                'description' => 'Get actual cash, online, wallet, split-payment and outstanding due summary for a period.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'date_range' => [
-                            'type' => 'string',
-                            'enum' => [
-                                'today',
-                                'yesterday',
-                                'last_7_days',
-                                'this_month',
-                            ],
-                        ],
-                    ],
-                    'required' => ['date_range'],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_supplier_summary',
-                'description' => 'Get supplier-wise purchase totals, paid amounts, outstanding dues and supplier count. Use for questions about suppliers, supplier balances, or who is owed money.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'date_range' => [
-                            'type' => 'string',
-                            'enum' => ['all_time', 'this_month'],
-                            'description' => 'Period for purchase totals. Use all_time for current outstanding balances.',
-                        ],
-                    ],
-                    'required' => [],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_supplier_details',
-                'description' => 'Get one supplier contact details, purchase bills, total purchased, paid and due amounts. Use when user asks about a named supplier or their purchase history.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'supplier_name' => [
-                            'type' => 'string',
-                            'description' => 'Supplier name mentioned by the user.',
-                        ],
-                    ],
-                    'required' => ['supplier_name'],
-                ],
-            ],
-        ],
-        [
-            'type' => 'function',
-            'function' => [
-                'name' => 'get_supplier_rate_comparison',
-                'description' => 'Compare recorded purchase rates for a product across suppliers. Use for questions about cheapest supplier or previous purchase rates.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'product_name' => [
-                            'type' => 'string',
-                            'description' => 'Product name mentioned by the user.',
-                        ],
-                    ],
-                    'required' => ['product_name'],
-                ],
-            ],
-        ],
-    ];
-
-    $download = null;
-    $maxToolRounds = 4;
-
-    for ($round = 0; $round <= $maxToolRounds; $round++) {
-        try {
-            $response = $aiProviderService->complete([
-                'messages' => $messages,
-                'tools' => $tools,
-                'tool_choice' => 'auto',
-                'temperature' => 0.2,
-            ], 'chat');
-        } catch (\Throwable $exception) {
-            report($exception);
-
-            return response()->json([
-                'status' => false,
-                'message' => 'AI request failed. Please try again.',
-            ], 502);
         }
 
-        if ($response->failed()) {
-            report(new \RuntimeException(
-                'AI chat completion failed with HTTP status ' . $response->status()
-            ));
+        // Admin ke liye branch_id = 0 means all branches.
+        $requestedBranchId = $request->input('branch_id');
 
-            return response()->json([
-                'status' => false,
-                'message' => 'AI request failed. Please try again.',
-            ], 502);
+        if ($user->role === 'admin' && (int) $requestedBranchId === 0) {
+            $requestedBranchId = null;
         }
 
-        $assistantMessage = $response->json('choices.0.message');
+        $branchId = $this->resolveBranchId(
+            $user,
+            $requestedBranchId
+        );
 
-        if (!is_array($assistantMessage)) {
+        if ($conversation && (int) ($conversation->branch_id ?? 0) !== (int) ($branchId ?? 0)) {
             return response()->json([
                 'status' => false,
-                'message' => 'AI returned an invalid response.',
-            ], 502);
-        }
-
-        $toolCalls = $assistantMessage['tool_calls'] ?? [];
-
-        if (empty($toolCalls)) {
-            return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
-                'status' => true,
-                'message' => $assistantMessage['content'] ?? '',
-                // Only set when the user actually asked for a report file.
-                'download' => $download,
-            ]);
-        }
-
-        if ($round === $maxToolRounds) {
-            return response()->json([
-                'status' => false,
-                'message' => 'AI analysis reached its tool-call limit. Please ask a more specific question.',
+                'message' => 'This conversation belongs to a different branch scope. Start a new chat for the selected branch.',
             ], 422);
         }
 
-        // Assistant tool-call message must precede tool results.
-        $messages[] = $assistantMessage;
 
-        foreach ($toolCalls as $toolCall) {
-            $functionName = $toolCall['function']['name'] ?? '';
+        // Deterministically fetch product names for list-style inventory questions.
+        // This avoids depending on the LLM to decide whether to call the inventory tool.
+        $latestMessage = trim((string) $request->input('message', ''));
 
-            $arguments = json_decode(
-                $toolCall['function']['arguments'] ?? '{}',
-                true
-            );
+        // Report/download requests must go to the AI + report tool, not the product list shortcut.
+        $isReportRequest = preg_match(
+            '/\b(report|download|export|pdf|excel|xlsx)\b/iu',
+            $latestMessage
+        ) === 1;
 
-            if (!is_array($arguments)) {
-                $arguments = [];
-            }
+        $isProductListRequest = preg_match(
+            '/\b(saare|sare|sabhi|sab|all|list|show|naam|names?)\b.{0,80}\b(products?|items?|inventory)\b|\b(products?|items?)\b.{0,80}\b(naam|names?|list|saare|sare|sabhi|sab|all)\b/iu',
+            $latestMessage
+        ) === 1;
 
+        if ($isProductListRequest && !$isReportRequest) {
             try {
-                $toolResult = $this->executeBusinessTool(
-                    $functionName,
-                    $arguments,
-                    $salesReportService,
+                // Shortcut replies are fixed text, so pick English vs Hinglish from the user's message.
+                $isEnglish = str_contains($this->languageDirective($latestMessage), 'English only');
+
+                $inventory = $this->getProductStockDetails(
                     $user,
-                    $branchId
+                    $branchId,
+                    ['page' => 1, 'per_page' => 100]
                 );
-            } catch (\Symfony\Component\HttpKernel\Exception\HttpException $exception) {
-                $toolResult = ['error' => $exception->getMessage()];
+
+                if (!empty($inventory['error'])) {
+                    return response()->json([
+                        'status' => false,
+                        'message' => $inventory['error'],
+                    ], 422);
+                }
+
+                $products = $inventory['products'] ?? [];
+                if (empty($products)) {
+                    return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
+                        'status' => true,
+                        'message' => $isEnglish
+                            ? 'No products were found in your selected data scope.'
+                            : 'Aapke selected data scope mein koi product nahi mila.',
+                        'data' => $inventory,
+                    ]);
+                }
+
+                $table = "| Product Name | Total Qty | Sold Qty | Expired Qty | Available Qty |\n";
+                $table .= "|---|---:|---:|---:|---:|\n";
+                foreach ($products as $product) {
+                    $name = str_replace(['|', "\r", "\n"], ['\\|', ' ', ' '], (string) ($product['product_name'] ?? 'Unnamed product'));
+                    $table .= '| ' . $name
+                        . ' | ' . ($product['total_qty'] ?? 0)
+                        . ' | ' . ($product['sold_qty'] ?? 0)
+                        . ' | ' . ($product['expired_qty'] ?? 0)
+                        . ' | ' . ($product['available_qty'] ?? 0)
+                        . " |\n";
+                }
+
+                $total = (int) ($inventory['total_products'] ?? count($products));
+                $message = ($isEnglish
+                    ? "There are {$total} products in your selected data scope.\n\n"
+                    : "Aapke selected data scope mein total {$total} products hain.\n\n") . $table;
+                if (($inventory['total_pages'] ?? 1) > 1) {
+                    $message .= $isEnglish
+                        ? "\nThese are the first 100 products. Total pages: " . $inventory['total_pages'] . '. Ask for the next page to see more.'
+                        : "\nYe pehle 100 products hain. Total pages: " . $inventory['total_pages'] . '. Agli list ke liye next page maangiye.';
+                }
+
+                return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
+                    'status' => true,
+                    'message' => $message,
+                    'data' => $inventory,
+                ]);
+            } catch (\Throwable $exception) {
+                report($exception);
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Product inventory load nahi ho payi. Server logs mein database error check karein.',
+                ], 500);
+            }
+        }
+
+        // Deterministic shortcut for "how many branches / branch names" questions.
+        // The LLM was guessing (e.g. "0 branches") instead of calling get_branches,
+        // so this answers straight from the database. Branch IDs are NOT shown to the user.
+        $mentionsBranch = preg_match(
+            '/\b(branch|branches)\b/iu',
+            $latestMessage
+        ) === 1;
+
+        $asksBranchCountOrList = preg_match(
+            '/\b(how many|kitni|kitne|ketli|ketla|count|list|names?|naam)\b/iu',
+            $latestMessage
+        ) === 1;
+
+        // Do not hijack questions that are really about sales/stock/etc. of a branch.
+        $mentionsOtherTopic = preg_match(
+            '/\b(sales?|sale|stock|inventory|products?|items?|suppliers?|profit|purchase|payment|bills?|revenue|compare|comparison)\b/iu',
+            $latestMessage
+        ) === 1;
+
+        $isBranchRequest = $mentionsBranch
+            && $asksBranchCountOrList
+            && !$mentionsOtherTopic
+            && !$isReportRequest;
+
+        if ($isBranchRequest) {
+            try {
+                $result = $this->getBranches($user, $branchId);
+
+                if (!empty($result['error'])) {
+                    return response()->json([
+                        'status' => false,
+                        'message' => $result['error'],
+                    ], 422);
+                }
+
+                $isEnglish = str_contains($this->languageDirective($latestMessage), 'English only');
+                $count = (int) ($result['count'] ?? 0);
+
+                if ($count === 0) {
+                    return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
+                        'status' => true,
+                        'message' => $isEnglish
+                            ? 'You do not have any branches in your store yet.'
+                            : 'Aapke store mein abhi koi branch nahi hai.',
+                        'data' => $result,
+                    ]);
+                }
+
+                $message = $isEnglish
+                    ? "You have {$count} branch(es) in your store.\n\n"
+                    : "Aapke store mein total {$count} branch hain.\n\n";
+
+                $message .= "| Branch Name |\n|---|\n";
+                foreach ($result['branches'] as $b) {
+                    $branchName = str_replace(['|', "\r", "\n"], ['\\|', ' ', ' '], (string) ($b['branch_name'] ?? ''));
+                    $message .= "| {$branchName} |\n";
+                }
+
+                return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
+                    'status' => true,
+                    'message' => $message,
+                    'data' => $result,
+                ]);
+            } catch (\Throwable $exception) {
+                report($exception);
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Branch list load nahi ho payi. Server logs check karein.',
+                ], 500);
+            }
+        }
+
+        // When a database conversation is supplied, load history from MySQL rather
+        // than trusting client-provided history. Keep the old history path temporarily
+        // for the frontend until it is migrated in the next step.
+        if ($conversation) {
+            $history = $conversation->messages()
+                ->whereIn('role', ['user', 'assistant'])
+                ->orderByDesc('id')
+                ->limit(10)
+                ->get(['role', 'content'])
+                ->reverse()
+                ->map(fn($item) => [
+                    'role' => $item->role,
+                    'content' => $item->content,
+                ])
+                ->values()
+                ->all();
+        } else {
+            $history = collect($request->input('history', []))
+                ->take(-10)
+                ->map(fn($item) => [
+                    'role' => $item['role'],
+                    'content' => $item['content'],
+                ])
+                ->values()
+                ->all();
+        }
+
+        $messages = array_merge(
+            [
+                [
+                    'role' => 'system',
+                    'content' => $this->systemPrompt($user, $branchId),
+                ],
+            ],
+            $history,
+            [
+                [
+                    'role' => 'user',
+                    // The language directive is only sent to the AI. The user never sees it
+                    // and the original message is what gets saved in the chat history.
+                    'content' => $request->message
+                        . "\n\n(Instruction for the assistant, never mention it: "
+                        . $this->languageDirective((string) $request->message) . ')',
+                ],
+            ]
+        );
+
+        $tools = [
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_sales_summary',
+                    'description' => 'Get actual POS sales data for a date range. Use this whenever the user asks about sales, revenue, business amount, number of bills, collected amount, due amount, profit, or similar sales performance information.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'date_range' => [
+                                'type' => 'string',
+                                'enum' => [
+                                    'today',
+                                    'yesterday',
+                                    'last_7_days',
+                                    'this_month',
+                                ],
+                                'description' => 'The period for which sales data is required.',
+                            ],
+                            'branch_id' => [
+                                'type' => 'integer',
+                                'description' => 'Optional branch ID. Use this only when the user explicitly asks about a specific branch.',
+                            ],
+                        ],
+                        'required' => ['date_range'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'prepare_sales_report_download',
+                    'description' => 'Use ONLY when the user explicitly asks to download/export/get a sales report file. Prepares a download button for the frontend. Do not use for normal sales questions.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'format' => [
+                                'type' => 'string',
+                                'enum' => ['pdf', 'excel'],
+                                'description' => 'Use excel ONLY if the user said excel/xlsx/sheet. Otherwise use pdf.',
+                            ],
+                            'date_range' => [
+                                'type' => 'string',
+                                'enum' => ['today', 'yesterday', 'last_7_days', 'this_month', 'last_month', 'custom'],
+                                'description' => 'Use custom for a specific month, year or date range, and then fill date_from and date_to.',
+                            ],
+                            'date_from' => [
+                                'type' => 'string',
+                                'description' => 'YYYY-MM-DD, only for custom.',
+                            ],
+                            'date_to' => [
+                                'type' => 'string',
+                                'description' => 'YYYY-MM-DD, only for custom.',
+                            ],
+                        ],
+                        'required' => ['date_range'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'prepare_report_download',
+                    'description' => 'Use ONLY when the user explicitly asks to download/export a NON-sales report file: stock/inventory report, low stock report, out of stock report, supplier dues report, top selling products report, purchase suggestions report, profit report, branch comparison, purchase report (bill-wise) or detailed purchase report (product-wise). Prepares a download button for the frontend. For SALES reports use prepare_sales_report_download instead.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'report_type' => [
+                                'type' => 'string',
+                                'enum' => ['inventory', 'low_stock', 'out_of_stock', 'supplier_dues', 'top_selling', 'purchase_suggestions', 'product_profit', 'branch_comparison', 'purchase_report', 'purchase_detail_report', 'customer_analysis', 'customer_wallet'],
+                                'description' => 'inventory = full stock list, low_stock = products running low, out_of_stock = zero stock products, supplier_dues = supplier purchase/paid/outstanding, top_selling = best selling products for a period, purchase_suggestions = what to reorder, product_profit = product-wise revenue and profit for a period, branch_comparison = all branches sales/profit comparison for a period (admin only), purchase_report = purchase bills (bill-wise summary) with paid and due for a period, purchase_detail_report = detailed product-wise (line-by-line) purchase report with qty, rate, batch, expiry and GST for a period; use this when the user says detailed / product-wise / item-wise purchase report,customer_analysis = customers visits/spend/repeat-new for a period; customer_wallet = customer wallet balances snapshot.',
+                            ],
+                            'format' => [
+                                'type' => 'string',
+                                'enum' => ['pdf', 'excel'],
+                                'description' => 'Use excel ONLY if the user said excel/xlsx/sheet. Otherwise use pdf.',
+                            ],
+                            'date_range' => [
+                                'type' => 'string',
+                                'enum' => ['today', 'yesterday', 'last_7_days', 'this_month', 'last_month', 'custom'],
+                                'description' => 'Only for top_selling, product_profit, branch_comparison, purchase_report and purchase_detail_report (default this_month). Other reports are current snapshots and ignore this.',
+                            ],
+                            'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for period reports with custom range.'],
+                            'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for period reports with custom range.'],
+                            'threshold' => ['type' => 'integer', 'description' => 'Only for low_stock. Default 10.'],
+                            'limit' => ['type' => 'integer', 'description' => 'Only for top_selling. Number of products, default 20, max 100.'],
+                            'cover_days' => ['type' => 'integer', 'description' => 'Only for purchase_suggestions. Default 7.'],
+                        ],
+                        'required' => ['report_type'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_low_stock_products',
+                    'description' => 'Find products with low available stock in the permitted branch.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'threshold' => [
+                                'type' => 'integer',
+                                'description' => 'Available quantity threshold. Defaults to 10.',
+                            ],
+                        ],
+                        'required' => [],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_stock_summary',
+                    'description' => 'Get product counts (all registered products and products that have stock records) and inventory totals / available stock summary.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => new \stdClass(),
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_product_categories',
+                    'description' => 'Get the number of product categories and how many products each category has. Use whenever the user asks about product categories.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => new \stdClass(),
+                        'required' => [],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_product_stock_details',
+                    'description' => 'Get a detailed list of all products with their exact available stock quantities. Use this whenever the user asks for all products, product names with quantities, item-wise stock, or a detailed inventory list. Do not use only get_stock_summary for these requests.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'page' => [
+                                'type' => 'integer',
+                                'description' => 'Page number, default 1.',
+                            ],
+                            'per_page' => [
+                                'type' => 'integer',
+                                'description' => 'Products per page, maximum 100.',
+                            ],
+                            'search' => [
+                                'type' => 'string',
+                                'description' => 'Optional product name or SKU search.',
+                            ],
+                        ],
+                        'required' => [],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_top_selling_products',
+                    'description' => 'Get top-selling products by quantity sold for each requested branch. Use branch_ids when comparing multiple branches.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'date_range' => [
+                                'type' => 'string',
+                                'enum' => [
+                                    'today',
+                                    'yesterday',
+                                    'last_7_days',
+                                    'this_month',
+                                ],
+                            ],
+                            'limit' => [
+                                'type' => 'integer',
+                                'description' => 'Number of products per branch, maximum 10.',
+                            ],
+                            'branch_ids' => [
+                                'type' => 'array',
+                                'items' => ['type' => 'integer'],
+                                'description' => 'Branch IDs to compare. Admin only, and only branches belonging to the users store.',
+                            ],
+                        ],
+                        'required' => ['date_range'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_out_of_stock_products',
+                    'description' => 'Find products with zero or negative available stock. Use this when user asks for out-of-stock or unavailable products.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'branch_ids' => [
+                                'type' => 'array',
+                                'items' => ['type' => 'integer'],
+                                'description' => 'Optional branch IDs for admin branch comparison.',
+                            ],
+                        ],
+                        'required' => [],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_purchase_suggestions',
+                    'description' => 'Suggest products to reorder based on last 30 days sales and current available stock. Do not invent quantities.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'branch_id' => [
+                                'type' => ['integer', 'null'],
+                                'description' => 'Optional numeric branch ID, only when the user explicitly provides or selects an ID.',
+                            ],
+                            'branch_name' => [
+                                'type' => 'string',
+                                'description' => 'Branch name explicitly mentioned by the user, for example LOYALITY MART. For admins, backend resolves the name to an authorized branch ID within their store. Never ask for a numeric ID if a branch name was provided. If no branch was named, ask the user for a branch name, not a numeric ID.',
+                            ],
+                            'product_name' => [
+                                'type' => 'string',
+                                'description' => 'Optional product name the user wants reorder suggestions for, e.g. XYZ-EDITED. This is a product name, not a branch name.',
+                            ],
+                            'cover_days' => [
+                                'type' => 'integer',
+                                'description' => 'Suggested stock coverage days; default 7.',
+                            ],
+                        ],
+                        'required' => [],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_branches',
+                    'description' => 'List/count branches belonging to the current admin store. Use whenever the user asks how many branches they have, branch names, or wants to identify a branch. Managers may only see their assigned branch.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => new \stdClass(),
+                        'required' => [],
+                    ],
+                ],
+            ],
+            [
+    'type' => 'function',
+    'function' => [
+        'name' => 'get_branch_wise_sales',
+        'description' => 'Branch-wise sales breakdown (bills, gross sales, collected, due, profit per branch) for a period. Use whenever the user asks for branch wise / branch-wise / each branch sales for today, yesterday, last 7 days or this month. Returns every branch of the store by name, including branches with zero sales.',
+        'parameters' => [
+            'type' => 'object',
+            'properties' => [
+                'date_range' => [
+                    'type' => 'string',
+                    'enum' => ['today', 'yesterday', 'last_7_days', 'this_month'],
+                ],
+            ],
+            'required' => ['date_range'],
+        ],
+    ],
+],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_sales_comparison',
+                    'description' => 'Compare current month with previous month, today with yesterday, or sales across authorized branches.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'comparison' => [
+                                'type' => 'string',
+                                'enum' => [
+                                    'today_vs_yesterday',
+                                    'this_month_vs_last_month',
+                                    'branches',
+                                ],
+                            ],
+                            'branch_ids' => [
+                                'type' => 'array',
+                                'items' => ['type' => 'integer'],
+                            ],
+                        ],
+                        'required' => ['comparison'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_payment_summary',
+                    'description' => 'Get actual cash, online, wallet, split-payment and outstanding due summary for a period.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'date_range' => [
+                                'type' => 'string',
+                                'enum' => [
+                                    'today',
+                                    'yesterday',
+                                    'last_7_days',
+                                    'this_month',
+                                ],
+                            ],
+                        ],
+                        'required' => ['date_range'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_supplier_summary',
+                    'description' => 'Get supplier-wise purchase totals, paid amounts, outstanding dues and supplier count. Use for questions about suppliers, supplier balances, or who is owed money.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'date_range' => [
+                                'type' => 'string',
+                                'enum' => ['all_time', 'this_month'],
+                                'description' => 'Period for purchase totals. Use all_time for current outstanding balances.',
+                            ],
+                        ],
+                        'required' => [],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_supplier_details',
+                    'description' => 'Get one supplier contact details, purchase bills, total purchased, paid and due amounts. Use when user asks about a named supplier or their purchase history.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'supplier_name' => [
+                                'type' => 'string',
+                                'description' => 'Supplier name mentioned by the user.',
+                            ],
+                        ],
+                        'required' => ['supplier_name'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_supplier_rate_comparison',
+                    'description' => 'Compare recorded purchase rates for a product across suppliers. Use for questions about cheapest supplier or previous purchase rates.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'product_name' => [
+                                'type' => 'string',
+                                'description' => 'Product name mentioned by the user.',
+                            ],
+                        ],
+                        'required' => ['product_name'],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_hourly_sales_analysis',
+                    'description' => 'Hour-wise sales analysis (e.g. 1pm-2pm): bills, sales and unique customers per hour, plus the peak sales hour and the peak customer hour. Use for questions about which time has most sales or most customers.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'date_range' => ['type' => 'string', 'enum' => ['today', 'yesterday', 'last_7_days', 'this_month']],
+                        ],
+                        'required' => [],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_customer_analysis',
+                    'description' => 'Customer analysis: total customers, new customers, repeat customers and top customers by spend for a period.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'date_range' => ['type' => 'string', 'enum' => ['today', 'yesterday', 'last_7_days', 'this_month']],
+                        ],
+                        'required' => [],
+                    ],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_expiry_analysis',
+                    'description' => 'Expiry analysis: already expired stock and stock expiring within 7, 30 and 60 days, with product names and quantities.',
+                    'parameters' => ['type' => 'object', 'properties' => new \stdClass(), 'required' => []],
+                ],
+            ],
+            [
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_customer_wallet_balances',
+                    'description' => 'Customers wallet balances: total wallet balance and the customers who have the highest balance.',
+                    'parameters' => ['type' => 'object', 'properties' => new \stdClass(), 'required' => []],
+                ],
+            ],
+        ];
+
+        $download = null;
+        $maxToolRounds = 4;
+
+        for ($round = 0; $round <= $maxToolRounds; $round++) {
+            try {
+                $response = $aiProviderService->complete([
+                    'messages' => $messages,
+                    'tools' => $tools,
+                    'tool_choice' => 'auto',
+                    'temperature' => 0.2,
+                ], 'chat');
             } catch (\Throwable $exception) {
                 report($exception);
 
-                $toolResult = [
-                    'error' => 'This business report could not be generated. Please try again.',
+                return response()->json([
+                    'status' => false,
+                    'message' => 'AI request failed. Please try again.',
+                ], 502);
+            }
+
+            if ($response->failed()) {
+                report(new \RuntimeException(
+                    'AI chat completion failed with HTTP status ' . $response->status()
+                ));
+
+                return response()->json([
+                    'status' => false,
+                    'message' => 'AI request failed. Please try again.',
+                ], 502);
+            }
+
+            $assistantMessage = $response->json('choices.0.message');
+
+            if (!is_array($assistantMessage)) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'AI returned an invalid response.',
+                ], 502);
+            }
+
+            $toolCalls = $assistantMessage['tool_calls'] ?? [];
+
+            if (empty($toolCalls)) {
+                return $this->persistSuccessfulChatResponse($conversation, $latestMessage, [
+                    'status' => true,
+                    'message' => $assistantMessage['content'] ?? '',
+                    // Only set when the user actually asked for a report file.
+                    'download' => $download,
+                ]);
+            }
+
+            if ($round === $maxToolRounds) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'AI analysis reached its tool-call limit. Please ask a more specific question.',
+                ], 422);
+            }
+
+            // Assistant tool-call message must precede tool results.
+            $messages[] = $assistantMessage;
+
+            foreach ($toolCalls as $toolCall) {
+                $functionName = $toolCall['function']['name'] ?? '';
+
+                $arguments = json_decode(
+                    $toolCall['function']['arguments'] ?? '{}',
+                    true
+                );
+
+                if (!is_array($arguments)) {
+                    $arguments = [];
+                }
+
+                try {
+                    $toolResult = $this->executeBusinessTool(
+                        $functionName,
+                        $arguments,
+                        $salesReportService,
+                        $user,
+                        $branchId
+                    );
+                } catch (\Symfony\Component\HttpKernel\Exception\HttpException $exception) {
+                    $toolResult = ['error' => $exception->getMessage()];
+                } catch (\Throwable $exception) {
+                    report($exception);
+
+                    $toolResult = [
+                        'error' => 'This business report could not be generated. Please try again.',
+                    ];
+                }
+
+                if (
+                    in_array($functionName, ['prepare_sales_report_download', 'prepare_report_download'], true)
+                    && !empty($toolResult['download'])
+                ) {
+                    $download = $toolResult['download'];
+                }
+
+                $messages[] = [
+                    'role' => 'tool',
+                    'tool_call_id' => $toolCall['id'] ?? '',
+                    'name' => $functionName,
+                    'content' => json_encode(
+                        $toolResult,
+                        JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR
+                    ) ?: '{"error":"Unable to encode tool result."}',
                 ];
             }
-
-            if (
-                in_array($functionName, ['prepare_sales_report_download', 'prepare_report_download'], true)
-                && !empty($toolResult['download'])
-            ) {
-                $download = $toolResult['download'];
-            }
-
-            $messages[] = [
-                'role' => 'tool',
-                'tool_call_id' => $toolCall['id'] ?? '',
-                'name' => $functionName,
-                'content' => json_encode(
-                    $toolResult,
-                    JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR
-                ) ?: '{"error":"Unable to encode tool result."}',
-            ];
         }
-    }
 
-    return response()->json([
-        'status' => false,
-        'message' => 'AI could not complete the request.',
-    ], 502);
-}
+        return response()->json([
+            'status' => false,
+            'message' => 'AI could not complete the request.',
+        ], 502);
+    }
 
 
     /**
@@ -815,7 +888,7 @@ public function chat(
         SalesReportService $salesReportService,
         $user,
         ?int $branchId
-     ): array {
+    ): array {
         switch ($functionName) {
             case 'get_sales_summary':
                 return $this->getSalesSummary(
@@ -840,6 +913,8 @@ public function chat(
                 return $this->getLowStockProducts($user, $branchId, $arguments);
             case 'get_stock_summary':
                 return $this->getStockSummary($user, $branchId);
+            case 'get_product_categories':
+                return $this->getProductCategories($user);
             case 'get_top_selling_products':
                 return $this->getTopSellingProducts(
                     $salesReportService,
@@ -884,6 +959,21 @@ public function chat(
                     $branchId,
                     $arguments
                 );
+            case 'get_hourly_sales_analysis':
+                return $this->getHourlySalesAnalysis($user, $branchId, $arguments);
+            case 'get_customer_analysis':
+                return $this->getCustomerAnalysis($user, $branchId, $arguments);
+            case 'get_expiry_analysis':
+                return $this->getExpiryAnalysis($user, $branchId);
+            case 'get_customer_wallet_balances':
+                return $this->getCustomerWalletBalances($user, $branchId);
+                case 'get_branch_wise_sales':
+    return $this->getBranchWiseSales(
+        $salesReportService,
+        $user,
+        $branchId,
+        $arguments
+    );
             default:
                 return ['error' => 'Unknown business tool.'];
         }
@@ -893,11 +983,81 @@ public function chat(
      * Prepares the data the frontend needs to show a download button.
      * Format is excel only if the user asked for it, otherwise pdf.
      */
+    private function getBranchWiseSales(
+    SalesReportService $salesReportService,
+    $user,
+    ?int $branchId,
+    array $arguments
+): array {
+    if ($user->role === 'manager' && !$branchId) {
+        return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
+    }
+
+    $dateRange = $arguments['date_range'] ?? 'today';
+    if (!in_array($dateRange, ['today', 'yesterday', 'last_7_days', 'this_month'], true)) {
+        $dateRange = 'today';
+    }
+
+    // Same date logic as get_sales_summary, so totals always match.
+    $f = $salesReportService->resolveFilters([
+        'date_range' => $dateRange,
+        'bill_status' => 'all',
+        'store_id' => $user->store_id,
+    ]);
+
+    $query = DB::table('branches as b')
+        ->leftJoin('sales_bills as sb', function ($join) use ($f, $user) {
+            $join->on('sb.branch_id', '=', 'b.id')
+                ->where('sb.store_id', '=', $user->store_id)
+                ->whereBetween('sb.created_at', [$f['from'], $f['to']]);
+        })
+        ->where('b.store_id', $user->store_id);
+
+    // Managers see only their own branch.
+    if ($user->role === 'manager') {
+        $query->where('b.id', $branchId);
+    }
+
+    $rows = $query
+        ->groupBy('b.id', 'b.name')
+        ->selectRaw('
+            b.name as branch_name,
+            COUNT(sb.id) as total_bills,
+            COALESCE(SUM(sb.total_amount), 0) as gross_sales,
+            COALESCE(SUM(sb.paid_amount), 0) as collected,
+            COALESCE(SUM(sb.due_amount), 0) as due,
+            COALESCE(SUM(sb.total_profit), 0) as profit
+        ')
+        ->orderByDesc('gross_sales')
+        ->get();
+
+    $branches = $rows->map(fn($r) => [
+        'branch_name' => $r->branch_name,
+        'total_bills' => (int) $r->total_bills,
+        'gross_sales' => round((float) $r->gross_sales, 2),
+        'collected_amount' => round((float) $r->collected, 2),
+        'due_amount' => round((float) $r->due, 2),
+        'profit' => round((float) $r->profit, 2),
+    ])->values();
+
+    return [
+        'date_range' => $dateRange,
+        'branches' => $branches->all(),
+        'totals' => [
+            'total_bills' => $branches->sum('total_bills'),
+            'gross_sales' => round($branches->sum('gross_sales'), 2),
+            'collected_amount' => round($branches->sum('collected_amount'), 2),
+            'due_amount' => round($branches->sum('due_amount'), 2),
+            'profit' => round($branches->sum('profit'), 2),
+        ],
+        'note' => 'Every branch of the store is listed, including branches with zero sales. The totals are the sum of the listed branches.',
+    ];
+}
     private function prepareSalesReportDownload(
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
@@ -967,7 +1127,7 @@ public function chat(
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
@@ -982,6 +1142,9 @@ public function chat(
             'product_profit' => 'Profit Report (Product-wise)',
             'branch_comparison' => 'Branch Comparison Report',
             'purchase_report' => 'Purchase Report',
+            'purchase_detail_report' => 'Detailed Purchase Report (Product-wise)',
+            'customer_analysis' => 'Customer Analysis Report',
+            'customer_wallet' => 'Customer Wallet Balance Report',
         ];
 
         $type = (string) ($arguments['report_type'] ?? '');
@@ -1002,7 +1165,7 @@ public function chat(
             return ['error' => 'Branch comparison report sirf admin download kar sakta hai.'];
         }
 
-        if (in_array($type, ['top_selling', 'product_profit', 'branch_comparison', 'purchase_report'], true)) {
+        if (in_array($type, ['top_selling', 'product_profit', 'branch_comparison', 'purchase_report', 'purchase_detail_report', 'customer_analysis'], true)) {
             $range = $arguments['date_range'] ?? 'this_month';
             switch ($range) {
                 case 'today':
@@ -1169,7 +1332,7 @@ public function chat(
             ->offset(($page - 1) * $perPage)
             ->limit($perPage)
             ->get()
-            ->map(fn ($product) => [
+            ->map(fn($product) => [
                 'branch_id' => $product->branch_id !== null ? (int) $product->branch_id : null,
                 'product_id' => (int) $product->product_id,
                 'product_name' => $product->product_name,
@@ -1188,7 +1351,7 @@ public function chat(
             'total_pages' => (int) ceil($totalProducts / $perPage),
             'branch_id' => $branchId,
 
-            'note' => 'Available quantity is total quantity minus sold quantity minus expired quantity.',
+            'note' => 'Available quantity is total quantity minus sold quantity minus expired quantity. total_products counts only products that have inventory records, not every registered product.',
             'description' => 'Get product-wise inventory details including exact product name, selling price and available quantity. Always use this tool when the user asks for a table of products with selling prices and stock quantities.',
         ];
     }
@@ -1319,12 +1482,49 @@ public function chat(
             ) as available_qty
         ')
             ->first();
+
+        // Every registered product in the store, including products that have
+        // not received any stock yet (no inventory row).
+        $catalogCount = DB::table('products')
+            ->where('store_id', $user->store_id)
+            ->whereNull('deleted_at')
+            ->count();
+
         return [
-            'product_count' => (int) $summary->product_count,
+            'products_in_catalog' => $catalogCount,
+            'products_with_inventory_records' => (int) $summary->product_count,
             'total_qty' => (float) $summary->total_qty,
             'total_sold_qty' => (float) $summary->total_sold_qty,
             'total_expired_qty' => (float) $summary->total_expired_qty,
             'available_qty' => (float) $summary->available_qty,
+            'note' => 'products_in_catalog counts every registered product; products without a purchase/stock entry have no inventory record yet.',
+        ];
+    }
+
+    /**
+     * Category count with number of products in each category.
+     * NOTE: assumes categories.store_id and products.category_id exist.
+     * Change column names if your schema is different.
+     */
+    private function getProductCategories($user): array
+    {
+        $rows = DB::table('categories as c')
+            ->leftJoin('products as p', function ($join) {
+                $join->on('p.category_id', '=', 'c.id')
+                    ->whereNull('p.deleted_at');
+            })
+            ->where('c.store_id', $user->store_id)
+            ->groupBy('c.id', 'c.name')
+            ->orderBy('c.name')
+            ->selectRaw('c.name as category_name, COUNT(p.id) as product_count')
+            ->get();
+
+        return [
+            'category_count' => $rows->count(),
+            'categories' => $rows->map(fn($r) => [
+                'category_name' => $r->category_name,
+                'product_count' => (int) $r->product_count,
+            ])->all(),
         ];
     }
 
@@ -2030,147 +2230,345 @@ public function chat(
         ];
     }
 
-public function scanPurchaseBill(
-    Request $request,
-    \App\Services\AIProviderService $aiProviderService
-) {
-    $request->validate([
-        'bill_image' => [
-            'required',
-            'image',
-            'mimes:jpg,jpeg,png,webp',
-            'max:10240',
-        ],
-    ]);
+    public function scanPurchaseBill(
+        Request $request,
+        \App\Services\AIProviderService $aiProviderService
+     ) {
+        $request->validate([
+            'bill_image' => [
+                'required',
+                'image',
+                'mimes:jpg,jpeg,png,webp',
+                'max:10240',
+            ],
+        ]);
 
-    $user = Auth::user();
+        $user = Auth::user();
 
-    if (!$user || !in_array($user->role, ['admin', 'manager'], true)) {
-        return response()->json([
-            'status' => false,
-            'message' => 'You are not authorized to scan purchase bills.',
-        ], 403);
-    }
+        if (!$user || !in_array($user->role, ['admin', 'manager'], true)) {
+            return response()->json([
+                'status' => false,
+                'message' => 'You are not authorized to scan purchase bills.',
+            ], 403);
+        }
 
-    $file = $request->file('bill_image');
-    $mime = $file->getMimeType();
+        $file = $request->file('bill_image');
+        $mime = $file->getMimeType();
 
-    $imageData = base64_encode(
-        file_get_contents($file->getRealPath())
-    );
+        $imageData = base64_encode(
+            file_get_contents($file->getRealPath())
+        );
 
-    $prompt = <<<'PROMPT'
-Read this supplier purchase invoice and extract its data.
+        $prompt = <<<'PROMPT'
+            Read this supplier purchase invoice and extract its data.
 
-Return ONLY valid JSON using this structure:
-{
-  "supplier_name": null,
-  "bill_no": null,
-  "bill_date": null,
-  "tax_type": "exclusive",
-  "total_amount": null,
-  "lines": [
-    {
-      "product_name": null,
-      "qty": null,
-      "free_qty": 0,
-      "purchase_rate": null,
-      "mrp": null,
-      "selling_price": null,
-      "gst_rate_percent": null,
-      "hsn_code": null,
-      "batch_no": null,
-      "expiry_date": null,
-      "discount": 0,
-      "discount_type": null
-    }
-  ]
-}
+                Return ONLY valid JSON using this structure:
+                {
+                "supplier_name": null,
+                "bill_no": null,
+                "bill_date": null,
+                "tax_type": "exclusive",
+                "total_amount": null,
+                "lines": [
+                    {
+                    "product_name": null,
+                    "qty": null,
+                    "free_qty": 0,
+                    "purchase_rate": null,
+                    "mrp": null,
+                    "selling_price": null,
+                    "gst_rate_percent": null,
+                    "hsn_code": null,
+                    "batch_no": null,
+                    "expiry_date": null,
+                    "discount": 0,
+                    "discount_type": null
+                    }
+                ]
+                }
 
-Rules:
-- Do not invent values. Use null when unreadable or missing.
-- Use YYYY-MM-DD for dates when the date is clear.
-- Return numeric values as numbers.
-- Use "inclusive" or "exclusive" only when supported by the invoice;
-  otherwise use null.
-- Extract each product row separately.
-- Do not treat the invoice total as a product rate.
-- Do not create or save any purchase bill.
-PROMPT;
+                Rules:
+                - Do not invent values. Use null when unreadable or missing.
+                - Use YYYY-MM-DD for dates when the date is clear.
+                - Return numeric values as numbers.
+                - Use "inclusive" or "exclusive" only when supported by the invoice;
+                otherwise use null.
+                - Extract each product row separately.
+                - Do not treat the invoice total as a product rate.
+                - Do not create or save any purchase bill.
+        PROMPT;
 
-    try {
-        $response = $aiProviderService->complete([
-            'temperature' => 0,
-            'messages' => [
-                [
-                    'role' => 'user',
-                    'content' => [
-                        [
-                            'type' => 'text',
-                            'text' => $prompt,
-                        ],
-                        [
-                            'type' => 'image_url',
-                            'image_url' => [
-                                'url' => "data:{$mime};base64,{$imageData}",
+        try {
+            $response = $aiProviderService->complete([
+                'temperature' => 0,
+                'messages' => [
+                    [
+                        'role' => 'user',
+                        'content' => [
+                            [
+                                'type' => 'text',
+                                'text' => $prompt,
+                            ],
+                            [
+                                'type' => 'image_url',
+                                'image_url' => [
+                                    'url' => "data:{$mime};base64,{$imageData}",
+                                ],
                             ],
                         ],
                     ],
                 ],
-            ],
-        ], 'vision');
+            ], 'vision');
 
-        if ($response->failed()) {
-            report(new \RuntimeException(
-                'Purchase bill AI scan failed: HTTP ' . $response->status()
-            ));
+            if ($response->failed()) {
+                report(new \RuntimeException(
+                    'Purchase bill AI scan failed: HTTP ' . $response->status()
+                ));
+
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Could not scan the bill. Please try again.',
+                ], 502);
+            }
+
+            $content = $response->json('choices.0.message.content');
+
+            $content = preg_replace(
+                '/^```(?:json)?\s*|\s*```$/i',
+                '',
+                trim((string) $content)
+            );
+
+            $bill = json_decode($content, true);
+
+            if (
+                !is_array($bill) ||
+                !isset($bill['lines']) ||
+                !is_array($bill['lines'])
+            ) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'AI could not read the bill correctly. Try a clearer image.',
+                ], 422);
+            }
+
+            return response()->json([
+                'status' => true,
+                'data' => $bill,
+            ]);
+        } catch (\Throwable $e) {
+            report($e);
 
             return response()->json([
                 'status' => false,
-                'message' => 'Could not scan the bill. Please try again.',
-            ], 502);
+                'message' => 'Bill scanning failed. Please try again.',
+            ], 500);
         }
-
-        $content = $response->json('choices.0.message.content');
-
-        $content = preg_replace(
-            '/^```(?:json)?\s*|\s*```$/i',
-            '',
-            trim((string) $content)
-        );
-
-        $bill = json_decode($content, true);
-
-        if (
-            !is_array($bill) ||
-            !isset($bill['lines']) ||
-            !is_array($bill['lines'])
-        ) {
-            return response()->json([
-                'status' => false,
-                'message' => 'AI could not read the bill correctly. Try a clearer image.',
-            ], 422);
-        }
-
-        return response()->json([
-            'status' => true,
-            'data' => $bill,
-        ]);
-    } catch (\Throwable $e) {
-        report($e);
-
-        return response()->json([
-            'status' => false,
-            'message' => 'Bill scanning failed. Please try again.',
-        ], 500);
     }
-}
 
+    private function resolvePeriod(string $range): array
+    {
+        $today = Carbon::today();
+        return match ($range) {
+            'yesterday'   => [$today->copy()->subDay()->startOfDay(), $today->copy()->subDay()->endOfDay()],
+            'last_7_days' => [$today->copy()->subDays(6)->startOfDay(), $today->copy()->endOfDay()],
+            'this_month'  => [$today->copy()->startOfMonth(), $today->copy()->endOfDay()],
+            default       => [$today->copy()->startOfDay(), $today->copy()->endOfDay()],
+        };
+    }
 
-    private function systemPrompt(
+    private function getHourlySalesAnalysis($user, ?int $branchId, array $arguments): array
+    {
+        if ($user->role === 'manager' && !$branchId) {
+            return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
+        }
+
+        $range = $arguments['date_range'] ?? 'today';
+        [$from, $to] = $this->resolvePeriod($range);
+
+        $query = DB::table('sales_bills')
+            ->where('store_id', $user->store_id)
+            ->whereBetween('created_at', [$from, $to]);
+
+        if ($branchId !== null) {
+            $query->where('branch_id', $branchId);
+        }
+
+        $rows = $query
+            ->selectRaw('HOUR(created_at) as hr, COUNT(*) as bills, COALESCE(SUM(total_amount),0) as sales, COUNT(DISTINCT customer_id) as customers')
+            ->groupBy(DB::raw('HOUR(created_at)'))
+            ->orderBy('hr')
+            ->get();
+
+        if ($rows->isEmpty()) {
+            return ['date_range' => $range, 'message' => 'Is period mein koi bill nahi mila.', 'hours' => []];
+        }
+
+        $label = fn($h) => sprintf('%02d:00-%02d:00', $h, ($h + 1) % 24);
+
+        $hours = $rows->map(fn($r) => [
+            'time_slot' => $label((int) $r->hr),
+            'bills' => (int) $r->bills,
+            'sales' => round((float) $r->sales, 2),
+            'unique_customers' => (int) $r->customers,
+        ])->values();
+
+        $peakSales = $rows->sortByDesc('sales')->first();
+        $peakCustomers = $rows->sortByDesc('bills')->first();
+
+        return [
+            'date_range' => $range,
+            'hours' => $hours->all(),
+            'peak_sales_slot' => ['time_slot' => $label((int) $peakSales->hr), 'sales' => round((float) $peakSales->sales, 2)],
+            'peak_customer_slot' => ['time_slot' => $label((int) $peakCustomers->hr), 'bills' => (int) $peakCustomers->bills],
+            'note' => 'Customer traffic is measured by number of bills per hour. Walk-in bills without a customer are counted in bills but not in unique_customers.',
+        ];
+    }
+
+    private function getCustomerAnalysis($user, ?int $branchId, array $arguments): array
+    {
+        if ($user->role === 'manager' && !$branchId) {
+            return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
+        }
+
+        $range = $arguments['date_range'] ?? 'this_month';
+        [$from, $to] = $this->resolvePeriod($range);
+
+        // Bills of identified customers in the period (sales_bills has store_id).
+        $bills = DB::table('sales_bills')
+            ->where('store_id', $user->store_id)
+            ->whereNotNull('customer_id')
+            ->whereBetween('created_at', [$from, $to]);
+
+        if ($branchId !== null) {
+            $bills->where('branch_id', $branchId);
+        }
+
+        $perCustomer = $bills
+            ->selectRaw('customer_id, COUNT(*) as visits, SUM(total_amount) as spent')
+            ->groupBy('customer_id')
+            ->get();
+
+        $names = DB::table('customers')
+            ->whereIn('id', $perCustomer->pluck('customer_id'))
+            ->pluck('name', 'id');
+
+        $top = $perCustomer->sortByDesc('spent')->take(10)->values()->map(fn($c) => [
+            'customer_name' => $names[$c->customer_id] ?? 'Unknown',
+            'visits' => (int) $c->visits,
+            'total_spent' => round((float) $c->spent, 2),
+        ]);
+
+        // customers table has no store_id, so scope through branches.store_id.
+        $customerScope = DB::table('customers as c')
+            ->join('branches as b', 'b.id', '=', 'c.branch_id')
+            ->where('b.store_id', $user->store_id);
+
+        if ($branchId !== null) {
+            $customerScope->where('c.branch_id', $branchId);
+        }
+
+        $totalCustomers = (clone $customerScope)->count();
+        $newCustomers = (clone $customerScope)
+            ->whereBetween('c.created_at', [$from, $to])
+            ->count();
+
+        return [
+            'date_range' => $range,
+            'active_customers' => $perCustomer->count(),
+            'repeat_customers' => $perCustomer->where('visits', '>', 1)->count(),
+            'new_customers' => $newCustomers,
+            'total_customers' => $totalCustomers,
+            'top_customers' => $top->all(),
+        ];
+    }
+    private function getCustomerWalletBalances($user, ?int $branchId = null): array
+    {
+        if ($user->role === 'manager' && !$branchId) {
+            return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
+        }
+
+        // customers has no store_id, so scope through branches.store_id.
+        $query = DB::table('customer_wallet_transactions as t')
+            ->join('customers as c', 'c.id', '=', 't.customer_id')
+            ->join('branches as b', 'b.id', '=', 'c.branch_id')
+            ->where('b.store_id', $user->store_id);
+
+        if ($branchId !== null) {
+            $query->where('c.branch_id', $branchId);
+        }
+
+        $balances = $query
+            ->groupBy('c.id', 'c.name', 'c.mobile')
+            ->selectRaw("c.name, c.mobile, SUM(CASE WHEN t.type = 'credit' THEN t.amount ELSE -t.amount END) as balance")
+            ->havingRaw('balance > 0')
+            ->orderByDesc('balance')
+            ->get();
+
+        return [
+            'customers_with_balance' => $balances->count(),
+            'total_wallet_balance' => round((float) $balances->sum('balance'), 2),
+            'top_wallet_customers' => $balances->take(20)->map(fn($c) => [
+                'customer_name' => $c->name,
+                'mobile' => $c->mobile,
+                'wallet_balance' => round((float) $c->balance, 2),
+            ])->values()->all(),
+        ];
+    }
+    private function getExpiryAnalysis($user, ?int $branchId): array
+    {
+        if ($user->role === 'manager' && !$branchId) {
+            return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
+        }
+
+        // ASSUMED: inventories.expiry_date exists. If expiry lives only on purchase_lines, tell me.
+        $query = DB::table('inventories as i')
+            ->join('branches as b', 'b.id', '=', 'i.branch_id')
+            ->join('products as p', 'p.id', '=', 'i.product_id')
+            ->where('b.store_id', $user->store_id)
+            ->whereNull('i.deleted_at')
+            ->whereNotNull('i.expiry_date');
+
+        if ($branchId !== null) {
+            $query->where('i.branch_id', $branchId);
+        }
+
+        $rows = $query
+            ->selectRaw('p.name as product_name, i.expiry_date, SUM(i.qty - i.sold_qty - COALESCE(i.expired_qty,0)) as available_qty')
+            ->groupBy('p.id', 'p.name', 'i.expiry_date')
+            ->havingRaw('available_qty > 0')
+            ->havingRaw('i.expiry_date <= ?', [Carbon::today()->addDays(60)->toDateString()])
+            ->orderBy('i.expiry_date')
+            ->limit(100)
+            ->get();
+
+        $today = Carbon::today();
+        $bucket = function ($r) use ($today) {
+            $d = Carbon::parse($r->expiry_date)->startOfDay();
+            if ($d->lt($today)) return 'already_expired';
+            $days = $today->diffInDays($d);
+            return $days <= 7 ? 'within_7_days' : ($days <= 30 ? 'within_30_days' : 'within_60_days');
+        };
+
+        $grouped = $rows->groupBy($bucket)->map(fn($g) => [
+            'count' => $g->count(),
+            'items' => $g->take(15)->map(fn($r) => [
+                'product_name' => $r->product_name,
+                'expiry_date' => $r->expiry_date,
+                'available_qty' => (float) $r->available_qty,
+            ])->values()->all(),
+        ]);
+
+        return [
+            'buckets' => $grouped->all(),
+            'total_batches_flagged' => $rows->count(),
+            'note' => 'Only batches with available stock and expiry within 60 days (or already expired) are listed. Each bucket shows at most 15 items.',
+        ];
+    }
+       private function systemPrompt(
         $user,
         ?int $branchId
-    ): string {
+     ): string {
         $scope = $user->role === 'manager'
             ? "The user is a manager and can only access branch {$branchId}."
             : 'The user is an admin and can access all branches belonging to their store. If no specific branch is explicitly requested, aggregate data across ALL branches in the store.';
@@ -2201,7 +2599,7 @@ PROMPT;
         13. For zero available stock, always call get_out_of_stock_products.
         14. For reorder suggestions, always call get_purchase_suggestions. Explain that recommendations are estimates based on the last 30 days of sales. Purchase suggestions require one branch because inventory and demand are branch-specific. If an admin names a branch, pass that exact branch name in branch_name; never ask for a numeric ID. If no branch is named, ask which branch by its NAME, not numeric ID. Never silently choose a branch or combine branches for purchase suggestions. Managers use their assigned branch, regardless of any branch name in the message. Distinguish the product name from the branch name: if the user says 'XYZ-EDITED ke liye product purchase suggestion', treat XYZ-EDITED as product_name, not branch_name. If product name is given but no branch is given, ask which branch name to use.
         14a. For ANY question about the number of branches, branch names, or the structure of the store, you MUST call get_branches in this turn, even if earlier messages in the history already answered it. Never answer branch counts or branch names from conversation history or from memory. Do not say there is no branch-listing tool.
-        15. For date or branch comparisons, always call get_sales_comparison.
+        15. For today-vs-yesterday or this-month-vs-last-month comparisons, call get_sales_comparison. For branch-wise / branch-by-branch sales for any period, ALWAYS call get_branch_wise_sales (never get_sales_comparison).
         16. For payment method breakdown or outstanding dues, always call get_payment_summary.
         17. Never invent product names, sales values, payment amounts, or reorder quantities.
         18. When a tool returns an error or no data, report that result honestly.
@@ -2229,13 +2627,17 @@ PROMPT;
         39. When the user asks for product name, selling price and quantity in a table, call get_product_stock_details and return a Markdown table with Product Name, Selling Price, and Available Quantity. Use only values returned by the tool.
         40. When the user asks to download, export or get a sales REPORT (file), call prepare_sales_report_download. Use format "excel" only if the user mentioned Excel/xlsx/sheet; otherwise use "pdf". For a month or year (for example "September 2026" or "2026"), use date_range "custom" with exact date_from and date_to. If no period is mentioned, use this_month. After the tool call, reply in one short line in the user's language and script (for example, English: "Your sales report is ready, download it using the button below.") and never paste the report data. If the user asks for CSV or Word, say only PDF and Excel are supported and prepare a PDF. If the tool returns an error, report it honestly and do not claim a download is ready.
         41. For normal sales questions (how much sold, today's sales etc.) do NOT call prepare_sales_report_download.
-        42. For downloading/exporting stock or inventory, low stock, out of stock, supplier dues, top selling products, purchase suggestions, product-wise profit, branch comparison or purchase bills as a file, call prepare_report_download with the matching report_type (use prepare_sales_report_download only for SALES reports). Choose format "excel" only if the user mentioned Excel/xlsx/sheet, otherwise "pdf". After the tool call reply in one short line in the user's language and script and never paste the report data. Only call it when the user asks for a downloadable report/file; for normal questions like "which products are low on stock" use the normal tools and answer in chat.
-        43. SUPPORTED downloadable reports (PDF or Excel): Sales report, Stock report, Low stock report, Out of stock report, Supplier dues report, Top selling products report, Purchase suggestions report, Profit report (product-wise), Branch comparison report (admin only), Purchase report. If the user asks to download a report that is NOT in this list (for example GST report, customer report, expense report, expiry report, staff report, payment method report, or any other custom report), do NOT call any tool and do NOT invent data. Reply briefly in the user's language and script that this report is not available for download yet, and list the available reports above so they can pick one. If the user asks for Word or CSV, say only PDF and Excel are supported. If the nearest available report could still help, suggest it.
+        42. For downloading/exporting stock or inventory, low stock, out of stock, supplier dues, top selling products, purchase suggestions, product-wise profit, branch comparison, purchase bills, customer analysis or customer wallet as a file, call prepare_report_download with the matching report_type (use prepare_sales_report_download only for SALES reports). Choose format "excel" only if the user mentioned Excel/xlsx/sheet, otherwise "pdf". After the tool call reply in one short line in the user's language and script and never paste the report data. Only call it when the user asks for a downloadable report/file; for normal questions like "which products are low on stock" use the normal tools and answer in chat.
+        43. SUPPORTED downloadable reports (PDF or Excel): Sales report, Stock report, Low stock report, Out of stock report, Supplier dues report, Top selling products report, Purchase suggestions report, Profit report (product-wise), Branch comparison report (admin only), Purchase report (bill-wise), Detailed purchase report (product-wise), Customer analysis report, Customer wallet balance report. If the user asks to download a report that is NOT in this list (for example GST report, expense report, expiry report, staff report, payment method report, or any other custom report), do NOT call any tool and do NOT invent data. Reply briefly in the user's language and script that this report is not available for download yet, and list the available reports above so they can pick one. If the user asks for Word or CSV, say only PDF and Excel are supported. If the nearest available report could still help, suggest it.
         44. The user's store name is given below under Store Name. If the user asks for the store name or "my store", answer from it. Never say the store name is unspecified or unknown, unless Store Name below says "Not available".
         45. You only have access to the user's own store. If the user asks about any other store, company or name that does not match the Store Name below or a branch name returned by get_branches, do NOT call any tool and do NOT give any numbers. Reply that you can only show data of their own store (mention the Store Name) and ask whether they meant their own store or one of their branches.
         46. Never attach a store name or branch name to tool results unless that exact name was returned by a tool or is given in Store Name below. Never guess what an unknown name refers to.
         47. Never show numeric IDs (branch_id, product_id, supplier_id, store id) to the user. Always refer to branches, products and suppliers by name only. Use IDs only internally when calling tools.
-
+        48. For a downloadable detailed, product-wise or item-wise purchase report use report_type purchase_detail_report. For a bill-wise purchase summary use purchase_report.
+        49. Product counts: get_stock_summary returns products_in_catalog (all products registered in the store) and products_with_inventory_records (products that have received stock). When the user asks how many products they have, answer with products_in_catalog and mention how many of them have stock. Never call the inventory-record count the total number of products. For product categories always call get_product_categories and never say category information is unavailable.
+        50. For time-wise / hour-wise / peak time questions call get_hourly_sales_analysis and present a Markdown table with Time Slot, Bills, Sales, Unique Customers, then clearly state the peak sales slot and the peak customer slot.
+        51. For customer analysis call get_customer_analysis. For expiry analysis call get_expiry_analysis. For customer wallet balances call get_customer_wallet_balances. Never invent values.
+        52. For branch-wise sales call get_branch_wise_sales and present a Markdown table with Branch Name, Total Bills, Gross Sales, Collected Amount, Due Amount, Profit, plus a Total row from the totals. Never explain or guess which branch a sale happened in. Never say sales were made at a "main" or "primary" branch. Only report what the tool returned. If a tool result looks incomplete or contradicts an earlier answer, say so honestly and do not invent a reason.
         **TABLE FORMATTING RULES**
 
         1. When the user asks for data in a table, always format the response as a clean Markdown table.
