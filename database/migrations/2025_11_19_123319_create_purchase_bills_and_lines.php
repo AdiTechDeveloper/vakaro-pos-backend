@@ -72,6 +72,7 @@ return new class extends Migration
      */
     public function down(): void
     {
-        Schema::dropIfExists('purchase_bills_and_lines');
+       Schema::dropIfExists('purchase_lines');
+Schema::dropIfExists('purchase_bills');
     }
 };

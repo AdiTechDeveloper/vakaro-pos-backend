@@ -32,6 +32,8 @@ use App\Http\Controllers\Api\StockExpiryController;
 use App\Http\Controllers\Api\StoreController;
 use App\Http\Controllers\Api\SupplierController;
 use App\Http\Controllers\CustomerPortalController;
+use App\Http\Controllers\ExpenseCategoryController;
+use App\Http\Controllers\ExpenseController;
 use Illuminate\Support\Facades\Route;
 
 // register / shift routes (auth + sliding token expiry)
@@ -341,6 +343,13 @@ Route::middleware(['auth:sanctum', 'extend.token'])->group(function () {
 });
 
 // customer portal (public - own OTP flow, no sanctum token)
+Route::middleware(['auth:sanctum'])->group(function () {
+    Route::get('expenses/summary', [ExpenseController::class, 'summary']);
+    Route::apiResource('expenses', ExpenseController::class);
+    Route::apiResource('expense-categories', ExpenseCategoryController::class)->except(['show']);
+});
+
+
 Route::prefix('customer-portal')->group(function () {
     Route::post('/send-otp', [CustomerPortalController::class, 'sendOtp']);
     Route::post('/verify-otp', [CustomerPortalController::class, 'verifyOtp']);
@@ -351,6 +360,7 @@ Route::prefix('customer-portal')->group(function () {
 Route::middleware(['auth:sanctum', 'extend.token'])->group(function () {
 
     Route::post('/ai/chat', [AIController::class, 'chat']);
+    Route::get('/dashboard/money-summary', [\App\Http\Controllers\Api\DashboardMoneyController::class, 'summary']);
 });
 
 Route::get('/test-product-template', function () {
