@@ -9,11 +9,11 @@ use Carbon\Carbon;
 class DeleteExpiredTokens extends Command
 {
     protected $signature = 'tokens:cleanup';
-    protected $description = 'Delete tokens older than 2 days';
+    protected $description = 'Delete tokens older than 1 days';
 
     public function handle()
     {
-        $cutoff = Carbon::now()->subDays(2);
+        $cutoff = Carbon::now()->subDays(1);
 
         $deleted = PersonalAccessToken::where('created_at', '<', $cutoff)->delete();
 

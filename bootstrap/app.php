@@ -15,6 +15,7 @@ return Application::configure(basePath: dirname(__DIR__))
         // $middleware->statefulApi();
         $middleware->alias([
             'token.expiry' => \App\Http\Middleware\CheckTokenExpiry::class,
+            'extend.token' => \App\Http\Middleware\ExtendTokenExpiry::class,
             'check.superadmin' => \App\Http\Middleware\CheckSuperAdmin::class,
             'check.admin' => \App\Http\Middleware\IsAdmin::class,
             'api.auth.response' => \App\Http\Middleware\ApiAuthResponse::class,

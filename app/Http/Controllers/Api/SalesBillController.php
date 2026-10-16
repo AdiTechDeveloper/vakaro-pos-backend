@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Branch;
 use App\Models\Customer;
 use App\Models\CustomerLoyaltyTransaction;
 use App\Models\CustomerWalletTransaction;
@@ -12,6 +13,7 @@ use App\Models\Product;
 use App\Models\SalesBill;
 use App\Models\SalesBillLine;
 use App\Models\SalesBillPayment;
+use App\Services\WeightBarcodeService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -36,106 +38,178 @@ class SalesBillController extends Controller
 
     public function scanBarcode(Request $request)
     {
-        $request->validate(['barcode' => 'required', 'branch_id' => 'nullable|integer']);
+        $request->validate([
+            'barcode' => 'required',
+            'branch_id' => 'nullable|integer',
+        ]);
 
-        $user = Auth::user();
+        $user = $request->user();
+        $storeId = $user->store_id;
 
         if ($user->role === 'admin') {
-            $storeBranchIds = \App\Models\Branch::where('store_id', $user->store_id)
-                ->pluck('id')->map(fn ($id) => (int) $id)->toArray();
-
-            $branchIds = $request->filled('branch_id')
-                ? array_values(array_intersect($storeBranchIds, [(int) $request->branch_id]))
-                : $storeBranchIds;
+            $branchIds = $request->branch_id
+                ? [$request->branch_id]
+                : Branch::where('store_id', $storeId)->pluck('id')->toArray();
+        } elseif ($user->role === 'manager' || $user->role === 'cashier') {
+            $branchIds = $user->branches->pluck('id')->toArray();
+            if ($request->branch_id && in_array($request->branch_id, $branchIds)) {
+                $branchIds = [$request->branch_id];
+            }
         } else {
-            $branchIds = array_map('intval', $user->branches->pluck('id')->toArray());
+            $branchIds = Branch::where('store_id', $storeId)->pluck('id')->toArray();
         }
 
         $barcode = trim($request->barcode);
         $today = date('Y-m-d');
 
+        if (WeightBarcodeService::isWeightBarcode($barcode)) {
+            $decoded = WeightBarcodeService::decode($barcode);
+
+            if (! $decoded) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Invalid weight barcode (checksum mismatch).',
+                ], 404);
+            }
+
+            $product = Product::with('gstRate')
+                ->where('store_id', $storeId)
+                ->where('plu_code', $decoded['plu_code'])
+                ->where('sale_type', 'weight')
+                ->first();
+
+            if (! $product) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'No weight-type product found for this PLU code.',
+                ], 404);
+            }
+
+            if (! $product->price_per_kg || $product->price_per_kg <= 0) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'This product has no price per kg configured.',
+                ], 404);
+            }
+
+            $weightKg = round($decoded['price'] / $product->price_per_kg, 3);
+
+            $batch = Inventory::where('product_id', $product->id)
+                ->whereIn('branch_id', $branchIds)
+                ->whereRaw('(qty - sold_qty - expired_qty) > 0')
+                ->where(function ($q) use ($today) {
+                    $q->whereNull('expiry_date')->orWhere('expiry_date', '>=', $today);
+                })
+                ->orderByRaw('expiry_date IS NULL, expiry_date ASC')
+                ->first();
+
+            if (! $batch) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => 'Out of stock for this product.',
+                ], 404);
+            }
+
+            $availableStock = $batch->qty - $batch->sold_qty - $batch->expired_qty;
+
+            if ($weightKg > $availableStock) {
+                return response()->json([
+                    'status' => 'error',
+                    'message' => "Not enough stock for this weight. Available: {$availableStock} kg",
+                ], 404);
+            }
+
+            return response()->json([
+                'status' => 'success',
+                'is_weight_item' => true,
+                'product' => [
+                    'id' => $product->id,
+                    'name' => $product->name,
+                    'barcode' => $barcode,
+                    'plu_code' => $product->plu_code,
+                    'sale_type' => $product->sale_type,
+                    'gst_rate' => $product->gstRate,
+                    'gst_inclusive' => (int) $product->gst_inclusive,
+                    'is_price_override' => 0,
+                ],
+                'inventory_id' => $batch->id,
+                'batch_no' => $batch->batch_no,
+                'batch_barcode' => $batch->batch_barcode,
+                'qty' => $weightKg,
+                'selling_price' => $product->price_per_kg,
+                'total_amount' => $decoded['price'],
+                'mrp' => $batch->mrp,
+                'cost_price' => $batch->cost_price,
+                'total_stock' => $availableStock,
+            ]);
+        }
+
         $product = Product::with('gstRate')
+            ->where('store_id', $storeId)
             ->where('barcode', $barcode)
-            ->where('store_id', $user->store_id)
             ->first();
 
         if (! $product) {
-            $inventory = Inventory::where(function ($q) use ($barcode) {
-                $q->where('batch_barcode', $barcode)
-                    ->orWhere('batch_barcode', 'LIKE', $barcode.'-%');
-            })
-                ->whereIn('branch_id', $branchIds)
+            $batchMatch = Inventory::where('batch_barcode', $barcode)
+                ->orWhere('batch_barcode', 'like', $barcode.'-%')
                 ->first();
 
-            if ($inventory) {
-                $product = Product::with('gstRate')->find($inventory->product_id);
+            if ($batchMatch) {
+                $product = Product::with('gstRate')->find($batchMatch->product_id);
             }
         }
 
         if (! $product) {
-            return response()->json(['status' => false, 'message' => 'Product not found'], 404);
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Product not found',
+            ], 404);
         }
 
-        $batches = Inventory::where('product_id', $product->id)
+        $batchesRaw = Inventory::where('product_id', $product->id)
             ->whereIn('branch_id', $branchIds)
-            ->whereRaw('(qty - sold_qty) > 0')
-            ->where(function ($q) use ($today) {
-                $q->whereNull('expiry_date')
-                    ->orWhere('expiry_date', '>=', $today);
-            })
-            ->orderByRaw('expiry_date IS NULL, expiry_date ASC') // FEFO
-            ->get()
-            ->groupBy('batch_barcode')
-            ->map(function ($group) {
+            ->orderByRaw('expiry_date IS NULL, expiry_date ASC')
+            ->get();
 
-                $validItem = $group->first(function ($i) {
-                    return ($i->qty - $i->sold_qty) > 0;
-                });
+        $batches = $batchesRaw->filter(function ($b) use ($today) {
+            $stock = $b->qty - $b->sold_qty - $b->expired_qty;
+            $notExpired = ! $b->expiry_date || $b->expiry_date >= $today;
 
-                if (! $validItem) {
-                    return null;
-                }
-
-                return [
-                    'inventory_id' => $validItem->id,
-                    'batch_no' => $validItem->batch_no,
-                    'batch_barcode' => $validItem->batch_barcode,
-                    'mrp' => (string) $validItem->mrp,
-                    'selling_price' => (string) $validItem->selling_price,
-                    'cost_price' => (string) $validItem->cost_price,
-                    'expiry_date' => $validItem->expiry_date,
-                    'total_stock' => (float) $group->sum(fn ($i) => $i->qty - $i->sold_qty),
-                ];
-            })
-            ->filter()
-            ->sortBy('expiry_date')
-            ->values();
+            return $stock > 0 && $notExpired;
+        })->map(function ($b) {
+            return [
+                'inventory_id' => $b->id,
+                'batch_no' => $b->batch_no,
+                'batch_barcode' => $b->batch_barcode,
+                'mrp' => $b->mrp,
+                'selling_price' => $b->selling_price,
+                'cost_price' => $b->cost_price,
+                'expiry_date' => $b->expiry_date,
+                'total_stock' => $b->qty - $b->sold_qty - $b->expired_qty,
+            ];
+        })->values();
 
         if ($batches->isEmpty()) {
-
-            $hasExpiredStock = Inventory::where('product_id', $product->id)
-                ->whereIn('branch_id', $branchIds)
-                ->whereRaw('(qty - sold_qty) > 0')
-                ->whereNotNull('expiry_date')
-                ->where('expiry_date', '<', $today)
-                ->exists();
+            $hasExpiredOnly = $batchesRaw->isNotEmpty();
 
             return response()->json([
-                'status' => false,
-                'message' => $hasExpiredStock
-                    ? 'All available stock is expired'
-                    : 'Product found but out of stock',
+                'status' => 'error',
+                'message' => $hasExpiredOnly
+                    ? 'All available stock for this product has expired.'
+                    : 'Product is out of stock.',
             ], 404);
         }
 
         return response()->json([
-            'status' => true,
+            'status' => 'success',
+            'is_weight_item' => false,
             'product' => [
                 'id' => $product->id,
                 'name' => $product->name,
+                'barcode' => $product->barcode,
+                'sale_type' => $product->sale_type ?? 'unit',
                 'gst_rate' => $product->gstRate,
-                'hsn_code' => $product->hsn_code,
-                'is_gst_inclusive' => $product->gst_inclusive,
+                'is_price_override' => $product->is_price_override,
             ],
             'batches' => $batches,
         ]);
@@ -508,19 +582,26 @@ class SalesBillController extends Controller
                 // 'balance_return' => $request->payment_type === 'credit' ? 0 : ($request->balance_return ?? 0),
             ]);
 
-            $customer = Customer::updateOrCreate(
+            $customerData = [
+                'name' => $request->customer['name'] ?? null,
+                'add1' => $request->customer['add1'] ?? null,
+                'add2' => $request->customer['add2'] ?? null,
+                'area' => $request->customer['area'] ?? null,
+                'city' => $request->customer['city'] ?? null,
+            ];
+
+            $customer = Customer::firstOrCreate(
                 [
-                    'branch_id' => $branchId,
+                    'store_id' => $user->store_id,
                     'mobile' => $request->customer['mobile'],
                 ],
-                [
-                    'name' => $request->customer['name'] ?? null,
-                    'add1' => $request->customer['add1'] ?? null,
-                    'add2' => $request->customer['add2'] ?? null,
-                    'area' => $request->customer['area'] ?? null,
-                    'city' => $request->customer['city'] ?? null,
-                ]
+                array_merge($customerData, [
+                    'branch_id' => $branchId,
+                    'name' => $customerData['name'] ?: 'Walk-in Customer',
+                ])
             );
+
+            $customer->update(array_filter($customerData, fn ($v) => $v !== null && $v !== ''));
 
             $bill->customer_id = $customer->id;
 
@@ -878,18 +959,20 @@ class SalesBillController extends Controller
         $user = Auth::user();
         $branchIds = $this->allowedCustomerBranchIds($user);
 
+        if ($user->role === 'admin' && request()->filled('branch_id')) {
+            abort_unless(in_array((int) request('branch_id'), $branchIds, true), 403, 'Invalid branch');
+        }
+
         $customers = SalesBill::select([
             'customer_id',
             DB::raw('SUM(due_amount) as total_due'),
         ])
+            ->where('store_id', $user->store_id)
+            ->whereIn('branch_id', $branchIds)
+            ->when($user->role === 'admin' && request()->filled('branch_id'),
+                fn ($q) => $q->where('branch_id', request('branch_id')))
             ->whereNotNull('customer_id')
             ->where('due_amount', '>', 0)
-            ->whereHas('customer', function ($query) use ($branchIds) {
-                $query->whereIn('branch_id', $branchIds);
-                if (Auth::user()->role === 'admin' && request()->filled('branch_id')) {
-                    $query->where('branch_id', request('branch_id'));
-                }
-            })
             ->groupBy('customer_id')
             ->with('customer:id,branch_id,name,mobile')
             ->get();
@@ -908,20 +991,22 @@ class SalesBillController extends Controller
     {
         $user = Auth::user();
         $branchIds = $this->allowedCustomerBranchIds($user);
-        $customerQuery = Customer::whereIn('branch_id', $branchIds)->where('mobile', $customerMobile);
+        $customer = Customer::where('store_id', $user->store_id)
+            ->where('mobile', $customerMobile)
+            ->first();
 
         if ($user->role === 'admin' && request()->filled('branch_id')) {
             abort_unless(in_array((int) request('branch_id'), $branchIds, true), 403, 'Invalid branch');
-            $customerQuery->where('branch_id', request('branch_id'));
         }
-
-        $customer = $customerQuery->first();
 
         if (! $customer) {
             return response()->json(['customer' => null]);
         }
 
         $totalDue = SalesBill::where('customer_id', $customer->id)
+            ->whereIn('branch_id', $branchIds)
+            ->when($user->role === 'admin' && request()->filled('branch_id'),
+                fn ($q) => $q->where('branch_id', request('branch_id')))
             ->where('due_amount', '>', 0)
             ->sum('due_amount');
 
@@ -1145,8 +1230,7 @@ class SalesBillController extends Controller
     {
 
         $user = Auth::user();
-        $customer = Customer::whereIn('branch_id', $this->allowedCustomerBranchIds($user))
-            ->findOrFail($request->customer_id);
+        $customer = Customer::where('store_id', $user->store_id)->findOrFail($request->customer_id);
 
         $request->validate([
             'customer_id' => 'required|exists:customers,id',
@@ -1162,6 +1246,8 @@ class SalesBillController extends Controller
             $remaining = $request->amount;
 
             $bills = SalesBill::where('customer_id', $customer->id)
+                ->where('store_id', $user->store_id)
+                ->whereIn('branch_id', $this->allowedCustomerBranchIds($user))
                 ->where('due_amount', '>', 0)
                 ->orderBy('created_at')
                 ->lockForUpdate()

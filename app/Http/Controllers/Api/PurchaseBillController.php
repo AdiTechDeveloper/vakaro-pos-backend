@@ -170,249 +170,31 @@ class PurchaseBillController extends Controller
         return "POS-{$productId}-{$date}-{$nextNumber}";
     }
 
-    private function generateInwardNumber(int $branchId)
+    protected function generateInwardNumber($branchId)
     {
-        // Financial Year prefix (e.g., 2425)
-        $fy = date('m') >= 4 ? date('y').(date('y') + 1) : (date('y') - 1).date('y');
+        $user = Auth::user();
+        $storeId = $user->store_id;
 
-        // Filter by FY to reset sequence every financial year globally
-        $lastSequence = PurchaseBill::withTrashed()
-            ->where('inward_no', 'like', "INW/{$fy}/%")
-            ->max('inward_sequence') ?? 0;
+        $lastBill = PurchaseBill::where('store_id', $storeId)
+            ->where('branch_id', $branchId)
+            ->orderBy('id', 'desc')
+            ->first();
 
-        $nextSequence = $lastSequence + 1;
+        $sequence = 1;
+        if ($lastBill && $lastBill->inward_sequence) {
+            $sequence = $lastBill->inward_sequence + 1;
+        }
 
-        // Formatted Inward Number e.g., INW/2425/0001
-        $inwardNo = 'INW/'.$fy.'/'.str_pad($nextSequence, 4, '0', STR_PAD_LEFT);
+        $financialYear = '2627';
+        $formattedSeq = str_pad($sequence, 4, '0', STR_PAD_LEFT);
+
+        $inwardNo = "INW/{$storeId}/{$branchId}/{$financialYear}/{$formattedSeq}";
 
         return [
             'inward_no' => $inwardNo,
-            'inward_sequence' => $nextSequence,
+            'inward_sequence' => $sequence,
         ];
     }
-
-    // public function store(Request $request)
-    // {
-    //     $validated = $request->validate([
-    //         'branch_id' => 'required|integer',
-    //         'supplier_id' => 'required|integer',
-    //         'bill_no' => [
-    //             'required',
-    //             'string',
-    //             \Illuminate\Validation\Rule::unique('purchase_bills')->where(
-    //                 fn ($q) => $q->where('supplier_id', $request->supplier_id)
-    //             ),
-    //         ],
-    //         'bill_date' => 'required|date',
-    //         'is_lost' => 'sometimes|in:0,1',
-    //         'lines' => 'required|array|min:1',
-    //         'lines.*.product_id' => 'required|integer',
-    //         'lines.*.qty' => 'required|numeric|min:0.0001',
-    //         'lines.*.free_qty' => 'nullable|numeric|min:0',
-    //         'lines.*.purchase_rate' => 'required|numeric|min:0',
-    //         'lines.*.mrp' => 'required|numeric|min:0',
-    //         'lines.*.selling_price' => 'required|numeric|min:0',
-    //         'lines.*.gst_rate_id' => 'required|integer',
-    //         'lines.*.batch_no' => 'nullable|string',
-    //         'lines.*.expiry_date' => 'nullable|date',
-    //         'lines.*.discount' => 'nullable|numeric|min:0',
-    //         'lines.*.discount_type' => 'nullable|string|in:percent,fixed',
-    //         'lines.*.is_opening' => 'sometimes|in:0,1',
-    //     ]);
-
-    //     try {
-    //         DB::beginTransaction();
-
-    //         $user = Auth::user();
-    //         $storeId = $user->store_id;
-    //         $supplier = Supplier::findOrFail($validated['supplier_id']);
-
-    //         $branch = Branch::findOrFail($validated['branch_id']);
-    //         $originState = ($user->role === 'admin')
-    //             ? Store::findOrFail($storeId)->state
-    //             : $branch->state;
-    //         $isIntra = ($originState === $supplier->state);
-
-    //         $bill = PurchaseBill::create([
-    //             'store_id' => $storeId,
-    //             'branch_id' => $validated['branch_id'],
-    //             'supplier_id' => $validated['supplier_id'],
-    //             'bill_no' => $validated['bill_no'],
-    //             'bill_date' => $validated['bill_date'],
-    //             'is_lost' => $validated['is_lost'] ?? 0,
-    //             'created_by' => $user->id,
-    //         ]);
-
-    //         $totals = ['taxable' => 0, 'cgst' => 0, 'sgst' => 0, 'igst' => 0];
-
-    //         foreach ($validated['lines'] as $lineData) {
-    //             $product = Product::findOrFail($lineData['product_id']);
-    //             $gst = GstRate::findOrFail($lineData['gst_rate_id']);
-
-    //             $qty = (float) $lineData['qty'];
-    //             $freeQty = (float) ($lineData['free_qty'] ?? 0);
-    //             $purchaseRate = (float) $lineData['purchase_rate'];
-    //             $mrp = (float) $lineData['mrp'];
-    //             $sellingPrice = (float) $lineData['selling_price'];
-
-    //             $discount = isset($lineData['discount']) ? (float) $lineData['discount'] : 0.0;
-    //             $discountType = $lineData['discount_type'] ?? null;
-
-    //             $grossValue = round($qty * $purchaseRate, 2);
-    //             $discountAmount = ($discountType === 'percent')
-    //                 ? round($grossValue * ($discount / 100), 2)
-    //                 : round($discount, 2);
-    //             $taxable = max(0, round($grossValue - $discountAmount, 2));
-
-    //             $taxRate = $gst->rate;
-    //             $cgst = $isIntra ? round(($taxable * ($taxRate / 2)) / 100, 2) : 0;
-    //             $sgst = $isIntra ? round(($taxable * ($taxRate / 2)) / 100, 2) : 0;
-    //             $igst = ! $isIntra ? round(($taxable * $taxRate) / 100, 2) : 0;
-
-    //             $hasBatch = ! empty($lineData['batch_no']);
-    //             $batchNo = $hasBatch ? $lineData['batch_no'] : $this->generateBatchNo($product->id);
-
-    //             $line = PurchaseLine::create([
-    //                 'purchase_bill_id' => $bill->id,
-    //                 'product_id' => $product->id,
-    //                 'qty' => $qty,
-    //                 'free_qty' => $freeQty,
-    //                 'purchase_rate' => $purchaseRate,
-    //                 'mrp' => $mrp,
-    //                 'selling_price' => $sellingPrice,
-    //                 'taxable_value' => $taxable,
-    //                 'cgst' => $cgst,
-    //                 'sgst' => $sgst,
-    //                 'igst' => $igst,
-    //                 'gst_rate_id' => $lineData['gst_rate_id'],
-    //                 'discount_type' => $discountType,
-    //                 'discount' => $discount,
-    //                 'hsn_code' => $lineData['hsn_code'] ?? $product->hsn_code,
-    //                 'batch_no' => $batchNo,
-    //                 'expiry_date' => $lineData['expiry_date'] ?? null,
-    //                 'is_opening' => (int) ($lineData['is_opening'] ?? 0),
-    //             ]);
-
-    //             $existingBatch = null;
-
-    //             if ($hasBatch) {
-    //                 $existingBatch = Inventory::where('product_id', $product->id)
-    //                     ->where('branch_id', $validated['branch_id'])
-    //                     ->where('selling_price', $sellingPrice)
-    //                     ->where('mrp', $mrp)
-    //                     ->where('batch_no', $batchNo)
-    //                     ->where('cost_price', $purchaseRate)
-    //                     ->where('free', 0)
-    //                     ->first();
-    //             }
-
-    //             if ($existingBatch) {
-    //                 $existingBatch->increment('qty', $qty);
-    //                 $batchBarcode = $existingBatch->batch_barcode;
-    //                 $existingBatch->amount = $existingBatch->qty * $existingBatch->cost_price;
-    //                 $existingBatch->save();
-    //             } else {
-    //                 $batchBarcode = $product->barcode;
-    //                 if (Inventory::where('batch_barcode', $batchBarcode)->exists()) {
-    //                     $batchBarcode = $product->barcode.'-'.strtoupper(Str::random(4));
-    //                 }
-
-    //                 $isOpening = (int) ($lineData['is_opening'] ?? 0);
-
-    //                 Inventory::create([
-    //                     'product_id' => $product->id,
-    //                     'branch_id' => $validated['branch_id'],
-    //                     'purchase_bill_id' => $bill->id,
-    //                     'purchase_line_id' => $line->id,
-    //                     'batch_barcode' => $batchBarcode,
-    //                     'batch_no' => $batchNo,
-    //                     'mrp' => $mrp,
-    //                     'selling_price' => $sellingPrice,
-    //                     'cost_price' => $purchaseRate,
-    //                     'qty' => $qty,
-    //                     'sold_qty' => 0,
-    //                     'free' => false,
-    //                     'rate' => $purchaseRate,
-    //                     'amount' => $qty * $purchaseRate,
-    //                     'expiry_date' => $lineData['expiry_date'] ?? null,
-    //                     'is_opening' => $isOpening,
-    //                 ]);
-    //             }
-
-    //             if ($freeQty > 0) {
-    //                 $isOpening = (int) ($lineData['is_opening'] ?? 0);
-
-    //                 $existingFreeBatch = Inventory::where('product_id', $product->id)
-    //                     ->where('branch_id', $validated['branch_id'])
-    //                     ->where('batch_no', $batchNo)
-    //                     ->where('mrp', $mrp)
-    //                     ->where('selling_price', $sellingPrice)
-    //                     ->where('cost_price', 0)
-    //                     ->where('free', 1)
-    //                     ->first();
-
-    //                 if ($existingFreeBatch) {
-    //                     $existingFreeBatch->increment('qty', $freeQty);
-    //                 } else {
-    //                     Inventory::create([
-    //                         'product_id' => $product->id,
-    //                         'branch_id' => $validated['branch_id'],
-    //                         'purchase_bill_id' => $bill->id,
-    //                         'purchase_line_id' => $line->id,
-    //                         'batch_barcode' => $batchBarcode,
-    //                         'batch_no' => $batchNo,
-    //                         'mrp' => $mrp,
-    //                         'selling_price' => $sellingPrice,
-    //                         'cost_price' => 0,
-    //                         'qty' => $freeQty,
-    //                         'sold_qty' => 0,
-    //                         'free' => true,
-    //                         'rate' => 0,
-    //                         'amount' => 0,
-    //                         'expiry_date' => $lineData['expiry_date'] ?? null,
-    //                         'is_opening' => $isOpening,
-    //                     ]);
-    //                 }
-    //             }
-
-    //             ItcEntry::create([
-    //                 'purchase_bill_id' => $bill->id,
-    //                 'purchase_line_id' => $line->id,
-    //                 'product_id' => $product->id,
-    //                 'cgst' => $cgst,
-    //                 'sgst' => $sgst,
-    //                 'igst' => $igst,
-    //                 'total_itc' => round($cgst + $sgst + $igst, 2),
-    //                 'created_by' => $user->id,
-    //             ]);
-
-    //             $totals['taxable'] += $taxable;
-    //             $totals['cgst'] += $cgst;
-    //             $totals['sgst'] += $sgst;
-    //             $totals['igst'] += $igst;
-    //         }
-
-    //         $totalTax = $totals['cgst'] + $totals['sgst'] + $totals['igst'];
-
-    //         $bill->update([
-    //             'taxable_value' => $totals['taxable'],
-    //             'cgst_amount' => $totals['cgst'],
-    //             'sgst_amount' => $totals['sgst'],
-    //             'igst_amount' => $totals['igst'],
-    //             'total_tax' => $totalTax,
-    //             'total_amount' => round($totals['taxable'] + $totalTax, 2),
-    //             'received' => true,
-    //         ]);
-
-    //         DB::commit();
-
-    //         return response()->json(['status' => true, 'message' => 'Success', 'bill' => $bill], 201);
-    //     } catch (\Exception $e) {
-    //         DB::rollBack();
-
-    //         return response()->json(['status' => false, 'message' => $e->getMessage()], 500);
-    //     }
-    // }
 
     public function store(Request $request)
     {
@@ -530,6 +312,9 @@ class PurchaseBillController extends Controller
                 $enteredPurchaseRate = (float) $lineData['purchase_rate'];
                 $mrp = (float) $lineData['mrp'];
                 $sellingPrice = (float) $lineData['selling_price'];
+                if ($product->sale_type === 'weight' && $product->price_per_kg) {
+                    $sellingPrice = (float) $product->price_per_kg;
+                }
                 $taxRate = (float) $gst->rate;
 
                 $discount = isset($lineData['discount']) ? (float) $lineData['discount'] : 0.0;

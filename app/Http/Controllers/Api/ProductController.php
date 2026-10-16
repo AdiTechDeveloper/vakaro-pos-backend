@@ -4,85 +4,22 @@ namespace App\Http\Controllers\Api;
 
 use App\Exports\ProductTemplateExport;
 use App\Http\Controllers\Controller;
+use App\Imports\ProductRowsImport;
 use App\Models\Branch;
+use App\Models\Brand;
+use App\Models\Category;
 use App\Models\Inventory;
 use App\Models\Product;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
-use Milon\Barcode\Facades\DNS1DFacade as DNS1D;
-use App\Models\Brand;
-use App\Models\Category;
-use App\Imports\ProductRowsImport;
 use Illuminate\Support\Facades\Validator;
 use Maatwebsite\Excel\Facades\Excel;
-
-
-
-
+use Milon\Barcode\Facades\DNS1DFacade as DNS1D;
 
 class ProductController extends Controller
 {
-    // public function getAllProducts(Request $request)
-    // {
-    //     $user = Auth::user();
-    //     $role = $user->role;
-    //     $storeId = $user->store_id;
-
-    //     $query = Product::where('store_id', $storeId)->with('brand', 'category', 'gstRate');
-
-    //     // if ($role === 'manager') {
-    //     //     $assignedBranchIds = DB::table('branch_staff')
-    //     //         ->where('user_id', $user->id)
-    //     //         ->pluck('branch_id')
-    //     //         ->toArray();
-
-    //     //     if (empty($assignedBranchIds)) {
-    //     //         return response()->json(['status' => true, 'products' => []], 200);
-    //     //     }
-
-    //     //     if ($request->filled('branch_id')) {
-    //     //         $requestedBranchId = (int) $request->branch_id;
-
-    //     //         if (! in_array($requestedBranchId, $assignedBranchIds)) {
-    //     //             return response()->json([
-    //     //                 'status' => false,
-    //     //                 'message' => 'Unauthorized access to this branch products.',
-    //     //             ], 403);
-    //     //         }
-
-    //     //         $targetBranchIds = [$requestedBranchId];
-    //     //     } else {
-    //     //         $targetBranchIds = $assignedBranchIds;
-    //     //     }
-
-    //     //     $staffUserIds = DB::table('branch_staff')
-    //     //         ->whereIn('branch_id', $targetBranchIds)
-    //     //         ->pluck('user_id')
-    //     //         ->toArray();
-
-    //     //     $query->whereIn('created_by', $staffUserIds);
-    //     // } elseif ($role === 'admin') {
-    //     //     if ($request->filled('branch_id')) {
-    //     //         $requestedBranchId = $request->branch_id;
-
-    //     //         $staffUserIds = DB::table('branch_staff')
-    //     //             ->where('branch_id', $requestedBranchId)
-    //     //             ->pluck('user_id')
-    //     //             ->toArray();
-
-    //     //         $query->whereIn('created_by', $staffUserIds);
-    //     //     }
-    //     // }
-
-    //     $products = $query->get();
-
-    //     return response()->json([
-    //         'status' => true,
-    //         'products' => $products,
-    //     ], 200);
-    // }
     public function getAllProducts(Request $request)
     {
         $user = Auth::user();
@@ -123,7 +60,7 @@ class ProductController extends Controller
             'total_stock' => Inventory::selectRaw('COALESCE(SUM(qty - sold_qty), 0)')
                 ->whereColumn('inventories.product_id', 'products.id')
                 ->whereNull('inventories.deleted_at')
-                ->when($branchId, fn($q) => $q->where('inventories.branch_id', $branchId))
+                ->when($branchId, fn ($q) => $q->where('inventories.branch_id', $branchId))
                 ->whereColumn('inventories.sold_qty', '<', 'inventories.qty')
                 ->where(function ($q) {
                     $q->whereNull('inventories.expiry_date')
@@ -161,7 +98,7 @@ class ProductController extends Controller
         if ($user->role === 'admin') {
             $storeBranchIds = Branch::where('store_id', $storeId)
                 ->pluck('id')
-                ->map(fn($id) => (int) $id)
+                ->map(fn ($id) => (int) $id)
                 ->toArray();
 
             if ($request->filled('branch_id')) {
@@ -184,7 +121,7 @@ class ProductController extends Controller
                 $q->where('brand_id', $request->brand_id);
             })
             ->when($request->search, function ($q) use ($request) {
-                $q->where('name', 'like', '%' . $request->search . '%');
+                $q->where('name', 'like', '%'.$request->search.'%');
             })
             ->with(['store', 'brand', 'category', 'gstRate'])
             ->with(['inventories' => function ($q) use ($branchIds) {
@@ -256,7 +193,7 @@ class ProductController extends Controller
                 ];
             })->values();
 
-            $prices = $batches->pluck('selling_price')->filter(fn($p) => ! is_null($p));
+            $prices = $batches->pluck('selling_price')->filter(fn ($p) => ! is_null($p));
 
             $data = $product->toArray();
             $data['min_price'] = $prices->min();
@@ -308,7 +245,7 @@ class ProductController extends Controller
         $checkDigit = (10 - ($sum % 10)) % 10;
 
         // Final barcode
-        return $base . $checkDigit;
+        return $base.$checkDigit;
     }
 
     public function store(Request $request)
@@ -319,6 +256,9 @@ class ProductController extends Controller
                 'sku' => 'nullable|string|unique:products,sku',
                 'barcode' => 'nullable|string', // This will be the Manufacturer barcode if scanned
                 'is_price_override' => 'nullable|boolean',
+                'sale_type' => 'nullable|in:unit,weight',
+                'plu_code' => 'nullable|digits_between:1,5|required_if:sale_type,weight',
+                'price_per_kg' => 'nullable|numeric|min:0|required_if:sale_type,weight',
             ]);
 
             $user = Auth::user();
@@ -356,6 +296,9 @@ class ProductController extends Controller
                 'gst_rate_id' => $request->gst_rate_id,
                 'gst_inclusive' => $request->gst_inclusive ?? 0,
                 'is_price_override' => $request->input('is_price_override', 0),
+                'sale_type' => $request->input('sale_type', 'unit'),
+                'plu_code' => $request->plu_code,
+                'price_per_kg' => $request->price_per_kg,
                 'created_by' => Auth::id(),
             ]);
 
@@ -379,7 +322,10 @@ class ProductController extends Controller
             $request->validate([
                 'name' => 'required|string',
                 'is_price_override' => 'nullable|boolean',
-                'barcode' => 'nullable|string|unique:products,barcode,' . $id,
+                'barcode' => 'nullable|string|unique:products,barcode,'.$id,
+                'sale_type' => 'nullable|in:unit,weight',
+                'plu_code' => 'nullable|digits_between:1,5|required_if:sale_type,weight',
+                'price_per_kg' => 'nullable|numeric|min:0|required_if:sale_type,weight',
             ]);
 
             $user = Auth::user();
@@ -412,6 +358,9 @@ class ProductController extends Controller
                 'gst_rate_id' => $request->gst_rate_id,
                 'gst_inclusive' => $request->gst_inclusive ?? 0,
                 'is_price_override' => $request->input('is_price_override', 0),
+                'sale_type' => $request->input('sale_type', $product->sale_type),
+                'plu_code' => $request->plu_code,
+                'price_per_kg' => $request->price_per_kg,
                 'updated_by' => Auth::id(),
             ]);
 
@@ -763,7 +712,7 @@ class ProductController extends Controller
         }
 
         $query = Inventory::with([
-            'product' => fn($q) => $q->withTrashed()->select('id', 'name'),
+            'product' => fn ($q) => $q->withTrashed()->select('id', 'name'),
             'branch:id,name',
         ])
             ->whereIn('branch_id', $branchIds)
@@ -826,335 +775,338 @@ class ProductController extends Controller
         ]);
     }
 
+    private const IMPORT_MAX_ROWS = 2000;
 
-private const IMPORT_MAX_ROWS = 2000;
- 
-/**
- * Empty Excel template (headings only) so a new user knows the exact columns.
- */
-public function downloadImportTemplate()
-{
-    $user = Auth::user();
+    /**
+     * Empty Excel template (headings only) so a new user knows the exact columns.
+     */
+    public function downloadImportTemplate()
+    {
+        $user = Auth::user();
 
-    if (!$user || !in_array($user->role, ['admin', 'manager'], true)) {
-        return response()->json([
-            'status' => false,
-            'message' => 'Unauthorized',
-        ], 403);
+        if (! $user || ! in_array($user->role, ['admin', 'manager'], true)) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Unauthorized',
+            ], 403);
+        }
+
+        return Excel::download(
+            new ProductTemplateExport,
+            'product-import-template.xlsx'
+        );
     }
 
-    return Excel::download(
-        new ProductTemplateExport(),
-        'product-import-template.xlsx'
-    );
-}
- 
-public function importExcel(Request $request)
-{
-    $user = Auth::user();
- 
-    if (!$user || !in_array($user->role, ['admin', 'manager'], true)) {
-        return response()->json([
-            'status' => false,
-            'message' => 'Unauthorized',
-        ], 403);
-    }
- 
-    $request->validate([
-        'file' => 'required|file|mimes:xlsx,xls,csv,txt|max:10240',
-    ]);
- 
-    // Large files can take a while (row by row validation).
-    set_time_limit(120);
- 
-    try {
-        $storeId = $user->store_id;
- 
-        $sheetRows = Excel::toCollection(
-            new ProductRowsImport(),
-            $request->file('file')
-        )->first() ?? collect();
- 
-        // Drop completely empty rows, but remember the real Excel row number
-        // (+2 because row 1 is the heading row).
-        $items = [];
-        foreach ($sheetRows as $index => $row) {
-            $raw = $row->toArray();
- 
-            if (collect($raw)->every(
-                fn ($value) => $value === null || trim((string) $value) === ''
-            )) {
-                continue;
-            }
- 
-            $items[] = [
-                'row' => $index + 2,
-                'data' => $this->normalizeImportRow($raw),
-                'has_name_column' => array_key_exists('name', $raw),
-            ];
-        }
- 
-        if (empty($items)) {
+    public function importExcel(Request $request)
+    {
+        $user = Auth::user();
+
+        if (! $user || ! in_array($user->role, ['admin', 'manager'], true)) {
             return response()->json([
                 'status' => false,
-                'message' => 'The file has no product rows.',
-            ], 422);
+                'message' => 'Unauthorized',
+            ], 403);
         }
- 
-        if (!$items[0]['has_name_column']) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Column "name" was not found. Please download the template and keep its headings unchanged.',
-            ], 422);
-        }
- 
-        if (count($items) > self::IMPORT_MAX_ROWS) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Too many rows. Please import at most ' . self::IMPORT_MAX_ROWS . ' products at a time.',
-            ], 422);
-        }
- 
-        // One query per column instead of one query per row.
-        $existingSkus = $this->existingImportValues('sku', array_column(array_column($items, 'data'), 'sku'));
-        $existingBarcodes = $this->existingImportValues('barcode', array_column(array_column($items, 'data'), 'barcode'));
- 
-        // Brands / categories of this store, so each name is looked up only once.
-        $brandIds = Brand::where('store_id', $storeId)->get(['id', 'name'])
-            ->mapWithKeys(fn ($b) => [mb_strtolower($b->name) => $b->id])->all();
-        $categoryIds = Category::where('store_id', $storeId)->get(['id', 'name'])
-            ->mapWithKeys(fn ($c) => [mb_strtolower($c->name) => $c->id])->all();
- 
-        // Valid GST rate ids (small table). Unknown ids are left blank instead of failing the row.
-        $validGstRateIds = DB::table('gst_rates')->pluck('id')
-            ->mapWithKeys(fn ($id) => [(string) $id => true])->all();
- 
-        $seenSkus = [];
-        $seenBarcodes = [];
-        $created = 0;
-        $errors = [];
- 
-        foreach ($items as $item) {
-            $rowNumber = $item['row'];
-            $data = $item['data'];
- 
-            // GST rate not available / not found -> save the product with a blank GST rate.
-            if ($data['gst_rate_id'] !== null && !isset($validGstRateIds[$data['gst_rate_id']])) {
-                $data['gst_rate_id'] = null;
-            }
- 
-            $validator = Validator::make($data, [
-                'name' => 'required|string|max:255',
-                'sku' => 'nullable|string|max:255',
-                'barcode' => 'nullable|string|max:255',
-                'brand' => 'nullable|string|max:255',
-                'category' => 'nullable|string|max:255',
-                'hsn_code' => 'nullable|string|max:255',
-                'mrp' => 'nullable|numeric|min:0',
-                'selling_price' => 'nullable|numeric|min:0',
-                'cost_price' => 'nullable|numeric|min:0',
-                'gst_inclusive' => 'nullable|in:0,1',
-                'is_price_override' => 'nullable|in:0,1',
-            ]);
- 
-            if ($validator->fails()) {
-                $errors[] = [
-                    'row' => $rowNumber,
-                    'name' => $data['name'] ?: null,
-                    'errors' => $validator->errors()->all(),
-                ];
-                continue;
-            }
- 
-            $skuKey = mb_strtolower($data['sku']);
-            $barcodeKey = mb_strtolower($data['barcode']);
- 
-            // SKU / barcode are globally unique in the database.
-            if ($data['sku'] !== '') {
-                if (isset($existingSkus[$skuKey])) {
-                    $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['SKU already exists: ' . $data['sku']]];
-                    continue;
-                }
-                if (isset($seenSkus[$skuKey])) {
-                    $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Duplicate SKU in this file: ' . $data['sku']]];
-                    continue;
-                }
-            }
- 
-            if ($data['barcode'] !== '') {
-                if (isset($existingBarcodes[$barcodeKey])) {
-                    $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Barcode already exists: ' . $data['barcode']]];
-                    continue;
-                }
-                if (isset($seenBarcodes[$barcodeKey])) {
-                    $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Duplicate barcode in this file: ' . $data['barcode']]];
-                    continue;
-                }
-            }
- 
-            try {
-                $brandId = $this->importLookupId(Brand::class, $brandIds, $data['brand'], $storeId, $user->id);
-                $categoryId = $this->importLookupId(Category::class, $categoryIds, $data['category'], $storeId, $user->id);
- 
-                $barcodeToSave = $data['barcode'];
- 
-                if ($barcodeToSave === '') {
-                    do {
-                        $barcodeToSave = $this->generateEan13Barcode();
-                    } while (
-                        isset($seenBarcodes[mb_strtolower($barcodeToSave)])
-                        || DB::table('products')->where('barcode', $barcodeToSave)->exists()
-                    );
-                }
- 
-                Product::create([
-                    'store_id' => $storeId,
-                    'name' => $data['name'],
-                    'sku' => $data['sku'] !== '' ? $data['sku'] : null,
-                    'barcode' => $barcodeToSave,
-                    'brand_id' => $brandId,
-                    'category_id' => $categoryId,
-                    'hsn_code' => $data['hsn_code'] !== '' ? $data['hsn_code'] : null,
-                    'gst_rate_id' => $data['gst_rate_id'],
-                    'mrp' => $data['mrp'],
-                    'selling_price' => $data['selling_price'],
-                    'cost_price' => $data['cost_price'],
-                    'gst_inclusive' => $data['gst_inclusive'] ?? 0,
-                    'is_price_override' => $data['is_price_override'] ?? 0,
-                    'created_by' => $user->id,
-                ]);
- 
-                if ($data['sku'] !== '') {
-                    $seenSkus[$skuKey] = true;
-                }
-                $seenBarcodes[mb_strtolower($barcodeToSave)] = true;
- 
-                $created++;
-            } catch (\Throwable $e) {
-                report($e);
- 
-                $errors[] = [
-                    'row' => $rowNumber,
-                    'name' => $data['name'],
-                    'errors' => ['Could not save this product. Check its database constraints.'],
-                ];
-            }
-        }
- 
-        return response()->json([
-            'status' => true,
-            'message' => 'Product import completed.',
-            'summary' => [
-                'total_rows' => count($items),
-                'created' => $created,
-                'skipped' => count($errors),
-            ],
-            'errors' => $errors,
+
+        $request->validate([
+            'file' => 'required|file|mimes:xlsx,xls,csv,txt|max:10240',
         ]);
-    } catch (\Throwable $e) {
-        report($e);
- 
-        return response()->json([
-            'status' => false,
-            'message' => 'Excel import failed. Check the file format and server logs.',
-        ], 422);
-    }
-}
- 
-/**
- * Excel gives numbers as int/float (barcode 8901234567890 -> float), which would
- * fail the "string" validation rules. Convert every cell to clean text / numbers first.
- */
-private function normalizeImportRow(array $raw): array
-{
-    return [
-        'name' => $this->importText($raw['name'] ?? null),
-        'sku' => $this->importText($raw['sku'] ?? null),
-        'barcode' => $this->importText($raw['barcode'] ?? null),
-        'brand' => $this->importText($raw['brand'] ?? null),
-        'category' => $this->importText($raw['category'] ?? null),
-        'hsn_code' => $this->importText($raw['hsn_code'] ?? null),
-        'gst_rate_id' => $this->importNumber($raw['gst_rate_id'] ?? null),
-        'mrp' => $this->importNumber($raw['mrp'] ?? null),
-        'selling_price' => $this->importNumber($raw['selling_price'] ?? null),
-        'cost_price' => $this->importNumber($raw['cost_price'] ?? null),
-        'gst_inclusive' => $this->importFlag($raw['gst_inclusive'] ?? null),
-        'is_price_override' => $this->importFlag($raw['is_price_override'] ?? null),
-    ];
-}
- 
-private function importText($value): string
-{
-    if ($value === null) {
-        return '';
-    }
- 
-    // 8901234567890.0 -> "8901234567890" (no ".0" / scientific notation)
-    if (is_float($value) && floor($value) == $value && abs($value) < 1e15) {
-        return (string) (int) $value;
-    }
- 
-    return trim((string) $value);
-}
- 
-private function importNumber($value): ?string
-{
-    $text = str_replace([',', '₹', ' '], '', $this->importText($value));
- 
-    return $text === '' ? null : $text;
-}
- 
-/** Accepts 1/0, yes/no, y/n, true/false. Anything else is left as-is so validation rejects it. */
-private function importFlag($value): ?string
-{
-    $text = mb_strtolower($this->importText($value));
- 
-    if ($text === '') {
-        return null;
-    }
-    if (in_array($text, ['1', 'yes', 'y', 'true'], true)) {
-        return '1';
-    }
-    if (in_array($text, ['0', 'no', 'n', 'false'], true)) {
-        return '0';
-    }
- 
-    return $text;
-}
- 
-/** Which of these SKUs/barcodes already exist in the products table? (lowercased lookup map) */
-private function existingImportValues(string $column, array $values): array
-{
-    $values = array_values(array_unique(array_filter($values, fn ($v) => $v !== '' && $v !== null)));
-    $found = [];
- 
-    foreach (array_chunk($values, 500) as $chunk) {
-        foreach (DB::table('products')->whereIn($column, $chunk)->pluck($column) as $existing) {
-            $found[mb_strtolower((string) $existing)] = true;
+
+        // Large files can take a while (row by row validation).
+        set_time_limit(120);
+
+        try {
+            $storeId = $user->store_id;
+
+            $sheetRows = Excel::toCollection(
+                new ProductRowsImport,
+                $request->file('file')
+            )->first() ?? collect();
+
+            // Drop completely empty rows, but remember the real Excel row number
+            // (+2 because row 1 is the heading row).
+            $items = [];
+            foreach ($sheetRows as $index => $row) {
+                $raw = $row->toArray();
+
+                if (collect($raw)->every(
+                    fn ($value) => $value === null || trim((string) $value) === ''
+                )) {
+                    continue;
+                }
+
+                $items[] = [
+                    'row' => $index + 2,
+                    'data' => $this->normalizeImportRow($raw),
+                    'has_name_column' => array_key_exists('name', $raw),
+                ];
+            }
+
+            if (empty($items)) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'The file has no product rows.',
+                ], 422);
+            }
+
+            if (! $items[0]['has_name_column']) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Column "name" was not found. Please download the template and keep its headings unchanged.',
+                ], 422);
+            }
+
+            if (count($items) > self::IMPORT_MAX_ROWS) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Too many rows. Please import at most '.self::IMPORT_MAX_ROWS.' products at a time.',
+                ], 422);
+            }
+
+            // One query per column instead of one query per row.
+            $existingSkus = $this->existingImportValues('sku', array_column(array_column($items, 'data'), 'sku'));
+            $existingBarcodes = $this->existingImportValues('barcode', array_column(array_column($items, 'data'), 'barcode'));
+
+            // Brands / categories of this store, so each name is looked up only once.
+            $brandIds = Brand::where('store_id', $storeId)->get(['id', 'name'])
+                ->mapWithKeys(fn ($b) => [mb_strtolower($b->name) => $b->id])->all();
+            $categoryIds = Category::where('store_id', $storeId)->get(['id', 'name'])
+                ->mapWithKeys(fn ($c) => [mb_strtolower($c->name) => $c->id])->all();
+
+            // Valid GST rate ids (small table). Unknown ids are left blank instead of failing the row.
+            $validGstRateIds = DB::table('gst_rates')->pluck('id')
+                ->mapWithKeys(fn ($id) => [(string) $id => true])->all();
+
+            $seenSkus = [];
+            $seenBarcodes = [];
+            $created = 0;
+            $errors = [];
+
+            foreach ($items as $item) {
+                $rowNumber = $item['row'];
+                $data = $item['data'];
+
+                // GST rate not available / not found -> save the product with a blank GST rate.
+                if ($data['gst_rate_id'] !== null && ! isset($validGstRateIds[$data['gst_rate_id']])) {
+                    $data['gst_rate_id'] = null;
+                }
+
+                $validator = Validator::make($data, [
+                    'name' => 'required|string|max:255',
+                    'sku' => 'nullable|string|max:255',
+                    'barcode' => 'nullable|string|max:255',
+                    'brand' => 'nullable|string|max:255',
+                    'category' => 'nullable|string|max:255',
+                    'hsn_code' => 'nullable|string|max:255',
+                    'mrp' => 'nullable|numeric|min:0',
+                    'selling_price' => 'nullable|numeric|min:0',
+                    'cost_price' => 'nullable|numeric|min:0',
+                    'gst_inclusive' => 'nullable|in:0,1',
+                    'is_price_override' => 'nullable|in:0,1',
+                ]);
+
+                if ($validator->fails()) {
+                    $errors[] = [
+                        'row' => $rowNumber,
+                        'name' => $data['name'] ?: null,
+                        'errors' => $validator->errors()->all(),
+                    ];
+
+                    continue;
+                }
+
+                $skuKey = mb_strtolower($data['sku']);
+                $barcodeKey = mb_strtolower($data['barcode']);
+
+                // SKU / barcode are globally unique in the database.
+                if ($data['sku'] !== '') {
+                    if (isset($existingSkus[$skuKey])) {
+                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['SKU already exists: '.$data['sku']]];
+
+                        continue;
+                    }
+                    if (isset($seenSkus[$skuKey])) {
+                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Duplicate SKU in this file: '.$data['sku']]];
+
+                        continue;
+                    }
+                }
+
+                if ($data['barcode'] !== '') {
+                    if (isset($existingBarcodes[$barcodeKey])) {
+                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Barcode already exists: '.$data['barcode']]];
+
+                        continue;
+                    }
+                    if (isset($seenBarcodes[$barcodeKey])) {
+                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Duplicate barcode in this file: '.$data['barcode']]];
+
+                        continue;
+                    }
+                }
+
+                try {
+                    $brandId = $this->importLookupId(Brand::class, $brandIds, $data['brand'], $storeId, $user->id);
+                    $categoryId = $this->importLookupId(Category::class, $categoryIds, $data['category'], $storeId, $user->id);
+
+                    $barcodeToSave = $data['barcode'];
+
+                    if ($barcodeToSave === '') {
+                        do {
+                            $barcodeToSave = $this->generateEan13Barcode();
+                        } while (
+                            isset($seenBarcodes[mb_strtolower($barcodeToSave)])
+                            || DB::table('products')->where('barcode', $barcodeToSave)->exists()
+                        );
+                    }
+
+                    Product::create([
+                        'store_id' => $storeId,
+                        'name' => $data['name'],
+                        'sku' => $data['sku'] !== '' ? $data['sku'] : null,
+                        'barcode' => $barcodeToSave,
+                        'brand_id' => $brandId,
+                        'category_id' => $categoryId,
+                        'hsn_code' => $data['hsn_code'] !== '' ? $data['hsn_code'] : null,
+                        'gst_rate_id' => $data['gst_rate_id'],
+                        'mrp' => $data['mrp'],
+                        'selling_price' => $data['selling_price'],
+                        'cost_price' => $data['cost_price'],
+                        'gst_inclusive' => $data['gst_inclusive'] ?? 0,
+                        'is_price_override' => $data['is_price_override'] ?? 0,
+                        'created_by' => $user->id,
+                    ]);
+
+                    if ($data['sku'] !== '') {
+                        $seenSkus[$skuKey] = true;
+                    }
+                    $seenBarcodes[mb_strtolower($barcodeToSave)] = true;
+
+                    $created++;
+                } catch (\Throwable $e) {
+                    report($e);
+
+                    $errors[] = [
+                        'row' => $rowNumber,
+                        'name' => $data['name'],
+                        'errors' => ['Could not save this product. Check its database constraints.'],
+                    ];
+                }
+            }
+
+            return response()->json([
+                'status' => true,
+                'message' => 'Product import completed.',
+                'summary' => [
+                    'total_rows' => count($items),
+                    'created' => $created,
+                    'skipped' => count($errors),
+                ],
+                'errors' => $errors,
+            ]);
+        } catch (\Throwable $e) {
+            report($e);
+
+            return response()->json([
+                'status' => false,
+                'message' => 'Excel import failed. Check the file format and server logs.',
+            ], 422);
         }
     }
- 
-    return $found;
-}
- 
-/** Find (or create once) a brand/category by name for this store. */
-private function importLookupId(string $model, array &$cache, string $name, $storeId, $userId): ?int
-{
-    if ($name === '') {
-        return null;
-    }
- 
-    $key = mb_strtolower($name);
- 
-    if (!isset($cache[$key])) {
-        $cache[$key] = $model::create([
-            'store_id' => $storeId,
-            'name' => $name,
-            'created_by' => $userId,
-        ])->id;
-    }
- 
-    return (int) $cache[$key];
-}
-}
 
+    /**
+     * Excel gives numbers as int/float (barcode 8901234567890 -> float), which would
+     * fail the "string" validation rules. Convert every cell to clean text / numbers first.
+     */
+    private function normalizeImportRow(array $raw): array
+    {
+        return [
+            'name' => $this->importText($raw['name'] ?? null),
+            'sku' => $this->importText($raw['sku'] ?? null),
+            'barcode' => $this->importText($raw['barcode'] ?? null),
+            'brand' => $this->importText($raw['brand'] ?? null),
+            'category' => $this->importText($raw['category'] ?? null),
+            'hsn_code' => $this->importText($raw['hsn_code'] ?? null),
+            'gst_rate_id' => $this->importNumber($raw['gst_rate_id'] ?? null),
+            'mrp' => $this->importNumber($raw['mrp'] ?? null),
+            'selling_price' => $this->importNumber($raw['selling_price'] ?? null),
+            'cost_price' => $this->importNumber($raw['cost_price'] ?? null),
+            'gst_inclusive' => $this->importFlag($raw['gst_inclusive'] ?? null),
+            'is_price_override' => $this->importFlag($raw['is_price_override'] ?? null),
+        ];
+    }
+
+    private function importText($value): string
+    {
+        if ($value === null) {
+            return '';
+        }
+
+        // 8901234567890.0 -> "8901234567890" (no ".0" / scientific notation)
+        if (is_float($value) && floor($value) == $value && abs($value) < 1e15) {
+            return (string) (int) $value;
+        }
+
+        return trim((string) $value);
+    }
+
+    private function importNumber($value): ?string
+    {
+        $text = str_replace([',', '₹', ' '], '', $this->importText($value));
+
+        return $text === '' ? null : $text;
+    }
+
+    /** Accepts 1/0, yes/no, y/n, true/false. Anything else is left as-is so validation rejects it. */
+    private function importFlag($value): ?string
+    {
+        $text = mb_strtolower($this->importText($value));
+
+        if ($text === '') {
+            return null;
+        }
+        if (in_array($text, ['1', 'yes', 'y', 'true'], true)) {
+            return '1';
+        }
+        if (in_array($text, ['0', 'no', 'n', 'false'], true)) {
+            return '0';
+        }
+
+        return $text;
+    }
+
+    /** Which of these SKUs/barcodes already exist in the products table? (lowercased lookup map) */
+    private function existingImportValues(string $column, array $values): array
+    {
+        $values = array_values(array_unique(array_filter($values, fn ($v) => $v !== '' && $v !== null)));
+        $found = [];
+
+        foreach (array_chunk($values, 500) as $chunk) {
+            foreach (DB::table('products')->whereIn($column, $chunk)->pluck($column) as $existing) {
+                $found[mb_strtolower((string) $existing)] = true;
+            }
+        }
+
+        return $found;
+    }
+
+    /** Find (or create once) a brand/category by name for this store. */
+    private function importLookupId(string $model, array &$cache, string $name, $storeId, $userId): ?int
+    {
+        if ($name === '') {
+            return null;
+        }
+
+        $key = mb_strtolower($name);
+
+        if (! isset($cache[$key])) {
+            $cache[$key] = $model::create([
+                'store_id' => $storeId,
+                'name' => $name,
+                'created_by' => $userId,
+            ])->id;
+        }
+
+        return (int) $cache[$key];
+    }
+}
