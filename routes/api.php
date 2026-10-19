@@ -278,11 +278,11 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
     Route::post('/reports/sales-analytics', [ReportController::class, 'salesAnalytics']);
     Route::get('/reports/sales-report', [SalesReportController::class, 'index']);
     Route::get('/reports/monthly-sales', [SalesReportController::class, 'monthlySales']);
-    Route::post(
-        '/reports/ai-sales-download',
-        [AiSalesReportDownloadController::class, 'download']
-    );
+    Route::post('/reports/ai-sales-download', [AiSalesReportDownloadController::class, 'download']);
     Route::post('/reports/ai-report-download', [AiReportDownloadController::class, 'download']);
+ 
+    // NEW
+    Route::get('/dashboard/sales-report', [DashboardInsightsController::class, 'salesReport']);
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:reports_purchase'])->group(function () {
