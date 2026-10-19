@@ -27,6 +27,8 @@ class ProductTemplateExport implements WithMultipleSheets
  * Sheet 1: Products
  *
  * Keep these headings compatible with ProductRowsImport.
+ * MRP and selling price are not part of a product: they are saved with the
+ * stock (purchase or opening stock). Only cost_price is imported here.
  */
 class ProductDataTemplateSheet implements
     FromArray,
@@ -50,8 +52,6 @@ class ProductDataTemplateSheet implements
             'category',
             'hsn_code',
             'gst_rate_id',
-            'mrp',
-            'selling_price',
             'cost_price',
             'gst_inclusive',
             'is_price_override',
@@ -69,8 +69,6 @@ class ProductDataTemplateSheet implements
                 'Sample Category',
                 '123456',
                 '',
-                100,
-                80,
                 50,
                 1,
                 0,
@@ -166,21 +164,9 @@ class ProductInstructionsSheet implements
                 'Check your database for the correct ID.',
             ],
             [
-                'mrp',
-                'No',
-                'Maximum retail price. Enter a non-negative number.',
-                '100',
-            ],
-            [
-                'selling_price',
-                'No',
-                'Selling price. Enter a non-negative number.',
-                '80',
-            ],
-            [
                 'cost_price',
                 'No',
-                'Purchase or cost price. Enter a non-negative number.',
+                'Purchase or cost price of the product. Enter a non-negative number.',
                 '50',
             ],
             [
@@ -194,6 +180,12 @@ class ProductInstructionsSheet implements
                 'No',
                 'Whether the product has a price override enabled.',
                 '1 = Yes, 0 = No; yes/no also accepted.',
+            ],
+            [
+                'Prices',
+                'Info',
+                'MRP and selling price are not imported here. Add them when you add stock (purchase bill or opening stock).',
+                'Only cost_price is part of this file.',
             ],
             [
                 'General rule',
