@@ -17,7 +17,7 @@ class CustomerController extends Controller
         $user = Auth::user();
         $branchIds = $this->allowedBranchIds($user);
 
-        $query = Customer::with('branch:id,name')->whereIn('branch_id', $branchIds);
+        $query = Customer::with('branch:id,name')->where('store_id', $user->store_id);
 
         if ($user->role === 'admin' && $request->filled('branch_id')) {
             abort_unless(in_array((int) $request->branch_id, $branchIds, true), 403, 'Invalid branch');
@@ -30,7 +30,7 @@ class CustomerController extends Controller
     public function show(int $id)
     {
         $customer = Customer::with('branch:id,name')
-            ->whereIn('branch_id', $this->allowedBranchIds(Auth::user()))
+            ->where('store_id', Auth::user()->store_id)
             ->find($id);
 
         if (! $customer) {
@@ -66,13 +66,14 @@ class CustomerController extends Controller
 
         DB::beginTransaction();
         try {
-            $customer = Customer::where('branch_id', $branchId)
+            $customer = Customer::where('store_id', $user->store_id)
                 ->where('mobile', $request->customer['mobile'])
                 ->lockForUpdate()
                 ->first();
 
             if (! $customer) {
                 $customer = Customer::create([
+                    'store_id' => $user->store_id,
                     'branch_id' => $branchId,
                     'name' => $request->customer['name'],
                     'mobile' => $request->customer['mobile'],
@@ -146,7 +147,7 @@ class CustomerController extends Controller
         ])->validate();
 
         try {
-            $customer = Customer::whereIn('branch_id', $this->allowedBranchIds($user))->find($id);
+            $customer = Customer::where('store_id', $user->store_id)->find($id);
 
             if (! $customer) {
                 return response()->json([
@@ -155,13 +156,13 @@ class CustomerController extends Controller
                 ], 404);
             }
 
-            $duplicate = Customer::where('branch_id', $customer->branch_id)
+            $duplicate = Customer::where('store_id', $customer->store_id)
                 ->where('mobile', $validated['mobile'])
                 ->where('id', '!=', $customer->id)
                 ->exists();
 
             if ($duplicate) {
-                return response()->json(['status' => false, 'message' => 'Mobile already exists in this branch.'], 422);
+                return response()->json(['status' => false, 'message' => 'Mobile already exists in this store.'], 422);
             }
 
             $customer->update($validated);
@@ -183,7 +184,7 @@ class CustomerController extends Controller
 
     public function walletBalance($mobile)
     {
-        $customer = Customer::whereIn('branch_id', $this->allowedBranchIds(Auth::user()))
+        $customer = Customer::where('store_id', Auth::user()->store_id)
             ->where('mobile', $mobile)
             ->first();
 
@@ -199,7 +200,8 @@ class CustomerController extends Controller
 
     public function walletHistory($id)
     {
-        $customerExists = Customer::whereIn('branch_id', $this->allowedBranchIds(Auth::user()))->whereKey($id)->exists();
+        $customerExists = Customer::where('store_id', Auth::user()->store_id)->whereKey($id)->exists();
+
         abort_unless($customerExists, 404, 'Customer not found');
 
         $transactions = CustomerWalletTransaction::where('customer_id', $id)
@@ -215,18 +217,21 @@ class CustomerController extends Controller
     public function advanceReport(Request $request)
     {
         try {
-            $deposits = CustomerAdvanceDeposit::whereHas('customer', function ($query) use ($request) {
-                $user = Auth::user();
-                $branchIds = $this->allowedBranchIds($user);
-                $query->whereIn('branch_id', $branchIds);
-                if ($user->role === 'admin' && $request->filled('branch_id')) {
-                    $query->where('branch_id', $request->branch_id);
-                }
-            })->with([
-                'customer:id,branch_id,name,mobile,opening_balance',
-                'receivedBy:id,name',
-                'branch:id,name',
-            ])
+            $user = Auth::user();
+            $branchIds = $this->allowedBranchIds($user);
+
+            $deposits = CustomerAdvanceDeposit::whereHas('customer', function ($query) use ($user) {
+                $query->where('store_id', $user->store_id);
+            })
+                ->whereIn('branch_id', $branchIds)
+                ->when($user->role === 'admin' && $request->filled('branch_id'), function ($q) use ($request) {
+                    $q->where('branch_id', $request->branch_id);
+                })
+                ->with([
+                    'customer:id,branch_id,name,mobile,opening_balance',
+                    'receivedBy:id,name',
+                    'branch:id,name',
+                ])
                 ->orderBy('created_at', 'desc')
                 ->get();
 
@@ -262,9 +267,13 @@ class CustomerController extends Controller
         return (int) $branchId;
     }
 
-    public function loyaltyBalance($mobile)
+    public function loyaltyBalance(Request $request, $mobile)
     {
-        $customer = Customer::where('mobile', $mobile)->first();
+        $storeId = $request->user()->store_id;
+
+        $customer = Customer::where('store_id', $storeId)
+            ->where('mobile', $mobile)
+            ->first();
 
         return response()->json([
             'balance' => $customer ? (float) $customer->loyalty_points : 0,

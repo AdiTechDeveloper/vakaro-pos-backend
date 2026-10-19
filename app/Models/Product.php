@@ -27,6 +27,9 @@ class Product extends Model
         'stock',
         'gst_inclusive',
         'is_price_override',
+        'sale_type',
+        'plu_code',
+        'price_per_kg',
     ];
 
     public function store()
