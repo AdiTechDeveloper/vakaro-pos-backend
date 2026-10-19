@@ -965,6 +965,7 @@ class ProductController extends Controller
                         'name' => $data['name'],
                         'sku' => $data['sku'] !== '' ? $data['sku'] : null,
                         'barcode' => $barcodeToSave,
+                        'plu_code' => null,
                         'brand_id' => $brandId,
                         'category_id' => $categoryId,
                         'hsn_code' => $data['hsn_code'] !== '' ? $data['hsn_code'] : null,
@@ -1006,6 +1007,10 @@ class ProductController extends Controller
             ]);
         } catch (\Throwable $e) {
             report($e);
+            dd(
+                get_class($e),
+                $e->getMessage()
+            );
 
             return response()->json([
                 'status' => false,
