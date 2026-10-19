@@ -10,6 +10,7 @@ use App\Http\Controllers\Api\BranchController;
 use App\Http\Controllers\Api\BrandController;
 use App\Http\Controllers\Api\CategoryController;
 use App\Http\Controllers\Api\CustomerController;
+use App\Http\Controllers\Api\DashboardInsightsController;
 use App\Http\Controllers\Api\FeatureController;
 use App\Http\Controllers\Api\FinancialReportController;
 use App\Http\Controllers\Api\GSTOutputReportController;
@@ -359,7 +360,7 @@ Route::prefix('customer-portal')->group(function () {
 
 // ai api
 Route::middleware(['auth:sanctum'])->group(function () {
-
+    Route::get('/dashboard/insights', [DashboardInsightsController::class, 'show']);
     Route::post('/ai/chat', [AIController::class, 'chat']);
     Route::get('/dashboard/money-summary', [\App\Http\Controllers\Api\DashboardMoneyController::class, 'summary']);
 });
