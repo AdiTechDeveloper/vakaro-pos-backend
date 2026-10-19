@@ -6,7 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\PosTerminal;
 use App\Models\User;
 use App\Services\FeatureService;
-use Carbon\Carbon;
+use App\Support\TokenExpiry;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
@@ -90,12 +90,11 @@ class AuthController extends Controller
             }
         }
 
-        $expiry = Carbon::now()->addHours(8);
+        $expiry = TokenExpiry::next();
 
         $abilities = $user->must_change_credentials ? ['password:change'] : ['*'];
 
-        $plainTextToken = $user->createToken('auth_token', $abilities)->plainTextToken;
-        $user->tokens()->latest()->first()->update(['expires_at' => $expiry]);
+        $plainTextToken = $user->createToken('auth_token', $abilities, $expiry)->plainTextToken;
 
         return response()->json([
             'message' => 'Login successful',

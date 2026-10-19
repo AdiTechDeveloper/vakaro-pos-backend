@@ -1,10 +1,10 @@
 <?php
 
-use App\Http\Controllers\Api\AiSalesReportDownloadController;
 use App\Http\Controllers\AIController;
 use App\Http\Controllers\Api\AiConversationController;
 use App\Http\Controllers\Api\AiInsightController;
 use App\Http\Controllers\Api\AiReportDownloadController;
+use App\Http\Controllers\Api\AiSalesReportDownloadController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\BranchController;
 use App\Http\Controllers\Api\BrandController;
@@ -32,34 +32,38 @@ use App\Http\Controllers\Api\StockExpiryController;
 use App\Http\Controllers\Api\StoreController;
 use App\Http\Controllers\Api\SupplierController;
 use App\Http\Controllers\CustomerPortalController;
+use App\Http\Controllers\ExpenseCategoryController;
+use App\Http\Controllers\ExpenseController;
 use Illuminate\Support\Facades\Route;
 
-Route::get('/staff/register-status', [App\Http\Controllers\Api\StaffController::class, 'getRegisterStatus'])
-    ->middleware('auth:sanctum');
-Route::get('/staff/shift-summary', [StaffController::class, 'getShiftSummary'])->middleware('auth:sanctum');
-Route::post('/staff/close-register', [StaffController::class, 'closeRegister'])->middleware('auth:sanctum');
-Route::post('/open-register', [StaffController::class, 'openRegister'])->middleware('auth:sanctum');
+// register / shift routes (auth + sliding token expiry)
+Route::middleware(['auth:sanctum', 'extend.token'])->group(function () {
+    Route::get('/staff/register-status', [App\Http\Controllers\Api\StaffController::class, 'getRegisterStatus']);
+    Route::get('/staff/shift-summary', [StaffController::class, 'getShiftSummary']);
+    Route::post('/staff/close-register', [StaffController::class, 'closeRegister']);
+    Route::post('/open-register', [StaffController::class, 'openRegister']);
+});
 
-Route::middleware(['auth:sanctum', 'feature:reports_shift'])->group(function () {
+Route::middleware(['auth:sanctum', 'extend.token', 'feature:reports_shift'])->group(function () {
     Route::get('/staff/shift-history', [StaffController::class, 'shiftHistory']);
 });
 
 // public route for master recovery
 Route::post('/auth/emergency-system-override', [AuthController::class, 'emergencyAdminReset']);
 
-// login route
+// login route (public - no extend.token here)
 Route::post('/login', [AuthController::class, 'login']);
 
-// store registration route
+// store registration route (public)
 Route::post('/pos-terminals/resolve', [PosTerminalController::class, 'resolve'])
     ->middleware('throttle:60,1');
 
-Route::middleware(['auth:sanctum', 'token.expiry'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token'])->group(function () {
     Route::post('/logout', [AuthController::class, 'logout']);
 });
 
 // stores routes for superadmin users
-Route::middleware(['auth:sanctum', 'token.expiry', 'check.superadmin'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'check.superadmin'])->group(function () {
     Route::post('/stores', [StoreController::class, 'store']);
     Route::get('/stores', [StoreController::class, 'index']);
     Route::put('/stores/{id}', [StoreController::class, 'update']);
@@ -70,13 +74,13 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'check.superadmin'])->group(f
 });
 
 // specific store routes for admin users
-Route::middleware(['auth:sanctum', 'token.expiry'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token'])->group(function () {
     Route::get('/stores/{id}', [StoreController::class, 'show']);
     Route::put('/stores/{id}', [StoreController::class, 'update']);
 });
 
 // branches routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'check.admin', 'feature:branch_management'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'check.admin', 'feature:branch_management'])->group(function () {
     Route::post('/branches', [BranchController::class, 'store']);
     Route::get('/branches', [BranchController::class, 'index']);
     Route::get('/branches/{id}', [BranchController::class, 'show']);
@@ -85,7 +89,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'check.a
 });
 
 // staff routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'check.admin', 'feature:staff_management'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'check.admin', 'feature:staff_management'])->group(function () {
     Route::post('/staff', [StaffController::class, 'store']);
     // Route::get('/staff', [StaffController::class, 'index']);
     Route::get('/staff/{id}', [StaffController::class, 'show']);
@@ -95,24 +99,24 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'check.a
 });
 
 // --- core / always-allowed (cashier's own register + password change) ---
-Route::middleware(['auth:sanctum'])->group(function () {
+Route::middleware(['auth:sanctum', 'extend.token'])->group(function () {
     Route::get('/staff/register-status', [StaffController::class, 'getRegisterStatus']);
     Route::post('/staff/open-register', [StaffController::class, 'openRegister']);
     Route::post('/user/change-password', [AuthController::class, 'changePassword']);
 });
 
 // staff listing + POS terminal management — back-office only, gated
-Route::middleware(['auth:sanctum', 'feature:staff_management'])->group(function () {
+Route::middleware(['auth:sanctum', 'extend.token', 'feature:staff_management'])->group(function () {
     Route::get('/staff', [StaffController::class, 'index']);
 });
-Route::middleware(['auth:sanctum', 'feature:pos_terminals'])->group(function () {
+Route::middleware(['auth:sanctum', 'extend.token', 'feature:pos_terminals'])->group(function () {
     Route::post('/pos-terminals', [PosTerminalController::class, 'register']);
     Route::get('/pos-terminals', [PosTerminalController::class, 'index']);
     Route::delete('/pos-terminals/{id}', [PosTerminalController::class, 'destroy']);
 });
 
 // manager routes — myBranches stays ungated (needed for terminal setup & POS)
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response'])->group(function () {
     Route::get('/manager/branches', [ManagerBranchController::class, 'myBranches']);
 
     // feature catalog + effective features for the logged-in user — everyone needs this
@@ -121,7 +125,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response'])->group(
 });
 
 // staff-management-gated manager/admin routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:staff_management'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:staff_management'])->group(function () {
     Route::get('/manager/branches/{branchId}/staff', [ManagerBranchController::class, 'branchStaff']);
     Route::get('/manager/staff/{staffId}', [ManagerBranchController::class, 'staffDetail']);
     Route::get('/staff/{userId}/features', [FeatureController::class, 'getManagerFeatures']);
@@ -129,7 +133,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 });
 
 // category routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response'])->group(function () {
     Route::get('/categories/parents', [CategoryController::class, 'parentCategories']);
     Route::get('/categories/{id}/subcategories', [CategoryController::class, 'subCategories']);
     Route::get('/categories/tree', [CategoryController::class, 'categoryTree']);
@@ -142,7 +146,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response'])->group(
 });
 
 // brand routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response'])->group(function () {
     Route::get('/brands', [BrandController::class, 'index']);
     Route::get('/brands/{id}', [BrandController::class, 'show']);
     Route::post('/brands', [BrandController::class, 'store']);
@@ -151,7 +155,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response'])->group(
 });
 
 // supplier routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:suppliers'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:suppliers'])->group(function () {
     Route::get('/suppliers/import-template', [SupplierController::class, 'downloadImportTemplate']);
     Route::post('/suppliers/import', [SupplierController::class, 'importExcel']);
     Route::get('/suppliers', [SupplierController::class, 'index']);
@@ -170,7 +174,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 });
 
 // GST Rate routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:gst_rates'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:gst_rates'])->group(function () {
     Route::get('/gst-rates', [GstRateController::class, 'index']);
     Route::get('/gst-rates/{id}', [GstRateController::class, 'show']);
     Route::post('/gst-rates', [GstRateController::class, 'store']);
@@ -180,7 +184,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 });
 
 // Product routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:products'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:products'])->group(function () {
     Route::post('/products/import', [ProductController::class, 'importExcel']);
     Route::get('/products/import-template', [ProductController::class, 'downloadImportTemplate']);
     Route::get('/all-products', [ProductController::class, 'getAllProducts']);
@@ -194,7 +198,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 });
 
 // Purchasebill routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:purchase_bills'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:purchase_bills'])->group(function () {
     Route::get('/purchase-bill', [PurchaseBillController::class, 'index']);
     Route::get('/purchase-bill/{id}', [PurchaseBillController::class, 'show']);
     Route::post('/purchase-bill', [PurchaseBillController::class, 'store']);
@@ -203,11 +207,11 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::delete('purchase-bill/{id}', [PurchaseBillController::class, 'destroy']);
     Route::post('/purchase-bill/scan', [
         AIController::class,
-        'scanPurchaseBill'
+        'scanPurchaseBill',
     ])->middleware('throttle:10,1');
 });
 
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_suplier'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:reports_suplier'])->group(function () {
 
     // suplier tracking
     Route::get('/supplier-tracking', [PurchaseBillController::class, 'supplierRanking']);
@@ -215,7 +219,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 });
 
 // Purchasebill return routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:purchase_returns'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:purchase_returns'])->group(function () {
     Route::get('/purchase-return', [PurchaseReturnController::class, 'index']);
     Route::get('/purchase-return/{id}', [PurchaseReturnController::class, 'show']);
 
@@ -225,7 +229,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
 });
 
 // Salesbill routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response'])->group(function () {
     Route::get('/sales-bills', [SalesBillController::class, 'index']);
     Route::get('/sales-bill/{id}', [SalesBillController::class, 'show']);
     // Product scan (used by POS)
@@ -262,12 +266,12 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response'])->group(
 });
 
 // Report routes
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_financial'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:reports_financial'])->group(function () {
     Route::get('/reports/profit-loss', [ReportController::class, 'profitLoss']);
     Route::get('/reports/financial-report', [FinancialReportController::class, 'index']);
 });
 
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_sales'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:reports_sales'])->group(function () {
     Route::get('/reports/top-selling-products', [ReportController::class, 'topSellingProducts']);
     Route::post('/reports/sales-summary', [ReportController::class, 'salesSummary']);
     Route::post('/reports/sales-analytics', [ReportController::class, 'salesAnalytics']);
@@ -280,44 +284,43 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature
     Route::post('/reports/ai-report-download', [AiReportDownloadController::class, 'download']);
 });
 
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_purchase'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:reports_purchase'])->group(function () {
     Route::post('/reports/purchase', [ReportController::class, 'purchaseSummary']);
     Route::get('/reports/purchase-report', [PurchaseReportController::class, 'index']);
 });
 
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:price_override'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:price_override'])->group(function () {
     Route::get('price-override-report', [PriceOverrideController::class, 'index']);
 });
 
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_gst'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:reports_gst'])->group(function () {
     Route::post('/reports/gst/sales-GST', [GSTOutputReportController::class, 'gstOutputReport']);
     Route::post('/reports/gst/gstr3b-Summary', [GSTOutputReportController::class, 'gstr3bSummary']);
     Route::post('/reports/gst/gstr1-Summary', [GSTOutputReportController::class, 'gstr1Summary']);
 });
 
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:stock_alerts'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:stock_alerts'])->group(function () {
     Route::get('/expired-products', [ProductController::class, 'getExpiredStock']);
     Route::get('/reports/expiry-details', [ReportController::class, 'getExpiryReport']);
     Route::get('/stock-expiry-alerts', [StockExpiryController::class, 'stockExpiryAlerts']);
     Route::get('/stock-alerts', [StockAlertController::class, 'index']);
 });
 
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:reports_stock'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:reports_stock'])->group(function () {
     Route::get('/reports/stock-summary', [ReportController::class, 'stockSummary']);
 });
 
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:advance_payments'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:advance_payments'])->group(function () {
     Route::get('/reports/advance-payments', [CustomerController::class, 'advanceReport']);
 });
 
-Route::middleware(['auth:sanctum', 'token.expiry', 'api.auth.response', 'feature:ai_insights'])->group(function () {
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:ai_insights'])->group(function () {
     Route::get('/ai-insights/branches', [AiInsightController::class, 'branches']);
     Route::get('/ai-insights', [AiInsightController::class, 'latest']);
     Route::post('/ai-insights/refresh', [AiInsightController::class, 'refresh']);
 });
 
-
-Route::middleware(['auth:sanctum'])->group(function () {
+Route::middleware(['auth:sanctum', 'extend.token'])->group(function () {
     Route::get('/ai/conversations', [
         AiConversationController::class,
         'index',
@@ -339,6 +342,13 @@ Route::middleware(['auth:sanctum'])->group(function () {
     ])->whereNumber('id');
 });
 
+// customer portal (public - own OTP flow, no sanctum token)
+Route::middleware(['auth:sanctum'])->group(function () {
+    Route::get('expenses/summary', [ExpenseController::class, 'summary']);
+    Route::apiResource('expenses', ExpenseController::class);
+    Route::apiResource('expense-categories', ExpenseCategoryController::class)->except(['show']);
+});
+
 
 Route::prefix('customer-portal')->group(function () {
     Route::post('/send-otp', [CustomerPortalController::class, 'sendOtp']);
@@ -346,19 +356,16 @@ Route::prefix('customer-portal')->group(function () {
     Route::get('/dashboard', [CustomerPortalController::class, 'dashboard']);
 });
 
-
-
-
 // ai api
-Route::middleware(['auth:sanctum'])->group(function () {
+Route::middleware(['auth:sanctum', 'extend.token'])->group(function () {
 
     Route::post('/ai/chat', [AIController::class, 'chat']);
+    Route::get('/dashboard/money-summary', [\App\Http\Controllers\Api\DashboardMoneyController::class, 'summary']);
 });
-
 
 Route::get('/test-product-template', function () {
     return \Maatwebsite\Excel\Facades\Excel::download(
-        new \App\Exports\ProductTemplateExport(),
+        new \App\Exports\ProductTemplateExport,
         'product-import-template.xlsx'
     );
-})->middleware('auth:sanctum');
+})->middleware(['auth:sanctum', 'extend.token']);

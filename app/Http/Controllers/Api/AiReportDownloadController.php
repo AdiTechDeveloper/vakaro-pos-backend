@@ -24,7 +24,7 @@ class AiReportDownloadController extends Controller
         $validated = $request->validate([
             'report_type' => [
                 'required',
-                'in:inventory,low_stock,out_of_stock,supplier_dues,top_selling,purchase_suggestions,product_profit,branch_comparison,purchase_report',
+                'in:inventory,low_stock,out_of_stock,supplier_dues,top_selling,purchase_suggestions,product_profit,branch_comparison,purchase_report,purchase_detail_report,customer_analysis,customer_wallet',
             ],
             'format' => ['required', 'in:pdf,excel'],
             'date_from' => ['required', 'date_format:Y-m-d'],
@@ -34,6 +34,7 @@ class AiReportDownloadController extends Controller
             'options.threshold' => ['nullable', 'integer', 'min:0', 'max:100000'],
             'options.limit' => ['nullable', 'integer', 'min:1', 'max:100'],
             'options.cover_days' => ['nullable', 'integer', 'min:1', 'max:30'],
+
         ]);
 
         $user = $request->user();
@@ -86,6 +87,19 @@ class AiReportDownloadController extends Controller
                 $validated['date_from'],
                 $validated['date_to']
             ),
+            'purchase_detail_report' => $this->purchaseDetailReport(
+                $user,
+                $branchId,
+                $validated['date_from'],
+                $validated['date_to']
+            ),
+            'customer_analysis' => $this->customerAnalysisReport(
+                $user,
+                $branchId,
+                $validated['date_from'],
+                $validated['date_to']
+            ),
+            'customer_wallet' => $this->customerWalletReport($user, $branchId),
         };
 
         if (isset($report['error'])) {
@@ -141,7 +155,7 @@ class AiReportDownloadController extends Controller
             ->limit(5000)
             ->get();
 
-        $rows = $data->map(fn ($r) => [
+        $rows = $data->map(fn($r) => [
             $r->product_name,
             $r->sku,
             (float) $r->total_qty,
@@ -190,7 +204,7 @@ class AiReportDownloadController extends Controller
 
         $data = $query->orderBy('available_qty')->limit(2000)->get();
 
-        $rows = $data->map(fn ($r) => [
+        $rows = $data->map(fn($r) => [
             $r->branch_name,
             $r->product_name,
             (float) $r->available_qty,
@@ -270,7 +284,7 @@ class AiReportDownloadController extends Controller
         string $from,
         string $to,
         int $limit
-    ): array {
+     ): array {
         $limit = max(1, min($limit, 100));
 
         $filters = $salesReportService->resolveFilters([
@@ -288,7 +302,7 @@ class AiReportDownloadController extends Controller
             ->sortByDesc('qty_sold')
             ->take($limit)
             ->values()
-            ->map(fn ($p, $i) => [
+            ->map(fn($p, $i) => [
                 $i + 1,
                 $p->product_name,
                 (float) $p->qty_sold,
@@ -310,7 +324,7 @@ class AiReportDownloadController extends Controller
         $user,
         ?int $branchId,
         int $coverDays
-    ): array {
+     ): array {
         if (!$branchId) {
             return ['error' => 'Purchase suggestions report ke liye ek branch select karein.'];
         }
@@ -353,10 +367,10 @@ class AiReportDownloadController extends Controller
                 'reorder' => $reorder,
             ];
         })
-            ->filter(fn ($r) => $r['reorder'] > 0)
+            ->filter(fn($r) => $r['reorder'] > 0)
             ->sortByDesc('reorder')
             ->values()
-            ->map(fn ($r) => [$r['name'], $r['sold'], $r['available'], $r['daily'], $r['reorder']])
+            ->map(fn($r) => [$r['name'], $r['sold'], $r['available'], $r['daily'], $r['reorder']])
             ->all();
 
         return [
@@ -375,7 +389,7 @@ class AiReportDownloadController extends Controller
         ?int $branchId,
         string $from,
         string $to
-    ): array {
+     ): array {
         $filters = $salesReportService->resolveFilters([
             'date_range' => 'custom',
             'date_from' => $from,
@@ -419,7 +433,7 @@ class AiReportDownloadController extends Controller
         $user,
         string $from,
         string $to
-    ): array {
+     ): array {
         if ($user->role !== 'admin') {
             return ['error' => 'Branch comparison report sirf admin download kar sakta hai.'];
         }
@@ -495,11 +509,11 @@ class AiReportDownloadController extends Controller
         $paidByBill = $billRows->isEmpty()
             ? collect()
             : DB::table('purchase_payments')
-                ->whereIn('purchase_bill_id', $billRows->pluck('id'))
-                ->where('status', 'success')
-                ->selectRaw('purchase_bill_id, SUM(amount) as paid')
-                ->groupBy('purchase_bill_id')
-                ->pluck('paid', 'purchase_bill_id');
+            ->whereIn('purchase_bill_id', $billRows->pluck('id'))
+            ->where('status', 'success')
+            ->selectRaw('purchase_bill_id, SUM(amount) as paid')
+            ->groupBy('purchase_bill_id')
+            ->pluck('paid', 'purchase_bill_id');
 
         $total = 0.0;
         $paidTotal = 0.0;
@@ -530,6 +544,93 @@ class AiReportDownloadController extends Controller
                 'Total purchase' => round($total, 2),
                 'Total paid' => round($paidTotal, 2),
                 'Total due' => round(max(0, $total - $paidTotal), 2),
+            ],
+        ];
+    }
+
+    /**
+     * Detailed (line-by-line / product-wise) purchase report.
+     * Reads purchase_lines joined with purchase_bills. GST % is derived from the
+     * tax actually stored on each line: (cgst + sgst + igst) / taxable_value.
+     */
+    private function purchaseDetailReport($user, ?int $branchId, string $from, string $to): array
+    {
+        $query = DB::table('purchase_lines as pl')
+            ->join('purchase_bills as pb', 'pb.id', '=', 'pl.purchase_bill_id')
+            ->leftJoin('suppliers as s', 's.id', '=', 'pb.supplier_id')
+            ->leftJoin('products as p', 'p.id', '=', 'pl.product_id')
+            ->where('pb.store_id', $user->store_id)
+            ->whereNull('pb.deleted_at')
+            ->whereBetween('pb.bill_date', [$from, $to]);
+
+        if ($branchId !== null) {
+            $query->where('pb.branch_id', $branchId);
+        }
+
+        $data = $query
+            ->orderBy('pb.bill_date')
+            ->orderBy('pb.id')
+            ->orderBy('pl.id')
+            ->limit(5000)
+            ->get([
+                'pb.bill_no',
+                'pb.bill_date',
+                's.name as supplier_name',
+                'p.name as product_name',
+                'pl.hsn_code',
+                'pl.batch_no',
+                'pl.expiry_date',
+                'pl.qty',
+                'pl.free_qty',
+                'pl.purchase_rate',
+                'pl.taxable_value',
+                'pl.cgst',
+                'pl.sgst',
+                'pl.igst',
+            ]);
+
+        $totalTaxable = 0.0;
+        $totalTax = 0.0;
+        $totalQty = 0.0;
+
+        $rows = $data->map(function ($r) use (&$totalTaxable, &$totalTax, &$totalQty) {
+            $taxable = (float) $r->taxable_value;
+            $tax = (float) $r->cgst + (float) $r->sgst + (float) $r->igst;
+            $gstPct = $taxable > 0 ? round(($tax / $taxable) * 100, 2) : 0;
+
+            $totalTaxable += $taxable;
+            $totalTax += $tax;
+            $totalQty += (float) $r->qty;
+
+            return [
+                $r->bill_no,
+                $r->bill_date,
+                $r->supplier_name ?? 'N/A',
+                $r->product_name ?? 'N/A',
+                $r->hsn_code ?? '',
+                $r->batch_no ?? '',
+                $r->expiry_date ?? '',
+                (float) $r->qty,
+                (float) $r->free_qty,
+                round((float) $r->purchase_rate, 2),
+                round($taxable, 2),
+                $gstPct,
+                round($tax, 2),
+                round($taxable + $tax, 2),
+            ];
+        })->all();
+
+        return [
+            'title' => 'Detailed Purchase Report (Product-wise)',
+            'subtitle' => "{$from} to {$to} | " . $this->branchLabel($user, $branchId),
+            'headings' => ['Bill No', 'Date', 'Supplier', 'Product', 'HSN', 'Batch', 'Expiry', 'Qty', 'Free Qty', 'Rate', 'Taxable', 'GST %', 'GST Amt', 'Line Total'],
+            'rows' => $rows,
+            'summary' => [
+                'Total lines' => count($rows),
+                'Total qty' => round($totalQty, 2),
+                'Total taxable' => round($totalTaxable, 2),
+                'Total GST' => round($totalTax, 2),
+                'Total amount' => round($totalTaxable + $totalTax, 2),
             ],
         ];
     }
@@ -575,7 +676,106 @@ class AiReportDownloadController extends Controller
 
         return $requestedBranchId;
     }
+private function customerAnalysisReport($user, ?int $branchId, string $from, string $to): array
+{
+    $query = DB::table('sales_bills as sb')
+        ->join('customers as c', 'c.id', '=', 'sb.customer_id')
+        ->where('sb.store_id', $user->store_id)
+        ->whereNotNull('sb.customer_id')
+        ->whereBetween('sb.created_at', [
+            Carbon::parse($from)->startOfDay(),
+            Carbon::parse($to)->endOfDay(),
+        ]);
 
+    if ($branchId !== null) {
+        $query->where('sb.branch_id', $branchId);
+    }
+
+    $data = $query
+        ->groupBy('c.id', 'c.name', 'c.mobile')
+        ->selectRaw('c.name, c.mobile, COUNT(sb.id) as visits, SUM(sb.total_amount) as spent, MAX(sb.created_at) as last_visit')
+        ->orderByDesc('spent')
+        ->limit(5000)
+        ->get();
+
+    $rows = $data->map(fn ($r) => [
+        $r->name,
+        $r->mobile ?? '',
+        (int) $r->visits,
+        round((float) $r->spent, 2),
+        round((float) $r->spent / max(1, (int) $r->visits), 2),
+        Carbon::parse($r->last_visit)->format('Y-m-d'),
+        $r->visits > 1 ? 'Repeat' : 'One-time',
+    ])->all();
+
+    // customers table has no store_id, so scope through branches.store_id.
+    $scope = DB::table('customers as c')
+        ->join('branches as b', 'b.id', '=', 'c.branch_id')
+        ->where('b.store_id', $user->store_id);
+
+    if ($branchId !== null) {
+        $scope->where('c.branch_id', $branchId);
+    }
+
+    $newCustomers = (clone $scope)
+        ->whereBetween('c.created_at', [Carbon::parse($from)->startOfDay(), Carbon::parse($to)->endOfDay()])
+        ->count();
+
+    return [
+        'title' => 'Customer Analysis Report',
+        'subtitle' => "{$from} to {$to} | " . $this->branchLabel($user, $branchId),
+        'headings' => ['Customer', 'Mobile', 'Visits', 'Total Spent', 'Avg Bill', 'Last Visit', 'Type'],
+        'rows' => $rows,
+        'summary' => [
+            'Active customers' => count($rows),
+            'Repeat customers' => $data->where('visits', '>', 1)->count(),
+            'New customers' => $newCustomers,
+            'Total customers' => (clone $scope)->count(),
+            'Total spent' => round((float) $data->sum('spent'), 2),
+        ],
+    ];
+}
+
+private function customerWalletReport($user, ?int $branchId): array
+{
+    $query = DB::table('customer_wallet_transactions as t')
+        ->join('customers as c', 'c.id', '=', 't.customer_id')
+        ->join('branches as b', 'b.id', '=', 'c.branch_id')
+        ->where('b.store_id', $user->store_id);
+
+    if ($branchId !== null) {
+        $query->where('c.branch_id', $branchId);
+    }
+
+    $data = $query
+        ->groupBy('c.id', 'c.name', 'c.mobile')
+        ->selectRaw("c.name, c.mobile,
+            SUM(CASE WHEN t.type = 'credit' THEN t.amount ELSE 0 END) as credits,
+            SUM(CASE WHEN t.type = 'debit' THEN t.amount ELSE 0 END) as debits")
+        ->havingRaw('SUM(CASE WHEN t.type = \'credit\' THEN t.amount ELSE -t.amount END) > 0')
+        ->orderByRaw("SUM(CASE WHEN t.type = 'credit' THEN t.amount ELSE -t.amount END) DESC")
+        ->limit(5000)
+        ->get();
+
+    $rows = $data->map(fn ($r) => [
+        $r->name,
+        $r->mobile ?? '',
+        round((float) $r->credits, 2),
+        round((float) $r->debits, 2),
+        round((float) $r->credits - (float) $r->debits, 2),
+    ])->all();
+
+    return [
+        'title' => 'Customer Wallet Balance Report',
+        'subtitle' => $this->branchLabel($user, $branchId),
+        'headings' => ['Customer', 'Mobile', 'Total Credit', 'Total Debit', 'Balance'],
+        'rows' => $rows,
+        'summary' => [
+            'Customers with balance' => count($rows),
+            'Total wallet balance' => round((float) $data->sum('credits') - (float) $data->sum('debits'), 2),
+        ],
+    ];
+}
     private function assertBranchBelongsToStore($user, int $branchId): void
     {
         $exists = DB::table('branches')
