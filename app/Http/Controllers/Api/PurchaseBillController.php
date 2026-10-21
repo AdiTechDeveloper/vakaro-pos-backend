@@ -175,14 +175,15 @@ class PurchaseBillController extends Controller
         $user = Auth::user();
         $storeId = $user->store_id;
 
-        $lastBill = PurchaseBill::where('store_id', $storeId)
+        $lastBill = PurchaseBill::withTrashed()
+            ->where('store_id', $storeId)
             ->where('branch_id', $branchId)
             ->orderBy('id', 'desc')
             ->first();
 
         $sequence = 1;
         if ($lastBill && $lastBill->inward_sequence) {
-            $sequence = $lastBill->inward_sequence + 1;
+            $sequence = (int) $lastBill->inward_sequence + 1;
         }
 
         $financialYear = '2627';
