@@ -10,6 +10,7 @@ use App\Http\Controllers\Api\BranchController;
 use App\Http\Controllers\Api\BrandController;
 use App\Http\Controllers\Api\CategoryController;
 use App\Http\Controllers\Api\CustomerController;
+use App\Http\Controllers\Api\DashboardInsightsController;
 use App\Http\Controllers\Api\FeatureController;
 use App\Http\Controllers\Api\FinancialReportController;
 use App\Http\Controllers\Api\GSTOutputReportController;
@@ -277,11 +278,11 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
     Route::post('/reports/sales-analytics', [ReportController::class, 'salesAnalytics']);
     Route::get('/reports/sales-report', [SalesReportController::class, 'index']);
     Route::get('/reports/monthly-sales', [SalesReportController::class, 'monthlySales']);
-    Route::post(
-        '/reports/ai-sales-download',
-        [AiSalesReportDownloadController::class, 'download']
-    );
+    Route::post('/reports/ai-sales-download', [AiSalesReportDownloadController::class, 'download']);
     Route::post('/reports/ai-report-download', [AiReportDownloadController::class, 'download']);
+ 
+    // NEW
+    Route::get('/dashboard/sales-report', [DashboardInsightsController::class, 'salesReport']);
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:reports_purchase'])->group(function () {
@@ -357,10 +358,24 @@ Route::prefix('customer-portal')->group(function () {
 });
 
 // ai api
+Route::middleware(['auth:sanctum'])->group(function () {
+
+    Route::get(
+        '/dashboard/insights',
+        [DashboardInsightsController::class, 'show']
+    );
+
+});
+
 Route::middleware(['auth:sanctum', 'extend.token'])->group(function () {
 
     Route::post('/ai/chat', [AIController::class, 'chat']);
-    Route::get('/dashboard/money-summary', [\App\Http\Controllers\Api\DashboardMoneyController::class, 'summary']);
+
+    Route::get(
+        '/dashboard/money-summary',
+        [\App\Http\Controllers\Api\DashboardMoneyController::class, 'summary']
+    );
+
 });
 
 Route::get('/test-product-template', function () {
