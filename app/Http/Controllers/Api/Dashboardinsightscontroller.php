@@ -13,10 +13,6 @@ use Maatwebsite\Excel\Facades\Excel;
 
 /**
  * GET /api/dashboard/insights?range=today|week|month&branch_id=
- *
- * Table / column naam alag hon to bhi chalega: har jagah candidates me se jo
- * pehla column milta hai wo use hota hai. Koi section fail ho to wo null
- * jaata hai (log me error aata hai) aur baaki dashboard chalta rehta hai.
  */
 class DashboardInsightsController extends Controller
 {
