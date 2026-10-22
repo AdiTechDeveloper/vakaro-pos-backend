@@ -913,7 +913,29 @@ class ProductController extends Controller
                     'cost_price' => 'nullable|numeric|min:0',
                     'gst_inclusive' => 'nullable|in:0,1',
                     'is_price_override' => 'nullable|in:0,1',
+
+                    'sale_type' => 'required|in:unit,weight',
+                    'plu_code' => 'nullable|string|max:10',
+                    'price_per_kg' => 'nullable|numeric|gt:0',
+
                 ]);
+
+                if ($data['sale_type'] === 'weight') {
+                    $extraValidator = Validator::make($data, [
+                        'plu_code' => 'required|string|max:10',
+                        'price_per_kg' => 'required|numeric|gt:0',
+                    ]);
+
+                    if ($extraValidator->fails()) {
+                        $errors[] = [
+                            'row' => $rowNumber,
+                            'name' => $data['name'] ?: null,
+                            'errors' => $extraValidator->errors()->all(),
+                        ];
+
+                        continue;
+                    }
+                }
 
                 if ($validator->fails()) {
                     $errors[] = [
@@ -983,6 +1005,13 @@ class ProductController extends Controller
                         'gst_inclusive' => $data['gst_inclusive'] ?? 0,
                         'is_price_override' => $data['is_price_override'] ?? 0,
                         'created_by' => $user->id,
+                        'sale_type' => $data['sale_type'],
+                        'plu_code' => $data['plu_code'] !== ''
+                            ? $data['plu_code']
+                            : null,
+                        'price_per_kg' => $data['sale_type'] === 'weight'
+                            ? $data['price_per_kg']
+                            : null,
                     ];
 
                     if ($hasCostPrice) {
@@ -1036,6 +1065,7 @@ class ProductController extends Controller
      * Excel gives numbers as int/float (barcode 8901234567890 -> float), which would
      * fail the "string" validation rules. Convert every cell to clean text / numbers first.
      */
+
     private function normalizeImportRow(array $raw): array
     {
         return [
@@ -1049,8 +1079,15 @@ class ProductController extends Controller
             'cost_price' => $this->importNumber($raw['cost_price'] ?? null),
             'gst_inclusive' => $this->importFlag($raw['gst_inclusive'] ?? null),
             'is_price_override' => $this->importFlag($raw['is_price_override'] ?? null),
+
+            'sale_type' => strtolower(
+                $this->importText($raw['sale_type'] ?? 'unit')
+            ),
+            'plu_code' => $this->importText($raw['plu_code'] ?? null),
+            'price_per_kg' => $this->importNumber($raw['price_per_kg'] ?? null),
         ];
     }
+
     /**
      * Excel gives numbers as int/float (barcode 8901234567890 -> float), which would
      * fail the "string" validation rules. Convert every cell to clean text / numbers first.

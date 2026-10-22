@@ -91,203 +91,203 @@ class DashboardInsightsController extends Controller
      *   &series=1d|1w|1m|1y              (from/to na ho to ye use hoga)
      *   &branch_id=
      */
-   
-public function salesReport(Request $request)
-{
-    $user = $request->user();
 
-    abort_unless(
-        $user && in_array($user->role, ['admin', 'manager'], true),
-        403,
-        'Not authorized.'
-    );
+    public function salesReport(Request $request)
+    {
+        $user = $request->user();
 
-    $storeId = (int) $user->store_id;
+        abort_unless(
+            $user && in_array($user->role, ['admin', 'manager'], true),
+            403,
+            'Not authorized.'
+        );
 
-    $branchId = $this->resolveBranch(
-        $user,
-        (int) $request->input('branch_id', 0)
-    );
+        $storeId = (int) $user->store_id;
 
-    $format = in_array(
-        $request->input('format'),
-        ['pdf', 'xlsx', 'csv'],
-        true
-    )
-        ? $request->input('format')
-        : 'xlsx';
+        $branchId = $this->resolveBranch(
+            $user,
+            (int) $request->input('branch_id', 0)
+        );
 
-    [$from, $to, $periodText] = $this->reportPeriod($request);
-
-    $days = $from->diffInDays($to) + 1;
-
-    $prevTo = $from->copy()->subDay();
-    $prevFrom = $prevTo->copy()->subDays($days - 1);
-
-    $totalColumn = $this->billTotalCol();
-
-    // Current period summary
-    $currentSummary = $this->bills(
-        $storeId,
-        $branchId,
-        $from,
-        $to
-    )
-        ->selectRaw(
-            "COALESCE(SUM(sb.$totalColumn), 0) as total, COUNT(*) as bills"
+        $format = in_array(
+            $request->input('format'),
+            ['pdf', 'xlsx', 'csv'],
+            true
         )
-        ->first();
+            ? $request->input('format')
+            : 'xlsx';
 
-    $previousTotal = (float) $this->bills(
-        $storeId,
-        $branchId,
-        $prevFrom,
-        $prevTo
-    )->sum("sb.$totalColumn");
+        [$from, $to, $periodText] = $this->reportPeriod($request);
 
-    $totalSales = (float) ($currentSummary->total ?? 0);
-    $totalBills = (int) ($currentSummary->bills ?? 0);
+        $days = $from->diffInDays($to) + 1;
 
-    $change = $previousTotal > 0
-        ? round(
-            (($totalSales - $previousTotal) / $previousTotal) * 100,
-            1
-        ) . '%'
-        : 'n/a';
+        $prevTo = $from->copy()->subDay();
+        $prevFrom = $prevTo->copy()->subDays($days - 1);
 
-    // Payments and expenses
-    $payments = $this->safe(
-        fn () => $this->payments(
+        $totalColumn = $this->billTotalCol();
+
+        // Current period summary
+        $currentSummary = $this->bills(
             $storeId,
             $branchId,
             $from,
             $to
         )
-    ) ?? [
-        'cash' => 0,
-        'online' => 0,
-    ];
+            ->selectRaw(
+                "COALESCE(SUM(sb.$totalColumn), 0) as total, COUNT(*) as bills"
+            )
+            ->first();
 
-    $expenses = $this->safe(
-        fn () => $this->expenses(
+        $previousTotal = (float) $this->bills(
             $storeId,
             $branchId,
-            $from,
-            $to
-        )
-    );
+            $prevFrom,
+            $prevTo
+        )->sum("sb.$totalColumn");
 
-    // Branch name
-    $branchName = $branchId
-        ? (
-            DB::table('branches')
+        $totalSales = (float) ($currentSummary->total ?? 0);
+        $totalBills = (int) ($currentSummary->bills ?? 0);
+
+        $change = $previousTotal > 0
+            ? round(
+                (($totalSales - $previousTotal) / $previousTotal) * 100,
+                1
+            ) . '%'
+            : 'n/a';
+
+        // Payments and expenses
+        $payments = $this->safe(
+            fn() => $this->payments(
+                $storeId,
+                $branchId,
+                $from,
+                $to
+            )
+        ) ?? [
+            'cash' => 0,
+            'online' => 0,
+        ];
+
+        $expenses = $this->safe(
+            fn() => $this->expenses(
+                $storeId,
+                $branchId,
+                $from,
+                $to
+            )
+        );
+
+        // Branch name
+        $branchName = $branchId
+            ? (
+                DB::table('branches')
                 ->where('id', $branchId)
                 ->value('name') ?? ''
-        )
-        : 'All branches';
+            )
+            : 'All branches';
 
-    // Summary rows: [label, value, type]
-    $summary = [
-        ['Period', $periodText, 'text'],
-        ['From', $from->format('d M Y'), 'text'],
-        ['To', $to->format('d M Y'), 'text'],
-        ['Branch', $branchName, 'text'],
-        ['Total sales (INR)', $totalSales, 'money'],
-        ['Bills', $totalBills, 'int'],
-        [
-            'Average bill (INR)',
-            $totalBills
-                ? round($totalSales / $totalBills, 2)
-                : 0,
-            'money',
-        ],
-        ['Previous period sales (INR)', $previousTotal, 'money'],
-        ['Change vs previous period', $change, 'text'],
-        ['Collected in cash (INR)', $payments['cash'] ?? 0, 'money'],
-        [
-            'Collected via UPI / bank (INR)',
-            $payments['online'] ?? 0,
-            'money',
-        ],
-        ['Expenses (INR)', $expenses['total'] ?? 0, 'money'],
-        ['Generated on', now()->format('d M Y, h:i A'), 'text'],
-    ];
+        // Summary rows: [label, value, type]
+        $summary = [
+            ['Period', $periodText, 'text'],
+            ['From', $from->format('d M Y'), 'text'],
+            ['To', $to->format('d M Y'), 'text'],
+            ['Branch', $branchName, 'text'],
+            ['Total sales (INR)', $totalSales, 'money'],
+            ['Bills', $totalBills, 'int'],
+            [
+                'Average bill (INR)',
+                $totalBills
+                    ? round($totalSales / $totalBills, 2)
+                    : 0,
+                'money',
+            ],
+            ['Previous period sales (INR)', $previousTotal, 'money'],
+            ['Change vs previous period', $change, 'text'],
+            ['Collected in cash (INR)', $payments['cash'] ?? 0, 'money'],
+            [
+                'Collected via UPI / bank (INR)',
+                $payments['online'] ?? 0,
+                'money',
+            ],
+            ['Expenses (INR)', $expenses['total'] ?? 0, 'money'],
+            ['Generated on', now()->format('d M Y, h:i A'), 'text'],
+        ];
 
-    // Sales breakdown
-    $breakdown = $this->reportBreakdown(
-        $storeId,
-        $branchId,
-        $from,
-        $to,
-        $days
-    );
-
-    // PDF: maximum 500 bills; Excel/CSV: maximum 20,000
-    $limit = $format === 'pdf' ? 500 : 20000;
-
-    $reportData = $this->reportBills(
-        $storeId,
-        $branchId,
-        $from,
-        $to,
-        $limit
-    );
-
-    $billRows = $reportData['rows'] ?? [];
-    $billCount = (int) ($reportData['count'] ?? 0);
-
-    // Ensure the view always receives a list of bill rows.
-    if ($billRows instanceof \Illuminate\Support\Collection) {
-        $billRows = $billRows->values()->all();
-    } elseif ($billRows instanceof \Traversable) {
-        $billRows = iterator_to_array($billRows);
-    } elseif (! is_array($billRows)) {
-        $billRows = [];
-    }
-
-    $stamp = $from->format('Ymd') . '-' . $to->format('Ymd');
-
-    // PDF export
-    if ($format === 'pdf') {
-        $pdf = Pdf::loadView('reports.dashboard-sales', [
-            'periodText' => $periodText,
-            'branchName' => $branchName,
-            'summary' => $summary,
-            'breakdown' => $breakdown,
-
-            // Use a distinct name to avoid collision with other "bills" variables.
-            'billRows' => $billRows,
-            'billCount' => $billCount,
-
-            'generatedAt' => now()->format('d M Y, h:i A'),
-            'fmt' => fn ($value) => '₹' . number_format(
-                (float) $value,
-                2
-            ),
-        ])->setPaper('a4', 'landscape');
-
-        return $pdf->download("sales-report-$stamp.pdf");
-    }
-
-    // Excel / CSV export
-    $export = new DashboardSalesReportExport(
-        $summary,
-        $breakdown,
-        $billRows,
-        $format === 'csv'
-    );
-
-    return $format === 'csv'
-        ? Excel::download(
-            $export,
-            "sales-report-$stamp.csv",
-            \Maatwebsite\Excel\Excel::CSV
-        )
-        : Excel::download(
-            $export,
-            "sales-report-$stamp.xlsx"
+        // Sales breakdown
+        $breakdown = $this->reportBreakdown(
+            $storeId,
+            $branchId,
+            $from,
+            $to,
+            $days
         );
-}
+
+        // PDF: maximum 500 bills; Excel/CSV: maximum 20,000
+        $limit = $format === 'pdf' ? 500 : 20000;
+
+        $reportData = $this->reportBills(
+            $storeId,
+            $branchId,
+            $from,
+            $to,
+            $limit
+        );
+
+        $billRows = $reportData['rows'] ?? [];
+        $billCount = (int) ($reportData['count'] ?? 0);
+
+        // Ensure the view always receives a list of bill rows.
+        if ($billRows instanceof \Illuminate\Support\Collection) {
+            $billRows = $billRows->values()->all();
+        } elseif ($billRows instanceof \Traversable) {
+            $billRows = iterator_to_array($billRows);
+        } elseif (! is_array($billRows)) {
+            $billRows = [];
+        }
+
+        $stamp = $from->format('Ymd') . '-' . $to->format('Ymd');
+
+        // PDF export
+        if ($format === 'pdf') {
+            $pdf = Pdf::loadView('reports.dashboard-sales', [
+                'periodText' => $periodText,
+                'branchName' => $branchName,
+                'summary' => $summary,
+                'breakdown' => $breakdown,
+
+                // Use a distinct name to avoid collision with other "bills" variables.
+                'billRows' => $billRows,
+                'billCount' => $billCount,
+
+                'generatedAt' => now()->format('d M Y, h:i A'),
+                'fmt' => fn($value) => '₹' . number_format(
+                    (float) $value,
+                    2
+                ),
+            ])->setPaper('a4', 'landscape');
+
+            return $pdf->download("sales-report-$stamp.pdf");
+        }
+
+        // Excel / CSV export
+        $export = new DashboardSalesReportExport(
+            $summary,
+            $breakdown,
+            $billRows,
+            $format === 'csv'
+        );
+
+        return $format === 'csv'
+            ? Excel::download(
+                $export,
+                "sales-report-$stamp.csv",
+                \Maatwebsite\Excel\Excel::CSV
+            )
+            : Excel::download(
+                $export,
+                "sales-report-$stamp.xlsx"
+            );
+    }
 
     /** Custom from/to ya series se period nikalta hai */
     private function reportPeriod(Request $request): array
@@ -654,27 +654,53 @@ public function salesReport(Request $request)
         }
 
         return [
-            'table' => $table,
-            'qty' => $qty,
+            'table'   => $table,
+            'qty'     => $qty,
+            'sold'    => in_array($qty, ['available_qty', 'current_stock'], true)
+                ? null
+                : $this->col($table, ['sold_qty', 'sold']),
             'product' => $product,
-            'branch' => $this->col($table, ['branch_id']),
-            'expiry' => $this->col($table, ['expiry_date', 'expiry', 'exp_date']),
+            'branch'  => $this->col($table, ['branch_id']),
+            'expiry'  => $this->col($table, ['expiry_date', 'expiry', 'exp_date']),
         ];
     }
 
-    /** [product_id => total qty] */
-    private function stockByProduct(array $m, ?int $branchId)
+    private function availExpr(array $m): string
     {
-        $q = DB::table($m['table'])
-            ->selectRaw("{$m['product']} as pid, SUM({$m['qty']}) as qty")
-            ->groupBy($m['product']);
+        return $m['sold']
+            ? "(s.{$m['qty']} - COALESCE(s.{$m['sold']}, 0))"
+            : "s.{$m['qty']}";
+    }
+
+    private function scopeStore($q, array $m, int $storeId): void
+    {
+        if ($m['branch']) {
+            $q->join('branches as sbr', 'sbr.id', '=', "s.{$m['branch']}")
+                ->where('sbr.store_id', $storeId);
+        } elseif (Schema::hasColumn($m['table'], 'store_id')) {
+            $q->where('s.store_id', $storeId);
+        } else {
+            $q->join('products as sp', 'sp.id', '=', "s.{$m['product']}")
+                ->where('sp.store_id', $storeId);
+        }
+    }
+
+    /** [product_id => available qty] */
+    private function stockByProduct(array $m, ?int $branchId, int $storeId)
+    {
+        $q = DB::table("{$m['table']} as s")
+            ->selectRaw("s.{$m['product']} as pid, SUM(" . $this->availExpr($m) . ") as qty")
+            ->groupBy("s.{$m['product']}");
+
+        $this->scopeStore($q, $m, $storeId);
 
         if ($branchId && $m['branch']) {
-            $q->where($m['branch'], $branchId);
+            $q->where("s.{$m['branch']}", $branchId);
         }
 
         return $q->pluck('qty', 'pid');
     }
+
 
     /* ------------------------------------------------------------ */
     /*  Sections                                                     */
@@ -966,7 +992,7 @@ public function salesReport(Request $request)
             return null;
         }
 
-        $stock = $this->stockByProduct($sm, $branchId);
+        $stock = $this->stockByProduct($sm, $branchId, $storeId);
         $limit = self::LOW_STOCK_LIMIT;
 
         $out = $stock->filter(fn($q) => (float) $q <= 0)->count();
@@ -1023,14 +1049,15 @@ public function salesReport(Request $request)
             ->pluck("i.{$im['product']}")
             ->all();
 
-        $stock = $this->stockByProduct($sm, $branchId)
-            ->filter(fn($q, $pid) => (float) $q > 0 && ! in_array($pid, $soldIds, false));
+       $stock = $this->stockByProduct($sm, $branchId, $storeId)
+    ->filter(fn($q, $pid) => (float) $q > 0 && ! in_array($pid, $soldIds, false));
 
         if ($stock->isEmpty()) {
             return ['count' => 0, 'value' => 0, 'items' => []];
         }
 
         $products = DB::table('products')
+            ->where('store_id', $storeId)
             ->whereIn('id', $stock->keys()->all())
             ->get(['id', 'name', 'cost_price'])
             ->keyBy('id');
@@ -1058,17 +1085,24 @@ public function salesReport(Request $request)
             return null;
         }
 
-        $base = DB::table($sm['table'])->where($sm['qty'], '>', 0)->whereNotNull($sm['expiry']);
+        $e = "s.{$sm['expiry']}";
+
+        $base = DB::table("{$sm['table']} as s")
+            ->whereRaw($this->availExpr($sm) . ' > 0')
+            ->whereNotNull($e);
+
+        $this->scopeStore($base, $sm, $storeId);
+
         if ($branchId && $sm['branch']) {
-            $base->where($sm['branch'], $branchId);
+            $base->where("s.{$sm['branch']}", $branchId);
         }
 
         $today = Carbon::today()->toDateString();
-        $soon = Carbon::today()->addDays(30)->toDateString();
+        $soon  = Carbon::today()->addDays(30)->toDateString();
 
         return [
-            'expired' => (clone $base)->whereDate($sm['expiry'], '<', $today)->count(),
-            'soon' => (clone $base)->whereDate($sm['expiry'], '>=', $today)->whereDate($sm['expiry'], '<=', $soon)->count(),
+            'expired' => (clone $base)->whereDate($e, '<', $today)->count(),
+            'soon'    => (clone $base)->whereDate($e, '>=', $today)->whereDate($e, '<=', $soon)->count(),
         ];
     }
 

@@ -14,8 +14,6 @@ class ProductTemplateExport implements WithMultipleSheets
 {
     public function sheets(): array
     {
-        // Keep Products as the first sheet because the importer
-        // currently reads the first worksheet.
         return [
             new ProductDataTemplateSheet(),
             new ProductInstructionsSheet(),
@@ -25,10 +23,6 @@ class ProductTemplateExport implements WithMultipleSheets
 
 /**
  * Sheet 1: Products
- *
- * Keep these headings compatible with ProductRowsImport.
- * MRP and selling price are not part of a product: they are saved with the
- * stock (purchase or opening stock). Only cost_price is imported here.
  */
 class ProductDataTemplateSheet implements
     FromArray,
@@ -55,6 +49,9 @@ class ProductDataTemplateSheet implements
             'cost_price',
             'gst_inclusive',
             'is_price_override',
+            'sale_type',
+            'plu_code',
+            'price_per_kg',
         ];
     }
 
@@ -72,6 +69,24 @@ class ProductDataTemplateSheet implements
                 50,
                 1,
                 0,
+                'unit',
+                '',
+                '',
+            ],
+            [
+                'SAMPLE - DELETE THIS ROW',
+                'SAMPLE-RICE-001',
+                '',
+                'Sample Brand',
+                'Grains',
+                '100630',
+                '',
+                45,
+                0,
+                0,
+                'weight',
+                'RICE01',
+                70,
             ],
         ];
     }
@@ -82,14 +97,14 @@ class ProductDataTemplateSheet implements
             'B' => NumberFormat::FORMAT_TEXT,
             'C' => NumberFormat::FORMAT_TEXT,
             'F' => NumberFormat::FORMAT_TEXT,
+            'K' => NumberFormat::FORMAT_TEXT,
+            'L' => NumberFormat::FORMAT_TEXT,
         ];
     }
 }
 
 /**
  * Sheet 2: Instructions
- *
- * Explains every import field and provides examples.
  */
 class ProductInstructionsSheet implements
     FromArray,
@@ -118,20 +133,20 @@ class ProductInstructionsSheet implements
             [
                 'IMPORTANT',
                 'Yes',
-                'Delete the sample product row from the Products sheet before importing.',
-                'Remove the row containing SAMPLE - DELETE THIS ROW.',
+                'Delete both sample product rows before importing.',
+                'Remove rows containing SAMPLE - DELETE THIS ROW.',
             ],
             [
                 'name',
                 'Yes',
-                'Product name. This field cannot be empty.',
-                'Aloo Tikki Burger',
+                'Product name.',
+                'Rice',
             ],
             [
                 'sku',
                 'No',
-                'Unique stock keeping unit. Leave blank if not needed.',
-                'BURGER-001',
+                'Unique SKU.',
+                'RICE-001',
             ],
             [
                 'barcode',
@@ -142,56 +157,86 @@ class ProductInstructionsSheet implements
             [
                 'brand',
                 'No',
-                'Brand name. A new brand may be created automatically.',
+                'Brand name. A missing brand may be created automatically.',
                 'ABC Foods',
             ],
             [
                 'category',
                 'No',
-                'Category name. A new category may be created automatically.',
-                'Burgers',
+                'Category name. A missing category may be created automatically.',
+                'Grains',
             ],
             [
                 'hsn_code',
                 'No',
-                'HSN code. Enter it as text to preserve leading zeros.',
-                '123456',
+                'HSN code.',
+                '100630',
             ],
             [
                 'gst_rate_id',
                 'No',
-                'Use an existing ID from the gst_rates table. Invalid IDs are saved as blank.',
+                'Existing ID from the gst_rates table.',
                 'Check your database for the correct ID.',
             ],
             [
                 'cost_price',
                 'No',
-                'Purchase or cost price of the product. Enter a non-negative number.',
-                '50',
+                'Product cost price. Enter a non-negative number.',
+                '45',
             ],
             [
                 'gst_inclusive',
                 'No',
                 'Whether the selling price includes GST.',
-                '1 = Yes, 0 = No; yes/no also accepted.',
+                '1 = Yes, 0 = No',
             ],
             [
                 'is_price_override',
                 'No',
-                'Whether the product has a price override enabled.',
-                '1 = Yes, 0 = No; yes/no also accepted.',
+                'Whether price override is enabled.',
+                '1 = Yes, 0 = No',
+            ],
+            [
+                'sale_type',
+                'Yes',
+                'Product selling type.',
+                'unit or weight',
+            ],
+            [
+                'plu_code',
+                'Conditional',
+                'PLU code for weight-based products. Must be unique within the store.',
+                'RICE01',
+            ],
+            [
+                'price_per_kg',
+                'Conditional',
+                'Selling price per kg for weight-based products.',
+                '70',
+            ],
+            [
+                'Weight product',
+                'Important',
+                'For sale_type=weight, PLU code and price_per_kg are required.',
+                'Rice, weight, RICE01, 70',
+            ],
+            [
+                'Unit product',
+                'Important',
+                'For sale_type=unit, PLU code and price_per_kg can remain blank.',
+                'Parle-G, unit',
             ],
             [
                 'Prices',
                 'Info',
-                'MRP and selling price are not imported here. Add them when you add stock (purchase bill or opening stock).',
-                'Only cost_price is part of this file.',
+                'MRP and inventory selling prices are not imported by this template.',
+                'Only cost_price is imported here.',
             ],
             [
                 'General rule',
                 'Important',
-                'Keep all column headings unchanged and enter data under the matching columns.',
-                'Maximum 2,000 product rows per import.',
+                'Keep headings unchanged. Maximum 2,000 product rows per import.',
+                'Use one row per product.',
             ],
         ];
     }
