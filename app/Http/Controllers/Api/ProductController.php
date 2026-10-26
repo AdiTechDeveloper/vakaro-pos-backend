@@ -137,7 +137,7 @@ class ProductController extends Controller
                                 now()->toDateString()
                             );
                     })
-                    ->orderBy('expiry_date', 'asc')
+                    ->orderByRaw('expiry_date IS NULL, expiry_date ASC')
                     ->orderBy('id', 'asc');
             }])
             ->addSelect([

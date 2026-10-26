@@ -184,15 +184,28 @@ class SalesBillController extends Controller
             ->map(function ($g) {
                 $first = $g->first();
 
+                $qty = $g->sum(fn ($b) => (float) $b->qty);
+                $sold = $g->sum(fn ($b) => (float) $b->sold_qty);
+                $expired = $g->sum(fn ($b) => (float) ($b->expired_qty ?? 0));
+                $available = $qty - $sold - $expired;
+
                 return [
                     'inventory_id' => $first->id,
+                    'id' => $first->id,
+                    'product_id' => $first->product_id,
+                    'branch_id' => $first->branch_id,
                     'batch_no' => $first->batch_no,
                     'batch_barcode' => $first->batch_barcode,
                     'mrp' => $first->mrp,
                     'selling_price' => $first->selling_price,
                     'cost_price' => $first->cost_price,
                     'expiry_date' => $first->expiry_date,
-                    'total_stock' => $g->sum(fn ($b) => (float) $b->qty - (float) $b->sold_qty - (float) ($b->expired_qty ?? 0)),
+
+                    'qty' => $qty,
+                    'sold_qty' => $sold,
+                    'expired_qty' => $expired,
+                    'qty_available' => $available,
+                    'total_stock' => $available,
                 ];
             })->values();
 
