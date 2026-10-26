@@ -9,10 +9,14 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Carbon\Carbon;
 
 class AIController extends Controller
 {
+    // New tools: GST, expenses/net profit, returns, dead stock, category/cashier-wise sales,
+    // product info, customer dues + shared date resolver (resolveRange) and excludeInvalidBills().
+    use \App\Http\Controllers\Concerns\AIExtraTools;
 
     public function chat(
         Request $request,
@@ -95,7 +99,14 @@ class AIController extends Controller
             $latestMessage
         ) === 1;
 
-        if ($isProductListRequest && !$isReportRequest) {
+        // Questions like "show products sold today" / "sab products ki sale" / "dead stock products"
+        // are NOT plain inventory lists. Let the AI + tools handle them.
+        $listMentionsOtherTopic = preg_match(
+            '/\b(sales?|sold|bika|bike|bikri|profit|purchase|suppliers?|low stock|out of stock|expiry|expired|expiring|dead|slow|categor(?:y|ies)|customers?|dues?|udhaar|gst|expenses?|returns?|price|rate|mrp|top|best|reorder)\b/iu',
+            $latestMessage
+        ) === 1;
+
+        if ($isProductListRequest && !$isReportRequest && !$listMentionsOtherTopic) {
             try {
                 // Shortcut replies are fixed text, so pick English vs Hinglish from the user's message.
                 $isEnglish = str_contains($this->languageDirective($latestMessage), 'English only');
@@ -175,7 +186,7 @@ class AIController extends Controller
 
         // Do not hijack questions that are really about sales/stock/etc. of a branch.
         $mentionsOtherTopic = preg_match(
-            '/\b(sales?|sale|stock|inventory|products?|items?|suppliers?|profit|purchase|payment|bills?|revenue|compare|comparison)\b/iu',
+            '/\b(sales?|sale|stock|inventory|products?|items?|suppliers?|profit|purchase|payment|bills?|revenue|compare|comparison|customers?|expenses?|gst|returns?|dues?)\b/iu',
             $latestMessage
         ) === 1;
 
@@ -279,6 +290,13 @@ class AIController extends Controller
             ]
         );
 
+        // Shared by every period-based tool (today, yesterday, last 7 days, this month, last month, custom).
+        $dateEnum = ['today', 'yesterday', 'last_7_days', 'this_month', 'last_month', 'custom'];
+        $customDateProps = [
+            'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
+            'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
+        ];
+
         $tools = [
             [
                 'type' => 'function',
@@ -295,9 +313,13 @@ class AIController extends Controller
                                     'yesterday',
                                     'last_7_days',
                                     'this_month',
+                                    'last_month',
+                                    'custom',
                                 ],
-                                'description' => 'The period for which sales data is required.',
+                                'description' => 'The period for which sales data is required. Use custom for a specific month, year or date range and fill date_from and date_to.',
                             ],
+                            'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
+                            'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
                             'branch_id' => [
                                 'type' => 'integer',
                                 'description' => 'Optional branch ID. Use this only when the user explicitly asks about a specific branch.',
@@ -359,7 +381,7 @@ class AIController extends Controller
                             'date_range' => [
                                 'type' => 'string',
                                 'enum' => ['today', 'yesterday', 'last_7_days', 'this_month', 'last_month', 'custom'],
-                                'description' => 'Only for top_selling, product_profit, branch_comparison, purchase_report and purchase_detail_report (default this_month). Other reports are current snapshots and ignore this.',
+                                'description' => 'Only for top_selling, product_profit, branch_comparison, purchase_report, purchase_detail_report and customer_analysis (default this_month). Other reports are current snapshots and ignore this.',
                             ],
                             'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for period reports with custom range.'],
                             'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for period reports with custom range.'],
@@ -415,7 +437,7 @@ class AIController extends Controller
                 'type' => 'function',
                 'function' => [
                     'name' => 'get_product_stock_details',
-                    'description' => 'Get a detailed list of all products with their exact available stock quantities. Use this whenever the user asks for all products, product names with quantities, item-wise stock, or a detailed inventory list. Do not use only get_stock_summary for these requests.',
+                    'description' => 'Get a detailed list of ALL products with their exact available stock quantities. Use this whenever the user asks for all products, product names with quantities, item-wise stock, or a detailed inventory list. Do not use only get_stock_summary for these requests. For ONE named product use get_product_info instead.',
                     'parameters' => [
                         'type' => 'object',
                         'properties' => [
@@ -446,13 +468,10 @@ class AIController extends Controller
                         'properties' => [
                             'date_range' => [
                                 'type' => 'string',
-                                'enum' => [
-                                    'today',
-                                    'yesterday',
-                                    'last_7_days',
-                                    'this_month',
-                                ],
+                                'enum' => $dateEnum,
                             ],
+                            'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
+                            'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
                             'limit' => [
                                 'type' => 'integer',
                                 'description' => 'Number of products per branch, maximum 10.',
@@ -527,22 +546,24 @@ class AIController extends Controller
                 ],
             ],
             [
-    'type' => 'function',
-    'function' => [
-        'name' => 'get_branch_wise_sales',
-        'description' => 'Branch-wise sales breakdown (bills, gross sales, collected, due, profit per branch) for a period. Use whenever the user asks for branch wise / branch-wise / each branch sales for today, yesterday, last 7 days or this month. Returns every branch of the store by name, including branches with zero sales.',
-        'parameters' => [
-            'type' => 'object',
-            'properties' => [
-                'date_range' => [
-                    'type' => 'string',
-                    'enum' => ['today', 'yesterday', 'last_7_days', 'this_month'],
+                'type' => 'function',
+                'function' => [
+                    'name' => 'get_branch_wise_sales',
+                    'description' => 'Branch-wise sales breakdown (bills, gross sales, collected, due, profit per branch) for a period. Use whenever the user asks for branch wise / branch-wise / each branch sales for today, yesterday, last 7 days, this month or last month. Returns every branch of the store by name, including branches with zero sales.',
+                    'parameters' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'date_range' => [
+                                'type' => 'string',
+                                'enum' => $dateEnum,
+                            ],
+                            'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
+                            'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
+                        ],
+                        'required' => ['date_range'],
+                    ],
                 ],
             ],
-            'required' => ['date_range'],
-        ],
-    ],
-],
             [
                 'type' => 'function',
                 'function' => [
@@ -578,13 +599,10 @@ class AIController extends Controller
                         'properties' => [
                             'date_range' => [
                                 'type' => 'string',
-                                'enum' => [
-                                    'today',
-                                    'yesterday',
-                                    'last_7_days',
-                                    'this_month',
-                                ],
+                                'enum' => $dateEnum,
                             ],
+                            'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
+                            'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
                         ],
                         'required' => ['date_range'],
                     ],
@@ -650,7 +668,9 @@ class AIController extends Controller
                     'parameters' => [
                         'type' => 'object',
                         'properties' => [
-                            'date_range' => ['type' => 'string', 'enum' => ['today', 'yesterday', 'last_7_days', 'this_month']],
+                            'date_range' => ['type' => 'string', 'enum' => $dateEnum],
+                            'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
+                            'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
                         ],
                         'required' => [],
                     ],
@@ -664,7 +684,9 @@ class AIController extends Controller
                     'parameters' => [
                         'type' => 'object',
                         'properties' => [
-                            'date_range' => ['type' => 'string', 'enum' => ['today', 'yesterday', 'last_7_days', 'this_month']],
+                            'date_range' => ['type' => 'string', 'enum' => $dateEnum],
+                            'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
+                            'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
                         ],
                         'required' => [],
                     ],
@@ -688,6 +710,10 @@ class AIController extends Controller
             ],
         ];
 
+        // New tools from AIExtraTools: GST, expenses/net profit, returns, dead stock,
+        // category-wise sales, cashier-wise sales, product info, customer dues.
+        $tools = array_merge($tools, $this->extraToolDefinitions());
+
         $download = null;
         $maxToolRounds = 4;
 
@@ -697,7 +723,8 @@ class AIController extends Controller
                     'messages' => $messages,
                     'tools' => $tools,
                     'tool_choice' => 'auto',
-                    'temperature' => 0.2,
+                    // 0 = no randomness. This is a data assistant, numbers must be stable.
+                    'temperature' => 0,
                 ], 'chat');
             } catch (\Throwable $exception) {
                 report($exception);
@@ -761,6 +788,9 @@ class AIController extends Controller
                     $arguments = [];
                 }
 
+                $toolStartedAt = microtime(true);
+                $toolFailed = false;
+
                 try {
                     $toolResult = $this->executeBusinessTool(
                         $functionName,
@@ -770,14 +800,28 @@ class AIController extends Controller
                         $branchId
                     );
                 } catch (\Symfony\Component\HttpKernel\Exception\HttpException $exception) {
+                    $toolFailed = true;
                     $toolResult = ['error' => $exception->getMessage()];
                 } catch (\Throwable $exception) {
+                    $toolFailed = true;
                     report($exception);
 
                     $toolResult = [
                         'error' => 'This business report could not be generated. Please try again.',
                     ];
                 }
+
+                // Every tool call is logged, so when a user says "galat data aaya"
+                // you can see exactly which tool ran with which arguments.
+                Log::info('ai_tool_call', [
+                    'user_id' => $user->id,
+                    'store_id' => $user->store_id,
+                    'branch_id' => $branchId,
+                    'tool' => $functionName,
+                    'arguments' => $arguments,
+                    'failed' => $toolFailed || !empty($toolResult['error']),
+                    'duration_ms' => (int) round((microtime(true) - $toolStartedAt) * 1000),
+                ]);
 
                 if (
                     in_array($functionName, ['prepare_sales_report_download', 'prepare_report_download'], true)
@@ -786,14 +830,23 @@ class AIController extends Controller
                     $download = $toolResult['download'];
                 }
 
+                $encodedResult = json_encode(
+                    $toolResult,
+                    JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR
+                ) ?: '{"error":"Unable to encode tool result."}';
+
+                // Very large results can break the model's token limit.
+                if (strlen($encodedResult) > 60000) {
+                    $encodedResult = json_encode([
+                        'error' => 'The result is too large to show in chat. Ask the user for a more specific question or suggest downloading the report.',
+                    ]);
+                }
+
                 $messages[] = [
                     'role' => 'tool',
                     'tool_call_id' => $toolCall['id'] ?? '',
                     'name' => $functionName,
-                    'content' => json_encode(
-                        $toolResult,
-                        JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR
-                    ) ?: '{"error":"Unable to encode tool result."}',
+                    'content' => $encodedResult,
                 ];
             }
         }
@@ -933,6 +986,13 @@ class AIController extends Controller
                 );
             case 'get_branches':
                 return $this->getBranches($user, $branchId);
+            case 'get_branch_wise_sales':
+                return $this->getBranchWiseSales(
+                    $salesReportService,
+                    $user,
+                    $branchId,
+                    $arguments
+                );
             case 'get_sales_comparison':
                 return $this->getSalesComparison(
                     $salesReportService,
@@ -967,92 +1027,97 @@ class AIController extends Controller
                 return $this->getExpiryAnalysis($user, $branchId);
             case 'get_customer_wallet_balances':
                 return $this->getCustomerWalletBalances($user, $branchId);
-                case 'get_branch_wise_sales':
-    return $this->getBranchWiseSales(
-        $salesReportService,
-        $user,
-        $branchId,
-        $arguments
-    );
             default:
-                return ['error' => 'Unknown business tool.'];
+                // New tools live in AIExtraTools (GST, expenses, returns, dead stock, ...).
+                $extra = $this->executeExtraTool(
+                    $functionName,
+                    $arguments,
+                    $salesReportService,
+                    $user,
+                    $branchId
+                );
+
+                return $extra ?? ['error' => 'Unknown business tool.'];
         }
+    }
+
+    /**
+     * Branch-wise sales for every branch of the store (including zero-sale branches).
+     * Uses the same date logic and the same valid-bill filter as the other sales tools.
+     */
+    private function getBranchWiseSales(
+        SalesReportService $salesReportService,
+        $user,
+        ?int $branchId,
+        array $arguments
+    ): array {
+        if ($user->role === 'manager' && !$branchId) {
+            return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
+        }
+
+        $range = $this->resolveRange($arguments, 'today');
+        if (isset($range['error'])) {
+            return $range;
+        }
+
+        $from = $range['from'];
+        $to = $range['to'];
+
+        $query = DB::table('branches as b')
+            ->leftJoin('sales_bills as sb', function ($join) use ($from, $to, $user) {
+                $join->on('sb.branch_id', '=', 'b.id')
+                    ->where('sb.store_id', '=', $user->store_id)
+                    ->whereBetween('sb.created_at', [$from, $to]);
+                $this->excludeInvalidBills($join, 'sb.bill_status');
+            })
+            ->where('b.store_id', $user->store_id);
+
+        // Managers see only their own branch.
+        if ($user->role === 'manager') {
+            $query->where('b.id', $branchId);
+        }
+
+        $rows = $query
+            ->groupBy('b.id', 'b.name')
+            ->selectRaw('
+                b.name as branch_name,
+                COUNT(sb.id) as total_bills,
+                COALESCE(SUM(sb.total_amount), 0) as gross_sales,
+                COALESCE(SUM(sb.paid_amount), 0) as collected,
+                COALESCE(SUM(sb.due_amount), 0) as due,
+                COALESCE(SUM(sb.total_profit), 0) as profit
+            ')
+            ->orderByDesc('gross_sales')
+            ->get();
+
+        $branches = $rows->map(fn($r) => [
+            'branch_name' => $r->branch_name,
+            'total_bills' => (int) $r->total_bills,
+            'gross_sales' => round((float) $r->gross_sales, 2),
+            'collected_amount' => round((float) $r->collected, 2),
+            'due_amount' => round((float) $r->due, 2),
+            'profit' => round((float) $r->profit, 2),
+        ])->values();
+
+        return [
+            'date_range' => $range['label'],
+            'period' => $range['period'],
+            'branches' => $branches->all(),
+            'totals' => [
+                'total_bills' => $branches->sum('total_bills'),
+                'gross_sales' => round($branches->sum('gross_sales'), 2),
+                'collected_amount' => round($branches->sum('collected_amount'), 2),
+                'due_amount' => round($branches->sum('due_amount'), 2),
+                'profit' => round($branches->sum('profit'), 2),
+            ],
+            'note' => 'Every branch of the store is listed, including branches with zero sales. The totals are the sum of the listed branches.',
+        ];
     }
 
     /**
      * Prepares the data the frontend needs to show a download button.
      * Format is excel only if the user asked for it, otherwise pdf.
      */
-    private function getBranchWiseSales(
-    SalesReportService $salesReportService,
-    $user,
-    ?int $branchId,
-    array $arguments
-): array {
-    if ($user->role === 'manager' && !$branchId) {
-        return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
-    }
-
-    $dateRange = $arguments['date_range'] ?? 'today';
-    if (!in_array($dateRange, ['today', 'yesterday', 'last_7_days', 'this_month'], true)) {
-        $dateRange = 'today';
-    }
-
-    // Same date logic as get_sales_summary, so totals always match.
-    $f = $salesReportService->resolveFilters([
-        'date_range' => $dateRange,
-        'bill_status' => 'all',
-        'store_id' => $user->store_id,
-    ]);
-
-    $query = DB::table('branches as b')
-        ->leftJoin('sales_bills as sb', function ($join) use ($f, $user) {
-            $join->on('sb.branch_id', '=', 'b.id')
-                ->where('sb.store_id', '=', $user->store_id)
-                ->whereBetween('sb.created_at', [$f['from'], $f['to']]);
-        })
-        ->where('b.store_id', $user->store_id);
-
-    // Managers see only their own branch.
-    if ($user->role === 'manager') {
-        $query->where('b.id', $branchId);
-    }
-
-    $rows = $query
-        ->groupBy('b.id', 'b.name')
-        ->selectRaw('
-            b.name as branch_name,
-            COUNT(sb.id) as total_bills,
-            COALESCE(SUM(sb.total_amount), 0) as gross_sales,
-            COALESCE(SUM(sb.paid_amount), 0) as collected,
-            COALESCE(SUM(sb.due_amount), 0) as due,
-            COALESCE(SUM(sb.total_profit), 0) as profit
-        ')
-        ->orderByDesc('gross_sales')
-        ->get();
-
-    $branches = $rows->map(fn($r) => [
-        'branch_name' => $r->branch_name,
-        'total_bills' => (int) $r->total_bills,
-        'gross_sales' => round((float) $r->gross_sales, 2),
-        'collected_amount' => round((float) $r->collected, 2),
-        'due_amount' => round((float) $r->due, 2),
-        'profit' => round((float) $r->profit, 2),
-    ])->values();
-
-    return [
-        'date_range' => $dateRange,
-        'branches' => $branches->all(),
-        'totals' => [
-            'total_bills' => $branches->sum('total_bills'),
-            'gross_sales' => round($branches->sum('gross_sales'), 2),
-            'collected_amount' => round($branches->sum('collected_amount'), 2),
-            'due_amount' => round($branches->sum('due_amount'), 2),
-            'profit' => round($branches->sum('profit'), 2),
-        ],
-        'note' => 'Every branch of the store is listed, including branches with zero sales. The totals are the sum of the listed branches.',
-    ];
-}
     private function prepareSalesReportDownload(
         $user,
         ?int $branchId,
@@ -1063,47 +1128,9 @@ class AIController extends Controller
         }
 
         $format = ($arguments['format'] ?? 'pdf') === 'excel' ? 'excel' : 'pdf';
-        $range = $arguments['date_range'] ?? 'this_month';
-        $today = Carbon::today();
-
-        switch ($range) {
-            case 'today':
-                $from = $today->copy();
-                $to = $today->copy();
-                break;
-            case 'yesterday':
-                $from = $today->copy()->subDay();
-                $to = $from->copy();
-                break;
-            case 'last_7_days':
-                $from = $today->copy()->subDays(6);
-                $to = $today->copy();
-                break;
-            case 'last_month':
-                $from = $today->copy()->subMonthNoOverflow()->startOfMonth();
-                $to = $from->copy()->endOfMonth();
-                break;
-            case 'custom':
-                try {
-                    $from = Carbon::createFromFormat(
-                        'Y-m-d',
-                        (string) ($arguments['date_from'] ?? '')
-                    )->startOfDay();
-                    $to = Carbon::createFromFormat(
-                        'Y-m-d',
-                        (string) ($arguments['date_to'] ?? '')
-                    )->startOfDay();
-                } catch (\Throwable $e) {
-                    return ['error' => 'Valid date range nahi mili. Month ya dates batayein.'];
-                }
-                if ($from->gt($to)) {
-                    return ['error' => 'Start date end date se badi nahi ho sakti.'];
-                }
-                break;
-            default: // this_month
-                $from = $today->copy()->startOfMonth();
-                $to = $today->copy();
-                break;
+        $range = $this->resolveRange($arguments, 'this_month');
+        if (isset($range['error'])) {
+            return $range;
         }
 
         return [
@@ -1111,8 +1138,8 @@ class AIController extends Controller
                 'report_type' => 'sales',
                 'title' => 'Sales Report',
                 'format' => $format,
-                'date_from' => $from->toDateString(),
-                'date_to' => $to->toDateString(),
+                'date_from' => $range['from']->toDateString(),
+                'date_to' => $range['to']->toDateString(),
                 'branch_id' => $branchId ?? 0,
             ],
             'message' => 'Download button user ko dikhaya jayega. Short confirmation do, report ka data chat mein paste mat karo.',
@@ -1121,7 +1148,7 @@ class AIController extends Controller
 
     /**
      * Prepares a download button for non-sales reports.
-     * Snapshot reports (stock etc.) use today's date; top_selling uses the requested period.
+     * Snapshot reports (stock etc.) use today's date; period reports use the requested period.
      */
     private function prepareReportDownload(
         $user,
@@ -1166,36 +1193,12 @@ class AIController extends Controller
         }
 
         if (in_array($type, ['top_selling', 'product_profit', 'branch_comparison', 'purchase_report', 'purchase_detail_report', 'customer_analysis'], true)) {
-            $range = $arguments['date_range'] ?? 'this_month';
-            switch ($range) {
-                case 'today':
-                    break;
-                case 'yesterday':
-                    $from = $today->copy()->subDay();
-                    $to = $from->copy();
-                    break;
-                case 'last_7_days':
-                    $from = $today->copy()->subDays(6);
-                    break;
-                case 'last_month':
-                    $from = $today->copy()->subMonthNoOverflow()->startOfMonth();
-                    $to = $from->copy()->endOfMonth();
-                    break;
-                case 'custom':
-                    try {
-                        $from = Carbon::createFromFormat('Y-m-d', (string) ($arguments['date_from'] ?? ''))->startOfDay();
-                        $to = Carbon::createFromFormat('Y-m-d', (string) ($arguments['date_to'] ?? ''))->startOfDay();
-                    } catch (\Throwable $e) {
-                        return ['error' => 'Valid date range nahi mili. Month ya dates batayein.'];
-                    }
-                    if ($from->gt($to)) {
-                        return ['error' => 'Start date end date se badi nahi ho sakti.'];
-                    }
-                    break;
-                default: // this_month
-                    $from = $today->copy()->startOfMonth();
-                    break;
+            $range = $this->resolveRange($arguments, 'this_month');
+            if (isset($range['error'])) {
+                return $range;
             }
+            $from = $range['from']->copy()->startOfDay();
+            $to = $range['to']->copy()->startOfDay();
         }
 
         $options = [];
@@ -1228,19 +1231,16 @@ class AIController extends Controller
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
-        $dateRange = $arguments['date_range'] ?? 'today';
-        if (!in_array($dateRange, [
-            'today',
-            'yesterday',
-            'last_7_days',
-            'this_month',
-        ], true)) {
-            $dateRange = 'today';
-        }
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
+
+        $range = $this->resolveRange($arguments, 'today');
+        if (isset($range['error'])) {
+            return $range;
+        }
+
         $requestedBranchId = $arguments['branch_id'] ?? null;
         if ($user->role === 'manager') {
             $requestedBranchId = $branchId;
@@ -1252,15 +1252,17 @@ class AIController extends Controller
             );
             $branchId = (int) $requestedBranchId;
         }
-        $filters = $salesReportService->resolveFilters([
-            'date_range' => $dateRange,
+
+        $filters = $salesReportService->resolveFilters(array_merge($range['service_input'], [
             'bill_status' => 'all',
             'store_id' => $user->store_id,
             'branch_id' => $branchId,
-        ]);
+        ]));
         $kpis = $salesReportService->getKpis($filters);
+
         return [
-            'date_range' => $dateRange,
+            'date_range' => $range['label'],
+            'period' => $range['period'],
             'branch_id' => $branchId,
             'total_bills' => (int) ($kpis['total_bills'] ?? 0),
             'gross_sales' => (float) ($kpis['gross_sales'] ?? 0),
@@ -1271,11 +1273,12 @@ class AIController extends Controller
             'total_gst' => (float) ($kpis['total_gst_bills'] ?? 0),
         ];
     }
+
     private function getProductStockDetails(
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return [
                 'error' => 'Manager ki assigned branch resolve nahi hui.',
@@ -1355,10 +1358,11 @@ class AIController extends Controller
             'description' => 'Get product-wise inventory details including exact product name, selling price and available quantity. Always use this tool when the user asks for a table of products with selling prices and stock quantities.',
         ];
     }
+
     private function resolveBranchId(
         $user,
         $requestedBranchId = null
-     ): ?int {
+    ): ?int {
         if ($user->role === 'manager') {
             if (!empty($user->branch_id)) {
                 $branchId = (int) $user->branch_id;
@@ -1383,7 +1387,7 @@ class AIController extends Controller
     private function validateAdminBranch(
         $user,
         int $branchId
-     ): void {
+    ): void {
         $exists = DB::table('branches')
             ->where('id', $branchId)
             ->where('store_id', $user->store_id)
@@ -1417,11 +1421,12 @@ class AIController extends Controller
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
         $threshold = max(0, min((int) ($arguments['threshold'] ?? 10), 100000));
+        $limit = 50;
         $query = DB::table('inventories as i')
             ->join('products as p', 'p.id', '=', 'i.product_id')
             ->join('branches as b', 'b.id', '=', 'i.branch_id')
@@ -1430,6 +1435,7 @@ class AIController extends Controller
         if ($branchId !== null) {
             $query->where('i.branch_id', $branchId);
         }
+        // Fetch one extra row so we can tell the AI the list was cut.
         $products = $query
             ->selectRaw('
                 p.id as product_id,
@@ -1446,19 +1452,27 @@ class AIController extends Controller
                 [$threshold]
             )
             ->orderBy('available_qty')
-            ->limit(50)
+            ->limit($limit + 1)
             ->get();
+
+        $truncated = $products->count() > $limit;
+        $products = $products->take($limit)->values();
+
         return [
             'threshold' => $threshold,
             'count' => $products->count(),
+            'truncated' => $truncated,
             'products' => $products->toArray(),
+            'note' => $truncated
+                ? "Only the first {$limit} lowest-stock products are shown; more exist. Tell the user the list is cut."
+                : null,
         ];
     }
 
     private function getStockSummary(
         $user,
         ?int $branchId
-     ): array {
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
@@ -1533,22 +1547,19 @@ class AIController extends Controller
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         if (!in_array($user->role, ['admin', 'manager'], true)) {
             return ['error' => 'You are not authorized to view sales analytics.'];
         }
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
-        $dateRange = $arguments['date_range'] ?? 'this_month';
-        if (!in_array($dateRange, [
-            'today',
-            'yesterday',
-            'last_7_days',
-            'this_month',
-        ], true)) {
-            $dateRange = 'this_month';
+
+        $range = $this->resolveRange($arguments, 'this_month');
+        if (isset($range['error'])) {
+            return $range;
         }
+
         $limit = max(
             1,
             min((int) ($arguments['limit'] ?? 5), 10)
@@ -1582,12 +1593,11 @@ class AIController extends Controller
         }
         $results = [];
         foreach ($branchIds as $id) {
-            $filters = $salesReportService->resolveFilters([
-                'date_range' => $dateRange,
+            $filters = $salesReportService->resolveFilters(array_merge($range['service_input'], [
                 'bill_status' => 'all',
                 'store_id' => $user->store_id,
                 'branch_id' => $id,
-            ]);
+            ]));
             $performance = $salesReportService->getProductPerformance(
                 $filters
             );
@@ -1604,13 +1614,14 @@ class AIController extends Controller
                 ]);
             $results[] = [
                 'branch_id' => $id,
-                'date_range' => $dateRange,
+                'date_range' => $range['label'],
                 'ranking_basis' => 'quantity_sold',
                 'products' => $products->all(),
             ];
         }
         return [
-            'date_range' => $dateRange,
+            'date_range' => $range['label'],
+            'period' => $range['period'],
             'ranking_basis' => 'quantity_sold',
             'products_by_branch' => $results,
         ];
@@ -1620,7 +1631,7 @@ class AIController extends Controller
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
@@ -1645,6 +1656,7 @@ class AIController extends Controller
                 $branchIds = [$branchId];
             }
         }
+        $limit = 100;
         $query = DB::table('inventories as i')
             ->join('branches as b', 'b.id', '=', 'i.branch_id')
             ->leftJoin('products as p', 'p.id', '=', 'i.product_id')
@@ -1653,6 +1665,7 @@ class AIController extends Controller
         if (!empty($branchIds)) {
             $query->whereIn('i.branch_id', $branchIds);
         }
+        // Fetch one extra row so we can tell the AI the list was cut.
         $rows = $query
             ->selectRaw('
                 i.branch_id,
@@ -1665,12 +1678,20 @@ class AIController extends Controller
                 'SUM(i.qty - i.sold_qty - COALESCE(i.expired_qty, 0)) <= 0'
             )
             ->orderBy('available_qty')
-            ->limit(100)
+            ->limit($limit + 1)
             ->get();
+
+        $truncated = $rows->count() > $limit;
+        $rows = $rows->take($limit)->values();
+
         return [
             'branch_ids' => $branchIds,
             'products' => $rows->toArray(),
             'count' => $rows->count(),
+            'truncated' => $truncated,
+            'note' => $truncated
+                ? "Only the first {$limit} out-of-stock products are shown; more exist. Tell the user the list is cut."
+                : null,
         ];
     }
 
@@ -1707,7 +1728,7 @@ class AIController extends Controller
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         $requestedBranchId = $arguments['branch_id'] ?? $branchId;
         $requestedBranchName = trim((string) ($arguments['branch_name'] ?? ''));
         $requestedProductName = trim((string) ($arguments['product_name'] ?? ''));
@@ -1835,11 +1856,12 @@ class AIController extends Controller
                 ];
             }
         }
-        $suggestions = $suggestions
+        $allSuggestions = $suggestions
             ->filter(fn($item) => $item['suggested_reorder_qty'] > 0)
             ->sortByDesc('suggested_reorder_qty')
-            ->take(50)
             ->values();
+        $totalSuggestions = $allSuggestions->count();
+        $suggestions = $allSuggestions->take(50)->values();
         $resolvedBranchName = DB::table('branches')
             ->where('id', (int) $requestedBranchId)
             ->where('store_id', $user->store_id)
@@ -1850,7 +1872,10 @@ class AIController extends Controller
             'branch_name' => $resolvedBranchName,
             'period' => 'last_30_days',
             'product_name_searched' => $requestedProductName !== '' ? $requestedProductName : null,
+            'total_matching' => $totalSuggestions,
+            'truncated' => $totalSuggestions > 50,
             'suggestions' => $suggestions->all(),
+            'note' => 'Daily demand = quantity sold in the last 30 days divided by 30. Products that were stocked recently may be under-estimated. Only the top 50 are shown if truncated is true.',
         ];
     }
 
@@ -1859,7 +1884,7 @@ class AIController extends Controller
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
@@ -1967,27 +1992,24 @@ class AIController extends Controller
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
-        $dateRange = $arguments['date_range'] ?? 'this_month';
-        if (!in_array($dateRange, [
-            'today',
-            'yesterday',
-            'last_7_days',
-            'this_month',
-        ], true)) {
-            $dateRange = 'this_month';
+
+        $range = $this->resolveRange($arguments, 'this_month');
+        if (isset($range['error'])) {
+            return $range;
         }
-        $filters = $salesReportService->resolveFilters([
-            'date_range' => $dateRange,
+
+        $filters = $salesReportService->resolveFilters(array_merge($range['service_input'], [
             'bill_status' => 'all',
             'store_id' => $user->store_id,
             'branch_id' => $branchId,
-        ]);
+        ]));
         return [
-            'date_range' => $dateRange,
+            'date_range' => $range['label'],
+            'period' => $range['period'],
             'branch_id' => $branchId,
             'payments' => $salesReportService->getPaymentSummary($filters),
             'payment_methods' => $salesReportService->getPaymentMethods($filters),
@@ -1999,7 +2021,7 @@ class AIController extends Controller
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
@@ -2069,7 +2091,7 @@ class AIController extends Controller
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
@@ -2109,11 +2131,11 @@ class AIController extends Controller
         $paidByBill = $recentIds->isEmpty()
             ? collect()
             : DB::table('purchase_payments')
-            ->whereIn('purchase_bill_id', $recentIds)
-            ->where('status', 'success')
-            ->selectRaw('purchase_bill_id, SUM(amount) as paid')
-            ->groupBy('purchase_bill_id')
-            ->pluck('paid', 'purchase_bill_id');
+                ->whereIn('purchase_bill_id', $recentIds)
+                ->where('status', 'success')
+                ->selectRaw('purchase_bill_id, SUM(amount) as paid')
+                ->groupBy('purchase_bill_id')
+                ->pluck('paid', 'purchase_bill_id');
         $history = $recentBills->map(function ($bill) use ($paidByBill) {
             $paid = (float) ($paidByBill[$bill->id] ?? 0);
             $total = (float) $bill->total_amount;
@@ -2144,6 +2166,7 @@ class AIController extends Controller
                 2
             ),
             'bills_returned' => $history->count(),
+            'truncated' => $allBills->count() > $history->count(),
             'purchase_history' => $history->all(),
             'note' => 'All-time totals cover all recorded bills in the authorized scope. History contains only the latest 50 bills.',
         ];
@@ -2153,7 +2176,7 @@ class AIController extends Controller
         $user,
         ?int $branchId,
         array $arguments
-     ): array {
+    ): array {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
@@ -2226,6 +2249,7 @@ class AIController extends Controller
         return [
             'product_name_searched' => $productName,
             'comparisons' => $comparisons->all(),
+            'truncated' => $rows->count() >= 500,
             'note' => 'Historical rates only, not current quotations. Aggregates are based on the latest 500 matching purchase rows returned by the query.',
         ];
     }
@@ -2233,7 +2257,7 @@ class AIController extends Controller
     public function scanPurchaseBill(
         Request $request,
         \App\Services\AIProviderService $aiProviderService
-     ) {
+    ) {
         $request->validate([
             'bill_image' => [
                 'required',
@@ -2260,43 +2284,43 @@ class AIController extends Controller
         );
 
         $prompt = <<<'PROMPT'
-            Read this supplier purchase invoice and extract its data.
+Read this supplier purchase invoice and extract its data.
 
-                Return ONLY valid JSON using this structure:
-                {
-                "supplier_name": null,
-                "bill_no": null,
-                "bill_date": null,
-                "tax_type": "exclusive",
-                "total_amount": null,
-                "lines": [
-                    {
-                    "product_name": null,
-                    "qty": null,
-                    "free_qty": 0,
-                    "purchase_rate": null,
-                    "mrp": null,
-                    "selling_price": null,
-                    "gst_rate_percent": null,
-                    "hsn_code": null,
-                    "batch_no": null,
-                    "expiry_date": null,
-                    "discount": 0,
-                    "discount_type": null
-                    }
-                ]
-                }
+Return ONLY valid JSON using this structure:
+{
+"supplier_name": null,
+"bill_no": null,
+"bill_date": null,
+"tax_type": "exclusive",
+"total_amount": null,
+"lines": [
+    {
+    "product_name": null,
+    "qty": null,
+    "free_qty": 0,
+    "purchase_rate": null,
+    "mrp": null,
+    "selling_price": null,
+    "gst_rate_percent": null,
+    "hsn_code": null,
+    "batch_no": null,
+    "expiry_date": null,
+    "discount": 0,
+    "discount_type": null
+    }
+]
+}
 
-                Rules:
-                - Do not invent values. Use null when unreadable or missing.
-                - Use YYYY-MM-DD for dates when the date is clear.
-                - Return numeric values as numbers.
-                - Use "inclusive" or "exclusive" only when supported by the invoice;
-                otherwise use null.
-                - Extract each product row separately.
-                - Do not treat the invoice total as a product rate.
-                - Do not create or save any purchase bill.
-        PROMPT;
+Rules:
+- Do not invent values. Use null when unreadable or missing.
+- Use YYYY-MM-DD for dates when the date is clear.
+- Return numeric values as numbers.
+- Use "inclusive" or "exclusive" only when supported by the invoice;
+  otherwise use null.
+- Extract each product row separately.
+- Do not treat the invoice total as a product rate.
+- Do not create or save any purchase bill.
+PROMPT;
 
         try {
             $response = $aiProviderService->complete([
@@ -2366,25 +2390,19 @@ class AIController extends Controller
         }
     }
 
-    private function resolvePeriod(string $range): array
-    {
-        $today = Carbon::today();
-        return match ($range) {
-            'yesterday'   => [$today->copy()->subDay()->startOfDay(), $today->copy()->subDay()->endOfDay()],
-            'last_7_days' => [$today->copy()->subDays(6)->startOfDay(), $today->copy()->endOfDay()],
-            'this_month'  => [$today->copy()->startOfMonth(), $today->copy()->endOfDay()],
-            default       => [$today->copy()->startOfDay(), $today->copy()->endOfDay()],
-        };
-    }
-
     private function getHourlySalesAnalysis($user, ?int $branchId, array $arguments): array
     {
         if ($user->role === 'manager' && !$branchId) {
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
 
-        $range = $arguments['date_range'] ?? 'today';
-        [$from, $to] = $this->resolvePeriod($range);
+        $r = $this->resolveRange($arguments, 'today');
+        if (isset($r['error'])) {
+            return $r;
+        }
+        $from = $r['from'];
+        $to = $r['to'];
+        $range = $r['label'];
 
         $query = DB::table('sales_bills')
             ->where('store_id', $user->store_id)
@@ -2394,6 +2412,9 @@ class AIController extends Controller
             $query->where('branch_id', $branchId);
         }
 
+        // Same valid-bill filter as the other sales tools, so totals match.
+        $this->excludeInvalidBills($query);
+
         $rows = $query
             ->selectRaw('HOUR(created_at) as hr, COUNT(*) as bills, COALESCE(SUM(total_amount),0) as sales, COUNT(DISTINCT customer_id) as customers')
             ->groupBy(DB::raw('HOUR(created_at)'))
@@ -2401,16 +2422,16 @@ class AIController extends Controller
             ->get();
 
         if ($rows->isEmpty()) {
-            return ['date_range' => $range, 'message' => 'Is period mein koi bill nahi mila.', 'hours' => []];
+            return ['date_range' => $range, 'period' => $r['period'], 'message' => 'Is period mein koi bill nahi mila.', 'hours' => []];
         }
 
         $label = fn($h) => sprintf('%02d:00-%02d:00', $h, ($h + 1) % 24);
 
-        $hours = $rows->map(fn($r) => [
-            'time_slot' => $label((int) $r->hr),
-            'bills' => (int) $r->bills,
-            'sales' => round((float) $r->sales, 2),
-            'unique_customers' => (int) $r->customers,
+        $hours = $rows->map(fn($row) => [
+            'time_slot' => $label((int) $row->hr),
+            'bills' => (int) $row->bills,
+            'sales' => round((float) $row->sales, 2),
+            'unique_customers' => (int) $row->customers,
         ])->values();
 
         $peakSales = $rows->sortByDesc('sales')->first();
@@ -2418,6 +2439,7 @@ class AIController extends Controller
 
         return [
             'date_range' => $range,
+            'period' => $r['period'],
             'hours' => $hours->all(),
             'peak_sales_slot' => ['time_slot' => $label((int) $peakSales->hr), 'sales' => round((float) $peakSales->sales, 2)],
             'peak_customer_slot' => ['time_slot' => $label((int) $peakCustomers->hr), 'bills' => (int) $peakCustomers->bills],
@@ -2431,8 +2453,13 @@ class AIController extends Controller
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
 
-        $range = $arguments['date_range'] ?? 'this_month';
-        [$from, $to] = $this->resolvePeriod($range);
+        $r = $this->resolveRange($arguments, 'this_month');
+        if (isset($r['error'])) {
+            return $r;
+        }
+        $from = $r['from'];
+        $to = $r['to'];
+        $range = $r['label'];
 
         // Bills of identified customers in the period (sales_bills has store_id).
         $bills = DB::table('sales_bills')
@@ -2443,6 +2470,9 @@ class AIController extends Controller
         if ($branchId !== null) {
             $bills->where('branch_id', $branchId);
         }
+
+        // Same valid-bill filter as the other sales tools, so totals match.
+        $this->excludeInvalidBills($bills);
 
         $perCustomer = $bills
             ->selectRaw('customer_id, COUNT(*) as visits, SUM(total_amount) as spent')
@@ -2475,6 +2505,7 @@ class AIController extends Controller
 
         return [
             'date_range' => $range,
+            'period' => $r['period'],
             'active_customers' => $perCustomer->count(),
             'repeat_customers' => $perCustomer->where('visits', '>', 1)->count(),
             'new_customers' => $newCustomers,
@@ -2482,6 +2513,7 @@ class AIController extends Controller
             'top_customers' => $top->all(),
         ];
     }
+
     private function getCustomerWalletBalances($user, ?int $branchId = null): array
     {
         if ($user->role === 'manager' && !$branchId) {
@@ -2513,8 +2545,10 @@ class AIController extends Controller
                 'mobile' => $c->mobile,
                 'wallet_balance' => round((float) $c->balance, 2),
             ])->values()->all(),
+            'truncated' => $balances->count() > 20,
         ];
     }
+
     private function getExpiryAnalysis($user, ?int $branchId): array
     {
         if ($user->role === 'manager' && !$branchId) {
@@ -2552,6 +2586,7 @@ class AIController extends Controller
 
         $grouped = $rows->groupBy($bucket)->map(fn($g) => [
             'count' => $g->count(),
+            'truncated' => $g->count() > 15,
             'items' => $g->take(15)->map(fn($r) => [
                 'product_name' => $r->product_name,
                 'expiry_date' => $r->expiry_date,
@@ -2562,112 +2597,122 @@ class AIController extends Controller
         return [
             'buckets' => $grouped->all(),
             'total_batches_flagged' => $rows->count(),
-            'note' => 'Only batches with available stock and expiry within 60 days (or already expired) are listed. Each bucket shows at most 15 items.',
+            'truncated' => $rows->count() >= 100,
+            'note' => 'Only batches with available stock and expiry within 60 days (or already expired) are listed. Each bucket shows at most 15 items; the query reads at most 100 batches. Tell the user when a bucket is truncated.',
         ];
     }
-       private function systemPrompt(
+
+    private function systemPrompt(
         $user,
         ?int $branchId
-     ): string {
+    ): string {
         $scope = $user->role === 'manager'
             ? "The user is a manager and can only access branch {$branchId}."
             : 'The user is an admin and can access all branches belonging to their store. If no specific branch is explicitly requested, aggregate data across ALL branches in the store.';
         $today = Carbon::today()->toDateString();
         $storeName = $this->getStoreName($user);
         return <<<PROMPT
-       You are the AI Business Assistant for a POS system.
-                You answer questions about the user's actual business data.
-                Today's date: {$today}
-                Important rules:
-        1. Never invent sales, stock, purchase, profit or financial numbers.
-        2. When the user asks about actual business data, use the available business tools.
-        3. The database result is the source of truth.
-        4. Give concise, clear and easy-to-understand answers.
-        5. LANGUAGE RULE (mandatory): Reply in the same language AND the same script as the user's latest message. Decide this only from the user's latest message, never from earlier history, tool results or these instructions.
-        6. Mapping: English message -> English reply. Hinglish (Hindi typed in Roman letters) -> Hinglish in Roman letters. Hindi typed in Devanagari -> Hindi in Devanagari. Gujarati typed in Gujarati script -> Gujarati script. Gujarati typed in Roman letters -> Gujarati language written in Roman letters (never switch to English or Hindi). The same applies to Marathi, Punjabi, Bengali, Tamil, Telugu, Kannada, Malayalam, Urdu and any other language: same language, same script as the user typed.
-        7. If the user explicitly asks for a language (for example "Gujarati mein batao" or "answer in Hindi"), use that language. Write it in the script the user is typing in: Roman letters if the message is in Roman letters, native script if the message is in native script.
-        8. For mixed messages, use the language that dominates the message. Very short follow-ups such as "ok", "yes", "haan", "1" keep the language and script of your previous reply.
-        9. Never translate or change data returned by tools: product names, branch names, supplier names, SKUs, dates, numbers and amounts stay exactly as returned. Table headings and all explanation text follow the user's language. Markdown tables must stay valid.
-        10. Short confirmations (for example report ready), "data not found" messages and error explanations must also follow the user's language and script.
-        11. Before sending the final answer, silently check that the language and script match the user's latest message. If not, rewrite the answer.
-        12. Examples:
-            - User: "HOW MUCH SALE TODAY?" -> "Today's total sales are ₹0.00. No bills were processed today."
-            - User: "AAJ KI SALE KITNI HAI?" -> "Aaj ki total sale ₹0.00 hai. Aaj koi bill process nahi hua."
-            - User: "आज की सेल कितनी है?" -> "आज की कुल सेल ₹0.00 है। आज कोई बिल नहीं बना।"
-            - User: "આજની સેલ કેટલી છે?" -> "આજની કુલ સેલ ₹0.00 છે. આજે કોઈ બિલ બન્યું નથી."
-            - User: "Aaj ni sale ketli chhe?" (Gujarati in Roman letters) -> "Aaj ni total sale ₹0.00 chhe. Aaje koi bill banyu nathi."
-        13. For zero available stock, always call get_out_of_stock_products.
-        14. For reorder suggestions, always call get_purchase_suggestions. Explain that recommendations are estimates based on the last 30 days of sales. Purchase suggestions require one branch because inventory and demand are branch-specific. If an admin names a branch, pass that exact branch name in branch_name; never ask for a numeric ID. If no branch is named, ask which branch by its NAME, not numeric ID. Never silently choose a branch or combine branches for purchase suggestions. Managers use their assigned branch, regardless of any branch name in the message. Distinguish the product name from the branch name: if the user says 'XYZ-EDITED ke liye product purchase suggestion', treat XYZ-EDITED as product_name, not branch_name. If product name is given but no branch is given, ask which branch name to use.
-        14a. For ANY question about the number of branches, branch names, or the structure of the store, you MUST call get_branches in this turn, even if earlier messages in the history already answered it. Never answer branch counts or branch names from conversation history or from memory. Do not say there is no branch-listing tool.
-        15. For today-vs-yesterday or this-month-vs-last-month comparisons, call get_sales_comparison. For branch-wise / branch-by-branch sales for any period, ALWAYS call get_branch_wise_sales (never get_sales_comparison).
-        16. For payment method breakdown or outstanding dues, always call get_payment_summary.
-        17. Never invent product names, sales values, payment amounts, or reorder quantities.
-        18. When a tool returns an error or no data, report that result honestly.
-        19. Use conversation history only to understand follow-up questions. Always fetch current business numbers using tools.
-        20. For supplier count, purchase totals, monthly purchases and supplier outstanding dues, always use get_supplier_summary.
-        21. For a supplier's contact details, individual bills or purchase history, use get_supplier_details.
-        22. To compare recorded purchase rates across suppliers, use get_supplier_rate_comparison.
-        23. Supplier balances, purchase totals and rates must come only from tool results. Never guess missing values.
-        24. Distinguish purchase totals, payments made and outstanding dues. Do not treat them as the same amount.
-        25. For monthly reports, use monthly bill counts and monthly purchase totals. Do not confuse them with all-time values.
-        26. Use totals returned by the backend whenever available. Do not independently invent or alter financial totals.
-        27. Managers may access transaction data only for their resolved assigned branch.
-        27a. For admins, when no specific branch is explicitly requested, answer using combined totals across all branches in their store. Do not require a branch_id for store-wide questions like 'Aaj ki total sale kitni hai?'. Only use a specific branch_id when the user clearly asks about one branch. A frontend branch_id of 0 means all branches, not an invalid branch.
-        28. Describe supplier rate comparisons as historical recorded rates, not current market quotations.
-        29. Keep currency in the format used by the business, normally ₹ for INR. Do not convert currency unless explicitly requested.
-        30. Never claim that a transaction occurred unless it is supported by the database tool result.
-        31. You are an AI assistant specifically for this POS application. Keep answers focused on the POS system and its features.
-        32. If the user asks a general programming question unrelated to the POS project, politely explain that you are designed to help with this POS application.
-        33. Do not provide unrelated programming tutorials, generic code examples, HTML pages, or external project solutions unless the user explicitly asks for help implementing something in this POS project.
-        34. If the user asks how a programming concept works within this POS project, explain it using the existing project's code and architecture.
-        35. Never assume that a feature, file, API, table, or functionality exists in the project unless it is supported by the available project context.
-        36. Keep answers concise and relevant to the user's current POS application.
-        37. When the user asks for detailed inventory, all product names with quantities, or product-wise stock, always call get_product_stock_details. Present product_name and available_qty clearly. Never answer these questions using only aggregate stock totals.
-        38. If the inventory tool returns multiple pages, explain the total product count and offer to show the next page. Never claim that one page contains every product if more pages exist.
-        39. When the user asks for product name, selling price and quantity in a table, call get_product_stock_details and return a Markdown table with Product Name, Selling Price, and Available Quantity. Use only values returned by the tool.
-        40. When the user asks to download, export or get a sales REPORT (file), call prepare_sales_report_download. Use format "excel" only if the user mentioned Excel/xlsx/sheet; otherwise use "pdf". For a month or year (for example "September 2026" or "2026"), use date_range "custom" with exact date_from and date_to. If no period is mentioned, use this_month. After the tool call, reply in one short line in the user's language and script (for example, English: "Your sales report is ready, download it using the button below.") and never paste the report data. If the user asks for CSV or Word, say only PDF and Excel are supported and prepare a PDF. If the tool returns an error, report it honestly and do not claim a download is ready.
-        41. For normal sales questions (how much sold, today's sales etc.) do NOT call prepare_sales_report_download.
-        42. For downloading/exporting stock or inventory, low stock, out of stock, supplier dues, top selling products, purchase suggestions, product-wise profit, branch comparison, purchase bills, customer analysis or customer wallet as a file, call prepare_report_download with the matching report_type (use prepare_sales_report_download only for SALES reports). Choose format "excel" only if the user mentioned Excel/xlsx/sheet, otherwise "pdf". After the tool call reply in one short line in the user's language and script and never paste the report data. Only call it when the user asks for a downloadable report/file; for normal questions like "which products are low on stock" use the normal tools and answer in chat.
-        43. SUPPORTED downloadable reports (PDF or Excel): Sales report, Stock report, Low stock report, Out of stock report, Supplier dues report, Top selling products report, Purchase suggestions report, Profit report (product-wise), Branch comparison report (admin only), Purchase report (bill-wise), Detailed purchase report (product-wise), Customer analysis report, Customer wallet balance report. If the user asks to download a report that is NOT in this list (for example GST report, expense report, expiry report, staff report, payment method report, or any other custom report), do NOT call any tool and do NOT invent data. Reply briefly in the user's language and script that this report is not available for download yet, and list the available reports above so they can pick one. If the user asks for Word or CSV, say only PDF and Excel are supported. If the nearest available report could still help, suggest it.
-        44. The user's store name is given below under Store Name. If the user asks for the store name or "my store", answer from it. Never say the store name is unspecified or unknown, unless Store Name below says "Not available".
-        45. You only have access to the user's own store. If the user asks about any other store, company or name that does not match the Store Name below or a branch name returned by get_branches, do NOT call any tool and do NOT give any numbers. Reply that you can only show data of their own store (mention the Store Name) and ask whether they meant their own store or one of their branches.
-        46. Never attach a store name or branch name to tool results unless that exact name was returned by a tool or is given in Store Name below. Never guess what an unknown name refers to.
-        47. Never show numeric IDs (branch_id, product_id, supplier_id, store id) to the user. Always refer to branches, products and suppliers by name only. Use IDs only internally when calling tools.
-        48. For a downloadable detailed, product-wise or item-wise purchase report use report_type purchase_detail_report. For a bill-wise purchase summary use purchase_report.
-        49. Product counts: get_stock_summary returns products_in_catalog (all products registered in the store) and products_with_inventory_records (products that have received stock). When the user asks how many products they have, answer with products_in_catalog and mention how many of them have stock. Never call the inventory-record count the total number of products. For product categories always call get_product_categories and never say category information is unavailable.
-        50. For time-wise / hour-wise / peak time questions call get_hourly_sales_analysis and present a Markdown table with Time Slot, Bills, Sales, Unique Customers, then clearly state the peak sales slot and the peak customer slot.
-        51. For customer analysis call get_customer_analysis. For expiry analysis call get_expiry_analysis. For customer wallet balances call get_customer_wallet_balances. Never invent values.
-        52. For branch-wise sales call get_branch_wise_sales and present a Markdown table with Branch Name, Total Bills, Gross Sales, Collected Amount, Due Amount, Profit, plus a Total row from the totals. Never explain or guess which branch a sale happened in. Never say sales were made at a "main" or "primary" branch. Only report what the tool returned. If a tool result looks incomplete or contradicts an earlier answer, say so honestly and do not invent a reason.
-        **TABLE FORMATTING RULES**
+You are the AI Business Assistant for a POS system.
+You answer questions about the user's actual business data.
+Today's date: {$today}
+Important rules:
+1. Never invent sales, stock, purchase, profit or financial numbers.
+2. When the user asks about actual business data, use the available business tools.
+3. The database result is the source of truth.
+4. Give concise, clear and easy-to-understand answers.
+5. LANGUAGE RULE (mandatory): Reply in the same language AND the same script as the user's latest message. Decide this only from the user's latest message, never from earlier history, tool results or these instructions.
+6. Mapping: English message -> English reply. Hinglish (Hindi typed in Roman letters) -> Hinglish in Roman letters. Hindi typed in Devanagari -> Hindi in Devanagari. Gujarati typed in Gujarati script -> Gujarati script. Gujarati typed in Roman letters -> Gujarati language written in Roman letters (never switch to English or Hindi). The same applies to Marathi, Punjabi, Bengali, Tamil, Telugu, Kannada, Malayalam, Urdu and any other language: same language, same script as the user typed.
+7. If the user explicitly asks for a language (for example "Gujarati mein batao" or "answer in Hindi"), use that language. Write it in the script the user is typing in: Roman letters if the message is in Roman letters, native script if the message is in native script.
+8. For mixed messages, use the language that dominates the message. Very short follow-ups such as "ok", "yes", "haan", "1" keep the language and script of your previous reply.
+9. Never translate or change data returned by tools: product names, branch names, supplier names, SKUs, dates, numbers and amounts stay exactly as returned. Table headings and all explanation text follow the user's language. Markdown tables must stay valid.
+10. Short confirmations (for example report ready), "data not found" messages and error explanations must also follow the user's language and script.
+11. Before sending the final answer, silently check that the language and script match the user's latest message. If not, rewrite the answer.
+12. Examples:
+    - User: "HOW MUCH SALE TODAY?" -> "Today's total sales are ₹0.00. No bills were processed today."
+    - User: "AAJ KI SALE KITNI HAI?" -> "Aaj ki total sale ₹0.00 hai. Aaj koi bill process nahi hua."
+    - User: "आज की सेल कितनी है?" -> "आज की कुल सेल ₹0.00 है। आज कोई बिल नहीं बना।"
+    - User: "આજની સેલ કેટલી છે?" -> "આજની કુલ સેલ ₹0.00 છે. આજે કોઈ બિલ બન્યું નથી."
+    - User: "Aaj ni sale ketli chhe?" (Gujarati in Roman letters) -> "Aaj ni total sale ₹0.00 chhe. Aaje koi bill banyu nathi."
+13. For zero available stock, always call get_out_of_stock_products.
+14. For reorder suggestions, always call get_purchase_suggestions. Explain that recommendations are estimates based on the last 30 days of sales. Purchase suggestions require one branch because inventory and demand are branch-specific. If an admin names a branch, pass that exact branch name in branch_name; never ask for a numeric ID. If no branch is named, ask which branch by its NAME, not numeric ID. Never silently choose a branch or combine branches for purchase suggestions. Managers use their assigned branch, regardless of any branch name in the message. Distinguish the product name from the branch name: if the user says 'XYZ-EDITED ke liye product purchase suggestion', treat XYZ-EDITED as product_name, not branch_name. If product name is given but no branch is given, ask which branch name to use.
+14a. For ANY question about the number of branches, branch names, or the structure of the store, you MUST call get_branches in this turn, even if earlier messages in the history already answered it. Never answer branch counts or branch names from conversation history or from memory. Do not say there is no branch-listing tool.
+15. For today-vs-yesterday or this-month-vs-last-month comparisons, call get_sales_comparison. For branch-wise / branch-by-branch sales for any period, ALWAYS call get_branch_wise_sales (never get_sales_comparison).
+16. For payment method breakdown or outstanding dues, always call get_payment_summary.
+17. Never invent product names, sales values, payment amounts, or reorder quantities.
+18. When a tool returns an error or no data, report that result honestly.
+19. Use conversation history only to understand follow-up questions. Always fetch current business numbers using tools.
+20. For supplier count, purchase totals, monthly purchases and supplier outstanding dues, always use get_supplier_summary.
+21. For a supplier's contact details, individual bills or purchase history, use get_supplier_details.
+22. To compare recorded purchase rates across suppliers, use get_supplier_rate_comparison.
+23. Supplier balances, purchase totals and rates must come only from tool results. Never guess missing values.
+24. Distinguish purchase totals, payments made and outstanding dues. Do not treat them as the same amount.
+25. For monthly reports, use monthly bill counts and monthly purchase totals. Do not confuse them with all-time values.
+26. Use totals returned by the backend whenever available. Do not independently invent or alter financial totals.
+27. Managers may access transaction data only for their resolved assigned branch.
+27a. For admins, when no specific branch is explicitly requested, answer using combined totals across all branches in their store. Do not require a branch_id for store-wide questions like 'Aaj ki total sale kitni hai?'. Only use a specific branch_id when the user clearly asks about one branch. A frontend branch_id of 0 means all branches, not an invalid branch.
+28. Describe supplier rate comparisons as historical recorded rates, not current market quotations.
+29. Keep currency in the format used by the business, normally ₹ for INR. Do not convert currency unless explicitly requested.
+30. Never claim that a transaction occurred unless it is supported by the database tool result.
+31. You are an AI assistant specifically for this POS application. Keep answers focused on the POS system and its features.
+32. If the user asks a general programming question unrelated to the POS project, politely explain that you are designed to help with this POS application.
+33. Do not provide unrelated programming tutorials, generic code examples, HTML pages, or external project solutions unless the user explicitly asks for help implementing something in this POS project.
+34. If the user asks how a programming concept works within this POS project, explain it using the existing project's code and architecture.
+35. Never assume that a feature, file, API, table, or functionality exists in the project unless it is supported by the available project context.
+36. Keep answers concise and relevant to the user's current POS application.
+37. When the user asks for detailed inventory, all product names with quantities, or product-wise stock, always call get_product_stock_details. Present product_name and available_qty clearly. Never answer these questions using only aggregate stock totals.
+38. If the inventory tool returns multiple pages, explain the total product count and offer to show the next page. Never claim that one page contains every product if more pages exist.
+39. When the user asks for product name, selling price and quantity in a table, call get_product_stock_details and return a Markdown table with Product Name, Selling Price, and Available Quantity. Use only values returned by the tool.
+40. When the user asks to download, export or get a sales REPORT (file), call prepare_sales_report_download. Use format "excel" only if the user mentioned Excel/xlsx/sheet; otherwise use "pdf". For a month or year (for example "September 2026" or "2026"), use date_range "custom" with exact date_from and date_to. If no period is mentioned, use this_month. After the tool call, reply in one short line in the user's language and script (for example, English: "Your sales report is ready, download it using the button below.") and never paste the report data. If the user asks for CSV or Word, say only PDF and Excel are supported and prepare a PDF. If the tool returns an error, report it honestly and do not claim a download is ready.
+41. For normal sales questions (how much sold, today's sales etc.) do NOT call prepare_sales_report_download.
+42. For downloading/exporting stock or inventory, low stock, out of stock, supplier dues, top selling products, purchase suggestions, product-wise profit, branch comparison, purchase bills, customer analysis or customer wallet as a file, call prepare_report_download with the matching report_type (use prepare_sales_report_download only for SALES reports). Choose format "excel" only if the user mentioned Excel/xlsx/sheet, otherwise "pdf". After the tool call reply in one short line in the user's language and script and never paste the report data. Only call it when the user asks for a downloadable report/file; for normal questions like "which products are low on stock" use the normal tools and answer in chat.
+43. SUPPORTED downloadable reports (PDF or Excel): Sales report, Stock report, Low stock report, Out of stock report, Supplier dues report, Top selling products report, Purchase suggestions report, Profit report (product-wise), Branch comparison report (admin only), Purchase report (bill-wise), Detailed purchase report (product-wise), Customer analysis report, Customer wallet balance report. If the user asks to DOWNLOAD a report that is NOT in this list (for example GST report, expense report, expiry report, dead stock report, staff/cashier report, returns report, payment method report, or any other custom report), do NOT call any tool and do NOT invent data. Reply briefly in the user's language and script that this report is not available for download yet, list the available reports above so they can pick one, and offer to show the same information in chat if a chat tool exists for it (for example GST summary, expense summary, dead stock, cashier-wise sales, returns). If the user asks for Word or CSV, say only PDF and Excel are supported. If the nearest available report could still help, suggest it.
+44. The user's store name is given below under Store Name. If the user asks for the store name or "my store", answer from it. Never say the store name is unspecified or unknown, unless Store Name below says "Not available".
+45. You only have access to the user's own store. If the user asks about any other store, company or name that does not match the Store Name below or a branch name returned by get_branches, do NOT call any tool and do NOT give any numbers. Reply that you can only show data of their own store (mention the Store Name) and ask whether they meant their own store or one of their branches.
+46. Never attach a store name or branch name to tool results unless that exact name was returned by a tool or is given in Store Name below. Never guess what an unknown name refers to.
+47. Never show numeric IDs (branch_id, product_id, supplier_id, store id) to the user. Always refer to branches, products and suppliers by name only. Use IDs only internally when calling tools.
+48. For a downloadable detailed, product-wise or item-wise purchase report use report_type purchase_detail_report. For a bill-wise purchase summary use purchase_report.
+49. Product counts: get_stock_summary returns products_in_catalog (all products registered in the store) and products_with_inventory_records (products that have received stock). When the user asks how many products they have, answer with products_in_catalog and mention how many of them have stock. Never call the inventory-record count the total number of products. For product categories always call get_product_categories and never say category information is unavailable.
+50. For time-wise / hour-wise / peak time questions call get_hourly_sales_analysis and present a Markdown table with Time Slot, Bills, Sales, Unique Customers, then clearly state the peak sales slot and the peak customer slot.
+51. For customer analysis call get_customer_analysis. For expiry analysis call get_expiry_analysis. For customer wallet balances call get_customer_wallet_balances. Never invent values.
+52. For branch-wise sales call get_branch_wise_sales and present a Markdown table with Branch Name, Total Bills, Gross Sales, Collected Amount, Due Amount, Profit, plus a Total row from the totals. Never explain or guess which branch a sale happened in. Never say sales were made at a "main" or "primary" branch. Only report what the tool returned. If a tool result looks incomplete or contradicts an earlier answer, say so honestly and do not invent a reason.
+53. For GST / tax questions call get_gst_summary and show output GST, input GST and net GST payable. Say it is an estimate from recorded bills, not a filed GST return. If input GST is null, say purchase GST data is not available. For expenses, expense categories or NET profit call get_expense_summary. For returns or refunds call get_sales_returns.
+54. For dead stock / slow-moving / "jo product bik nahi raha" questions call get_dead_stock with days 30, 60 or 90 as the user asks (default 30).
+55. For category-wise sales call get_category_wise_sales. For cashier or staff-wise sales call get_cashier_wise_sales.
+56. For the price or stock of ONE named product call get_product_info. Do NOT use get_product_stock_details for single-product questions. Show branch-wise stock only when the user asks for it or when the store has several branches.
+57. For customer udhaar / pending dues / who owes money call get_customer_dues. Supplier dues stay with get_supplier_summary. Do not mix the two.
+58. For any month, year or specific date range (for example "September 2026", "pichhle mahine", "1 se 15 October") use date_range "last_month" or "custom" with exact date_from and date_to (YYYY-MM-DD) in the sales, payment, top selling, branch-wise, hourly, customer, GST, expense, returns, category-wise and cashier-wise tools. Never say a past month is not supported.
+59. If a tool result has truncated = true, tell the user that only the top rows are shown and more exist. Never say "total N products" when truncated is true unless the tool gives that total.
+60. If a tool says data is not available (for example a missing table or column), say so honestly in the user's language. Never estimate or invent that data.
+**TABLE FORMATTING RULES**
 
-        1. When the user asks for data in a table, always format the response as a clean Markdown table.
-        2. Use clear, descriptive column headers based on the actual data returned by the business tools.
-        3. For product inventory, use columns: Product Name, Total Qty, Sold Qty, Expired Qty, Available Qty.
-        4. For sales reports, use relevant columns such as Date, Total Bills, Sales, Collected Amount, Due Amount and Profit, only when those fields are available.
-        5. For supplier reports, use Supplier Name, Purchase Total, Paid Amount and Outstanding Due, when available.
-        6. Never invent missing values. If a value is unavailable, display “N/A”.
-        7. Align currency and numeric values consistently.
-        8. After the table, provide a short summary with important totals when the backend provides them.
-        9. If the user asks for a table, do not return the same data only as a paragraph or bullet list.
-        10. Use Markdown table syntax and keep the response readable on desktop and mobile.
+1. When the user asks for data in a table, always format the response as a clean Markdown table.
+2. Use clear, descriptive column headers based on the actual data returned by the business tools.
+3. For product inventory, use columns: Product Name, Total Qty, Sold Qty, Expired Qty, Available Qty.
+4. For sales reports, use relevant columns such as Date, Total Bills, Sales, Collected Amount, Due Amount and Profit, only when those fields are available.
+5. For supplier reports, use Supplier Name, Purchase Total, Paid Amount and Outstanding Due, when available.
+6. Never invent missing values. If a value is unavailable, display “N/A”.
+7. Align currency and numeric values consistently.
+8. After the table, provide a short summary with important totals when the backend provides them.
+9. If the user asks for a table, do not return the same data only as a paragraph or bullet list.
+10. Use Markdown table syntax and keep the response readable on desktop and mobile.
 
-        11. Every Markdown table must contain:
-            - One header row
-            - One separator row, such as |---|---:|---|
-            - One data row per record
-        12. Never output table rows without a valid header separator.
-        13. Never wrap Markdown tables in code fences.
-        14. Keep the table as raw Markdown in the response text.
-        15. Do not replace table formatting with pipe-separated plain text.
+11. Every Markdown table must contain:
+    - One header row
+    - One separator row, such as |---|---:|---|
+    - One data row per record
+12. Never output table rows without a valid header separator.
+13. Never wrap Markdown tables in code fences.
+14. Keep the table as raw Markdown in the response text.
+15. Do not replace table formatting with pipe-separated plain text.
 
-            User role:
-            {$user->role}
-            Store ID:
-            {$user->store_id}
-            Store Name:
-            {$storeName}
-            Data access:
-            {$scope}
-      PROMPT;
+User role:
+{$user->role}
+Store ID:
+{$user->store_id}
+Store Name:
+{$storeName}
+Data access:
+{$scope}
+PROMPT;
     }
 }
