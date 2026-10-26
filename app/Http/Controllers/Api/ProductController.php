@@ -60,7 +60,7 @@ class ProductController extends Controller
             'total_stock' => Inventory::selectRaw('COALESCE(SUM(qty - sold_qty), 0)')
                 ->whereColumn('inventories.product_id', 'products.id')
                 ->whereNull('inventories.deleted_at')
-                ->when($branchId, fn($q) => $q->where('inventories.branch_id', $branchId))
+                ->when($branchId, fn ($q) => $q->where('inventories.branch_id', $branchId))
                 ->whereColumn('inventories.sold_qty', '<', 'inventories.qty')
                 ->where(function ($q) {
                     $q->whereNull('inventories.expiry_date')
@@ -98,7 +98,7 @@ class ProductController extends Controller
         if ($user->role === 'admin') {
             $storeBranchIds = Branch::where('store_id', $storeId)
                 ->pluck('id')
-                ->map(fn($id) => (int) $id)
+                ->map(fn ($id) => (int) $id)
                 ->toArray();
 
             if ($request->filled('branch_id')) {
@@ -121,26 +121,41 @@ class ProductController extends Controller
                 $q->where('brand_id', $request->brand_id);
             })
             ->when($request->search, function ($q) use ($request) {
-                $q->where('name', 'like', '%' . $request->search . '%');
+                $q->where('name', 'like', '%'.$request->search.'%');
             })
             ->with(['store', 'brand', 'category', 'gstRate'])
             ->with(['inventories' => function ($q) use ($branchIds) {
                 $q->whereIn('branch_id', $branchIds)
-                    ->whereColumn('sold_qty', '<', 'qty')
+                    ->whereRaw(
+                        '(qty - sold_qty - COALESCE(expired_qty, 0)) > 0'
+                    )
                     ->where(function ($q2) {
                         $q2->whereNull('expiry_date')
-                            ->orWhere('expiry_date', '>=', now()->toDateString());
+                            ->orWhereDate(
+                                'expiry_date',
+                                '>=',
+                                now()->toDateString()
+                            );
                     })
-                    ->orderBy('expiry_date', 'asc');
+                    ->orderBy('expiry_date', 'asc')
+                    ->orderBy('id', 'asc');
             }])
             ->addSelect([
-                'total_stock' => Inventory::selectRaw('COALESCE(SUM(qty - sold_qty), 0)')
+                'total_stock' => Inventory::selectRaw(
+                    'COALESCE(SUM(qty - sold_qty - COALESCE(expired_qty, 0)), 0)'
+                )
                     ->whereColumn('inventories.product_id', 'products.id')
                     ->whereIn('inventories.branch_id', $branchIds)
-                    ->whereColumn('inventories.sold_qty', '<', 'inventories.qty')
+                    ->whereRaw(
+                        '(qty - sold_qty - COALESCE(expired_qty, 0)) > 0'
+                    )
                     ->where(function ($q) {
                         $q->whereNull('inventories.expiry_date')
-                            ->orWhere('inventories.expiry_date', '>=', now()->toDateString());
+                            ->orWhereDate(
+                                'inventories.expiry_date',
+                                '>=',
+                                now()->toDateString()
+                            );
                     }),
             ])
             ->addSelect([
@@ -168,39 +183,111 @@ class ProductController extends Controller
         }
 
         $products = $products->map(function ($product) {
-            $groupedBatches = $product->inventories->groupBy('batch_no');
+
+            // Same batch + same selling price = one selectable POS option.
+            $groupedBatches = $product->inventories->groupBy(
+                function ($inv) {
+                    return $inv->batch_no.'|'
+                        .number_format(
+                            (float) $inv->selling_price,
+                            2,
+                            '.',
+                            ''
+                        );
+                }
+            );
 
             $batches = $groupedBatches->map(function ($invGroup) {
-                $first = $invGroup->first();
 
-                $totalQty = $invGroup->sum('qty');
-                $totalSoldQty = $invGroup->sum('sold_qty');
-                $totalFree = $invGroup->sum('free');
+                // Ignore records without sellable stock.
+                $eligibleRows = $invGroup->filter(function ($inv) {
+                    $available = (float) $inv->qty
+                        - (float) $inv->sold_qty
+                        - (float) ($inv->expired_qty ?? 0);
+
+                    return $available > 0;
+                });
+
+                if ($eligibleRows->isEmpty()) {
+                    return null;
+                }
+
+                // This ID must identify a real, sellable inventory row.
+                $first = $eligibleRows->first();
+
+                $totalQty = $eligibleRows->sum(
+                    fn ($inv) => (float) $inv->qty
+                );
+
+                $totalSoldQty = $eligibleRows->sum(
+                    fn ($inv) => (float) $inv->sold_qty
+                );
+
+                $totalExpiredQty = $eligibleRows->sum(
+                    fn ($inv) => (float) ($inv->expired_qty ?? 0)
+                );
+
+                $totalFree = $eligibleRows->sum(
+                    fn ($inv) => (float) $inv->free
+                );
+
+                $availableQty = $eligibleRows->sum(
+                    fn ($inv) => max(
+                        0,
+                        (float) $inv->qty
+                            - (float) $inv->sold_qty
+                            - (float) ($inv->expired_qty ?? 0)
+                    )
+                );
 
                 return [
+                    // Use this ID when adding the option to the cart.
                     'id' => $first->id,
+
+                    'product_id' => $first->product_id,
+                    'branch_id' => $first->branch_id,
                     'batch_no' => $first->batch_no,
-                    'mrp' => $first->mrp,
-                    'cost_price' => $first->cost_price,
-                    'selling_price' => $first->selling_price,
+
+                    'mrp' => (float) $first->mrp,
+                    'cost_price' => (float) $first->cost_price,
+                    'selling_price' => (float) $first->selling_price,
+
                     'qty' => $totalQty,
                     'sold_qty' => $totalSoldQty,
+                    'expired_qty' => $totalExpiredQty,
                     'free' => $totalFree,
-                    'qty_available' => $totalQty - $totalSoldQty, // Total available stock
+                    'qty_available' => $availableQty,
+
                     'expiry_date' => $first->expiry_date,
                     'is_opening' => $first->is_opening,
-                    'batch_barcode' => $first->batch_barcode,
-                ];
-            })->values();
 
-            $prices = $batches->pluck('selling_price')->filter(fn($p) => ! is_null($p));
+                    // Preserve barcode-level details.
+                    'batch_barcode' => $first->batch_barcode,
+                    'inventory_ids' => $eligibleRows->pluck('id')->values(),
+                    'batch_barcodes' => $eligibleRows
+                        ->pluck('batch_barcode')
+                        ->unique()
+                        ->values(),
+                ];
+            })
+                ->filter()
+                ->values();
+
+            $prices = $batches
+                ->pluck('selling_price')
+                ->filter(fn ($price) => $price !== null);
 
             $data = $product->toArray();
+
             $data['min_price'] = $prices->min();
             $data['max_price'] = $prices->max();
-            $data['has_multiple_prices'] = $prices->unique()->count() > 1;
+
+            $data['has_multiple_prices'] =
+                $prices->unique()->count() > 1;
+
             $data['batch_count'] = $batches->count();
             $data['batches'] = $batches;
+
             unset($data['inventories']);
 
             return $data;
@@ -245,7 +332,7 @@ class ProductController extends Controller
         $checkDigit = (10 - ($sum % 10)) % 10;
 
         // Final barcode
-        return $base . $checkDigit;
+        return $base.$checkDigit;
     }
 
     public function store(Request $request)
@@ -322,7 +409,7 @@ class ProductController extends Controller
             $request->validate([
                 'name' => 'required|string',
                 'is_price_override' => 'nullable|boolean',
-                'barcode' => 'nullable|string|unique:products,barcode,' . $id,
+                'barcode' => 'nullable|string|unique:products,barcode,'.$id,
                 'sale_type' => 'nullable|in:unit,weight',
                 'plu_code' => 'nullable|digits_between:1,5|required_if:sale_type,weight',
                 'price_per_kg' => 'nullable|numeric|min:0|required_if:sale_type,weight',
@@ -452,44 +539,6 @@ class ProductController extends Controller
             ], 500);
         }
     }
-
-    // public function destroy($id)
-    // {
-    //     try {
-    //         $user = Auth::user();
-
-    //         if (! in_array($user->role, ['admin', 'manager'])) {
-    //             return response()->json([
-    //                 'status' => false,
-    //                 'message' => 'Unauthorized',
-    //             ], 403);
-    //         }
-
-    //         $storeId = Auth::user()->store_id;
-
-    //         $product = Product::where('store_id', $storeId)->where('id', $id)->first();
-
-    //         if (! $product) {
-    //             return response()->json([
-    //                 'status' => false,
-    //                 'message' => 'Product not found',
-    //             ], 404);
-    //         }
-
-    //         $product->delete();
-
-    //         return response()->json([
-    //             'status' => true,
-    //             'message' => 'Product deleted successfully',
-    //         ], 200);
-    //     } catch (\Exception $e) {
-    //         return response()->json([
-    //             'status' => false,
-    //             'message' => 'An error occurred while deleting the product.',
-    //             'error' => $e->getMessage(),
-    //         ], 500);
-    //     }
-    // }
 
     public function destroy($id)
     {
@@ -712,7 +761,7 @@ class ProductController extends Controller
         }
 
         $query = Inventory::with([
-            'product' => fn($q) => $q->withTrashed()->select('id', 'name'),
+            'product' => fn ($q) => $q->withTrashed()->select('id', 'name'),
             'branch:id,name',
         ])
             ->whereIn('branch_id', $branchIds)
@@ -797,15 +846,6 @@ class ProductController extends Controller
         );
     }
 
-    /**
-     * Paste these TWO methods over the existing importExcel() and normalizeImportRow()
-     * in app/Http/Controllers/Api/ProductController.php.
-     *
-     * Change: mrp / selling_price are NOT imported any more (the products table does
-     * not have them; those prices live on inventories/batches). cost_price IS imported.
-     * Old Excel files that still contain mrp / selling_price columns still work:
-     * the extra columns are simply ignored.
-     */
     public function importExcel(Request $request)
     {
         $user = Auth::user();
@@ -839,7 +879,7 @@ class ProductController extends Controller
                 $raw = $row->toArray();
 
                 if (collect($raw)->every(
-                    fn($value) => $value === null || trim((string) $value) === ''
+                    fn ($value) => $value === null || trim((string) $value) === ''
                 )) {
                     continue;
                 }
@@ -868,7 +908,7 @@ class ProductController extends Controller
             if (count($items) > self::IMPORT_MAX_ROWS) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Too many rows. Please import at most ' . self::IMPORT_MAX_ROWS . ' products at a time.',
+                    'message' => 'Too many rows. Please import at most '.self::IMPORT_MAX_ROWS.' products at a time.',
                 ], 422);
             }
 
@@ -878,13 +918,13 @@ class ProductController extends Controller
 
             // Brands / categories of this store, so each name is looked up only once.
             $brandIds = Brand::where('store_id', $storeId)->get(['id', 'name'])
-                ->mapWithKeys(fn($b) => [mb_strtolower($b->name) => $b->id])->all();
+                ->mapWithKeys(fn ($b) => [mb_strtolower($b->name) => $b->id])->all();
             $categoryIds = Category::where('store_id', $storeId)->get(['id', 'name'])
-                ->mapWithKeys(fn($c) => [mb_strtolower($c->name) => $c->id])->all();
+                ->mapWithKeys(fn ($c) => [mb_strtolower($c->name) => $c->id])->all();
 
             // Valid GST rate ids (small table). Unknown ids are left blank instead of failing the row.
             $validGstRateIds = DB::table('gst_rates')->pluck('id')
-                ->mapWithKeys(fn($id) => [(string) $id => true])->all();
+                ->mapWithKeys(fn ($id) => [(string) $id => true])->all();
 
             // cost_price is saved only if the products table really has that column
             $hasCostPrice = \Illuminate\Support\Facades\Schema::hasColumn('products', 'cost_price');
@@ -953,12 +993,12 @@ class ProductController extends Controller
                 // SKU / barcode are globally unique in the database.
                 if ($data['sku'] !== '') {
                     if (isset($existingSkus[$skuKey])) {
-                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['SKU already exists: ' . $data['sku']]];
+                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['SKU already exists: '.$data['sku']]];
 
                         continue;
                     }
                     if (isset($seenSkus[$skuKey])) {
-                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Duplicate SKU in this file: ' . $data['sku']]];
+                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Duplicate SKU in this file: '.$data['sku']]];
 
                         continue;
                     }
@@ -966,12 +1006,12 @@ class ProductController extends Controller
 
                 if ($data['barcode'] !== '') {
                     if (isset($existingBarcodes[$barcodeKey])) {
-                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Barcode already exists: ' . $data['barcode']]];
+                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Barcode already exists: '.$data['barcode']]];
 
                         continue;
                     }
                     if (isset($seenBarcodes[$barcodeKey])) {
-                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Duplicate barcode in this file: ' . $data['barcode']]];
+                        $errors[] = ['row' => $rowNumber, 'name' => $data['name'], 'errors' => ['Duplicate barcode in this file: '.$data['barcode']]];
 
                         continue;
                     }
@@ -1061,11 +1101,6 @@ class ProductController extends Controller
         }
     }
 
-    /**
-     * Excel gives numbers as int/float (barcode 8901234567890 -> float), which would
-     * fail the "string" validation rules. Convert every cell to clean text / numbers first.
-     */
-
     private function normalizeImportRow(array $raw): array
     {
         return [
@@ -1087,17 +1122,6 @@ class ProductController extends Controller
             'price_per_kg' => $this->importNumber($raw['price_per_kg'] ?? null),
         ];
     }
-
-    /**
-     * Excel gives numbers as int/float (barcode 8901234567890 -> float), which would
-     * fail the "string" validation rules. Convert every cell to clean text / numbers first.
-     */
-
-    /**
-     * Excel gives numbers as int/float (barcode 8901234567890 -> float), which would
-     * fail the "string" validation rules. Convert every cell to clean text / numbers first.
-     */
-
 
     private function importText($value): string
     {
@@ -1141,7 +1165,7 @@ class ProductController extends Controller
     /** Which of these SKUs/barcodes already exist in the products table? (lowercased lookup map) */
     private function existingImportValues(string $column, array $values): array
     {
-        $values = array_values(array_unique(array_filter($values, fn($v) => $v !== '' && $v !== null)));
+        $values = array_values(array_unique(array_filter($values, fn ($v) => $v !== '' && $v !== null)));
         $found = [];
 
         foreach (array_chunk($values, 500) as $chunk) {

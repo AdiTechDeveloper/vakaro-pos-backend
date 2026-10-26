@@ -13,11 +13,13 @@ use App\Models\Product;
 use App\Models\SalesBill;
 use App\Models\SalesBillLine;
 use App\Models\SalesBillPayment;
+use App\Models\Store;
 use App\Services\WeightBarcodeService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\Rule;
 use Milon\Barcode\Facades\DNS1DFacade as DNS1D;
 
@@ -168,26 +170,31 @@ class SalesBillController extends Controller
 
         $batchesRaw = Inventory::where('product_id', $product->id)
             ->whereIn('branch_id', $branchIds)
+            ->whereNull('deleted_at')
             ->orderByRaw('expiry_date IS NULL, expiry_date ASC')
             ->get();
 
         $batches = $batchesRaw->filter(function ($b) use ($today) {
-            $stock = $b->qty - $b->sold_qty - $b->expired_qty;
+            $stock = (float) $b->qty - (float) $b->sold_qty - (float) ($b->expired_qty ?? 0);
             $notExpired = ! $b->expiry_date || $b->expiry_date >= $today;
 
             return $stock > 0 && $notExpired;
-        })->map(function ($b) {
-            return [
-                'inventory_id' => $b->id,
-                'batch_no' => $b->batch_no,
-                'batch_barcode' => $b->batch_barcode,
-                'mrp' => $b->mrp,
-                'selling_price' => $b->selling_price,
-                'cost_price' => $b->cost_price,
-                'expiry_date' => $b->expiry_date,
-                'total_stock' => $b->qty - $b->sold_qty - $b->expired_qty,
-            ];
-        })->values();
+        })
+            ->groupBy(fn ($b) => $b->batch_no.'|'.number_format((float) $b->selling_price, 2, '.', ''))
+            ->map(function ($g) {
+                $first = $g->first();
+
+                return [
+                    'inventory_id' => $first->id,
+                    'batch_no' => $first->batch_no,
+                    'batch_barcode' => $first->batch_barcode,
+                    'mrp' => $first->mrp,
+                    'selling_price' => $first->selling_price,
+                    'cost_price' => $first->cost_price,
+                    'expiry_date' => $first->expiry_date,
+                    'total_stock' => $g->sum(fn ($b) => (float) $b->qty - (float) $b->sold_qty - (float) ($b->expired_qty ?? 0)),
+                ];
+            })->values();
 
         if ($batches->isEmpty()) {
             $hasExpiredOnly = $batchesRaw->isNotEmpty();
@@ -239,6 +246,14 @@ class SalesBillController extends Controller
                 $query->whereIn('branch_id', $branchIds);
             } elseif ($user->role === 'admin' && $request->filled('branch_id')) {
                 $query->where('branch_id', (int) $request->query('branch_id'));
+            }
+
+            if ($request->filled('search')) {
+                $term = trim($request->query('search'));
+                $query->where('bill_no', 'like', '%'.$term.'%');
+                $query->limit(100);
+            } elseif ($request->filled('selected_date') || $request->filled('date')) {
+                $query->whereDate('created_at', $request->query('selected_date', $request->query('date')));
             }
 
             if ($request->has('limit')) {
@@ -309,13 +324,23 @@ class SalesBillController extends Controller
     public function store(Request $request)
     {
         $idempotencyKey = $request->header('Idempotency-Key');
+        $user = Auth::user();
 
         if (! $idempotencyKey) {
-            return response()->json(['error' => 'Missing Idempotency Key'], 400);
+            return response()->json([
+                'error' => 'Missing Idempotency Key',
+            ], 400);
         }
 
-        // Prevent duplicate bill creation
-        $existing = SalesBill::where('last_idempotency_key_store', $idempotencyKey)->first();
+        // Fast path for retries; the locked check below handles concurrent requests.
+        $existing = SalesBill::where(
+            'store_id',
+            $user->store_id
+        )->where(
+            'last_idempotency_key_store',
+            $idempotencyKey
+        )->first();
+
         if ($existing) {
             return response()->json([
                 'success' => true,
@@ -335,6 +360,7 @@ class SalesBillController extends Controller
             'customer.name' => 'nullable|string|max:255',
             'customer.mobile' => 'required|string|max:15',
             'branch_id' => 'nullable|integer',
+
             'payment_type' => 'required|in:cash,online,split,credit,wallet',
             'cash_received' => 'nullable|numeric|min:0',
             'online_received' => 'nullable|numeric|min:0',
@@ -349,18 +375,46 @@ class SalesBillController extends Controller
         try {
             DB::beginTransaction();
 
-            $user = Auth::user();
-            $branchId = $this->resolveCustomerBranchId($request->branch_id, $user);
+            // Serialize bill creation per store without adding a sequence table.
+            $store = Store::whereKey($user->store_id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
+            $existing = SalesBill::where('store_id', $user->store_id)
+                ->where('last_idempotency_key_store', $idempotencyKey)
+                ->first();
+
+            if ($existing) {
+                DB::commit();
+
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Duplicate Store Request Ignored',
+                    'data' => $existing,
+                ], 200);
+            }
+
+            $branchId = $this->resolveCustomerBranchId(
+                $request->branch_id,
+                $user
+            );
 
             if (! $branchId) {
+                DB::rollBack();
+
                 return response()->json([
                     'status' => false,
                     'message' => 'User has no branch assigned.',
                 ], 400);
             }
 
+            $branch = Branch::where('id', $branchId)
+                ->where('store_id', $user->store_id)
+                ->firstOrFail();
+
             $billDate = $request->filled('selected_date')
-                ? Carbon::parse($request->input('selected_date'))->setTimeFrom(now())
+                ? Carbon::parse($request->input('selected_date'))
+                    ->setTimeFrom(now())
                 : now();
 
             $datePrefix = $billDate->format('ymd');
@@ -370,13 +424,19 @@ class SalesBillController extends Controller
                 ->whereDate('created_at', $billDate->toDateString())
                 ->count();
 
-            $sequence = str_pad($todayCount + 1, 4, '0', STR_PAD_LEFT);
+            $sequence = str_pad(
+                $todayCount + 1,
+                4,
+                '0',
+                STR_PAD_LEFT
+            );
 
             $storePad = str_pad($user->store_id, 2, '0', STR_PAD_LEFT);
             $branchPad = str_pad($branchId, 2, '0', STR_PAD_LEFT);
             $userPad = str_pad($user->id, 2, '0', STR_PAD_LEFT);
 
-            $billNo = $storePad.$branchPad.$userPad.$datePrefix.$sequence;
+            $billNo = $storePad.$branchPad.$userPad
+                .$datePrefix.$sequence;
 
             // Create Sales Bill Record
             $bill = SalesBill::create([
@@ -401,61 +461,106 @@ class SalesBillController extends Controller
             $processedProducts = [];
 
             foreach ($request->lines as $lineData) {
-                $product = Product::with('gstRate')->findOrFail($lineData['product_id']);
+                $product = Product::with('gstRate')
+                    ->findOrFail($lineData['product_id']);
 
-                // Get specific batch info from inventory table
-                $selectedInventory = Inventory::where('id', $lineData['inventory_id'])
+                // Validate the selected inventory belongs to
+                // the requested product and current branch.
+                $selectedInventory = Inventory::where(
+                    'id',
+                    $lineData['inventory_id']
+                )
+                    ->where('product_id', $product->id)
                     ->where('branch_id', $branchId)
+                    ->lockForUpdate()
                     ->firstOrFail();
 
-                $batchBarcode = $selectedInventory->batch_barcode;
                 $inventoryPrice = (float) $selectedInventory->selling_price;
+
                 $isOverridden = ! empty($lineData['is_price_overridden']) && $lineData['is_price_overridden'] == true;
-                $price = $isOverridden && isset($lineData['selling_price'])
+
+                $price = $isOverridden
+                    && isset($lineData['selling_price'])
                     ? (float) $lineData['selling_price']
                     : $inventoryPrice;
 
-                $originalPrice = (float) ($lineData['original_price'] ?? $inventoryPrice);
+                $originalPrice = (float) (
+                    $lineData['original_price'] ?? $inventoryPrice
+                );
+
                 $overridePrice = $isOverridden ? $price : null;
                 $mrp = (float) $selectedInventory->mrp;
-
-                if ($selectedInventory->qty <= $selectedInventory->sold_qty) {
-                    throw new \Exception('Stock already exhausted for this batch.');
-                }
-
-                if ($price <= 0) {
-                    throw new \Exception("Invalid selling price for {$product->name} in this batch.");
-                }
-
                 $requiredQty = (float) $lineData['qty'];
 
+                if ($price <= 0) {
+                    throw new \Exception(
+                        "Invalid selling price for {$product->name}."
+                    );
+                }
+
+                $batchNo = $selectedInventory->batch_no;
+                $selectedSellingPrice = $selectedInventory->selling_price;
+
                 $batchRows = Inventory::where('product_id', $product->id)
-                    ->where('batch_barcode', $batchBarcode)
                     ->where('branch_id', $branchId)
-                    ->whereColumn('sold_qty', '<', 'qty')
+                    ->where('batch_no', $batchNo)
+                    ->where('selling_price', $selectedSellingPrice)
+                    ->whereNull('deleted_at')
+                    ->whereRaw(
+                        '(qty - sold_qty - COALESCE(expired_qty, 0)) > 0'
+                    )
                     ->where(function ($q) use ($billDate) {
                         $q->whereNull('expiry_date')
-                            ->orWhere('expiry_date', '>=', $billDate);
+                            ->orWhereDate(
+                                'expiry_date',
+                                '>=',
+                                $billDate->toDateString()
+                            );
                     })
-                    ->orderBy('free', 'asc')
+                    // FEFO: earliest expiry first
+                    ->orderByRaw(
+                        'CASE WHEN expiry_date IS NULL THEN 1 ELSE 0 END'
+                    )
+                    ->orderBy('expiry_date', 'asc')
+                    ->orderBy('id', 'asc')
                     ->lockForUpdate()
                     ->get();
 
-                $availableStock = $batchRows->sum(fn ($inv) => $inv->qty - $inv->sold_qty);
+                $availableStock = $batchRows->sum(function ($inv) {
+                    return max(
+                        0,
+                        (float) $inv->qty
+                            - (float) $inv->sold_qty
+                            - (float) ($inv->expired_qty ?? 0)
+                    );
+                });
 
                 if ($availableStock < $requiredQty) {
-                    throw new \Exception("Insufficient stock in batch {$selectedInventory->batch_no} for {$product->name}");
+                    throw new \Exception(
+                        "Insufficient stock at selling price ₹{$selectedSellingPrice} "
+                            ."for batch {$batchNo}. "
+                            ."Available: {$availableStock}, "
+                            ."Requested: {$requiredQty}."
+                    );
                 }
 
-                // COGS and Stock Deduction
+                // COGS and stock allocation across inventory rows
                 $remaining = $requiredQty;
                 $totalLineCogs = 0;
+                $inventoryAllocations = [];
 
                 foreach ($batchRows as $batch) {
                     if ($remaining <= 0) {
                         break;
                     }
-                    $available = $batch->qty - $batch->sold_qty;
+
+                    $available = max(
+                        0,
+                        (float) $batch->qty
+                            - (float) $batch->sold_qty
+                            - (float) ($batch->expired_qty ?? 0)
+                    );
+
                     if ($available <= 0) {
                         continue;
                     }
@@ -463,22 +568,43 @@ class SalesBillController extends Controller
                     $consume = min($available, $remaining);
 
                     $purchaseRate = (float) $batch->cost_price;
-                    $gstRate = $product->gstRate->rate ?? 0;
+                    $gstRate = (float) ($product->gstRate->rate ?? 0);
 
                     if ($batch->purchase_gst_inclusive && $gstRate > 0) {
-                        $purchaseRate = $purchaseRate * 100 / (100 + $product->gstRate->rate);
+                        $purchaseRate = $purchaseRate * 100
+                            / (100 + $gstRate);
                     }
 
-                    $totalLineCogs += ($purchaseRate * $consume);
-                    $batch->increment('sold_qty', $consume);
+                    // Preserve the exact stock allocation for auditing.
+                    $inventoryAllocations[] = [
+                        'inventory_id' => $batch->id,
+                        'qty' => $consume,
+                        'cost_price' => $purchaseRate,
+                    ];
+
+                    $batch->sold_qty = (float) $batch->sold_qty + $consume;
+                    $batch->save();
+
+                    $totalLineCogs += $purchaseRate * $consume;
                     $remaining -= $consume;
                 }
 
-                // Tax Logic
-                $gstRate = $product->gstRate->rate ?? 0;
+                // Defensive check: never create a partially allocated sale.
+                if ($remaining > 0.000001) {
+                    throw new \Exception(
+                        'Unable to allocate the full quantity for '
+                            ."{$product->name}."
+                    );
+                }
+
+                // Tax Logic - retained from your existing method
+                $gstRate = (float) ($product->gstRate->rate ?? 0);
+
                 if ($gstRate > 0) {
                     if ($product->gst_inclusive) {
-                        $taxable = ($price * 100 / (100 + $gstRate)) * $requiredQty;
+                        $taxable = ($price * 100 / (100 + $gstRate))
+                            * $requiredQty;
+
                         $totalLineGst = ($price * $requiredQty) - $taxable;
                     } else {
                         $taxable = $price * $requiredQty;
@@ -489,77 +615,156 @@ class SalesBillController extends Controller
                     $totalLineGst = 0;
                 }
 
-                // State-based Tax Split
-                $storeState = $user->store?->state ?? '';
-                $branchState = $user->branches?->first()?->state ?? '';
+                $taxable = round($taxable, 2);
+                $totalLineGst = round($totalLineGst, 2);
+
+                // Split tax using the branch that owns this sale.
+                $storeState = $store->state ?? '';
+                $branchState = $branch->state ?? '';
+
                 $cgst = $sgst = $igst = 0;
 
                 if ($gstRate > 0) {
                     if ($storeState == $branchState) {
-                        $cgst = $sgst = $totalLineGst / 2;
+                        $cgst = round($totalLineGst / 2, 2);
+                        $sgst = $totalLineGst - $cgst;
                     } else {
                         $igst = $totalLineGst;
                     }
                 }
 
-                $lineAmount = $product->gst_inclusive ? ($price * $requiredQty) : ($taxable + $totalLineGst);
+                $lineAmount = round(
+                    $product->gst_inclusive
+                        ? ($price * $requiredQty)
+                        : ($taxable + $totalLineGst),
+                    2
+                );
+                $totalLineCogs = round($totalLineCogs, 2);
 
-                $netRevenue = $taxable;
-                $profit = $netRevenue - $totalLineCogs;
+                $remainingTaxable = $taxable;
+                $remainingAmount = $lineAmount;
+                $remainingCgst = $cgst;
+                $remainingSgst = $sgst;
+                $remainingIgst = $igst;
+                $remainingGst = $totalLineGst;
+                $remainingCogs = $totalLineCogs;
 
-                // Record Line
-                $salesLine = SalesBillLine::create([
-                    'sales_bill_id' => $bill->id,
-                    'product_id' => $product->id,
-                    'branch_id' => $branchId,
-                    'inventory_id' => $selectedInventory->id,
-                    'qty' => $requiredQty,
-                    'rate' => $price,
-                    'selling_price' => $price,
-                    'original_price' => $originalPrice,
-                    'override_price' => $overridePrice,
-                    'is_price_overridden' => $isOverridden ? 1 : 0,
-                    'taxable_amount' => $taxable,
-                    'amount' => $lineAmount,
-                    'cgst' => $cgst,
-                    'sgst' => $sgst,
-                    'igst' => $igst,
-                    'total_gst' => $totalLineGst,
-                    'cogs' => $totalLineCogs,
-                    'profit' => $profit,
-                    'created_at' => $billDate,
-                ]);
+                foreach ($inventoryAllocations as $allocationIndex => $allocation) {
+                    $isLastAllocation = $allocationIndex
+                        === count($inventoryAllocations) - 1;
+                    $allocationRatio = $allocation['qty'] / $requiredQty;
 
-                // Log price override for audit report
-                if ($isOverridden) {
-                    \App\Models\PriceOverride::create([
-                        'sale_bill_id' => $bill->id,
-                        'sale_bill_line_id' => $salesLine->id,
+                    $allocationTaxable = $isLastAllocation
+                        ? $remainingTaxable
+                        : min(
+                            $remainingTaxable,
+                            round($taxable * $allocationRatio, 2)
+                        );
+                    $allocationAmount = $isLastAllocation
+                        ? $remainingAmount
+                        : min(
+                            $remainingAmount,
+                            round($lineAmount * $allocationRatio, 2)
+                        );
+                    $allocationCgst = $isLastAllocation
+                        ? $remainingCgst
+                        : min(
+                            $remainingCgst,
+                            round($cgst * $allocationRatio, 2)
+                        );
+                    $allocationSgst = $isLastAllocation
+                        ? $remainingSgst
+                        : min(
+                            $remainingSgst,
+                            round($sgst * $allocationRatio, 2)
+                        );
+                    $allocationIgst = $isLastAllocation
+                        ? $remainingIgst
+                        : min(
+                            $remainingIgst,
+                            round($igst * $allocationRatio, 2)
+                        );
+                    $allocationGst = $isLastAllocation
+                        ? $remainingGst
+                        : min(
+                            $remainingGst,
+                            round($totalLineGst * $allocationRatio, 2)
+                        );
+                    $allocationCogs = $isLastAllocation
+                        ? $remainingCogs
+                        : min(
+                            $remainingCogs,
+                            round(
+                                $allocation['cost_price'] * $allocation['qty'],
+                                2
+                            )
+                        );
+
+                    $salesLine = SalesBillLine::create([
+                        'sales_bill_id' => $bill->id,
                         'product_id' => $product->id,
                         'branch_id' => $branchId,
+                        'inventory_id' => $allocation['inventory_id'],
+                        'qty' => $allocation['qty'],
+                        'rate' => $price,
+                        'selling_price' => $price,
                         'original_price' => $originalPrice,
-                        'override_price' => $price,
-                        'difference' => round($originalPrice - $price, 2),
-                        'qty' => $requiredQty,
-                        'total_loss' => round(($originalPrice - $price) * $requiredQty, 2),
-                        'overridden_by' => $user->id,
+                        'override_price' => $overridePrice,
+                        'is_price_overridden' => $isOverridden ? 1 : 0,
+                        'taxable_amount' => $allocationTaxable,
+                        'amount' => $allocationAmount,
+                        'cgst' => $allocationCgst,
+                        'sgst' => $allocationSgst,
+                        'igst' => $allocationIgst,
+                        'total_gst' => $allocationGst,
+                        'cogs' => $allocationCogs,
+                        'profit' => $allocationTaxable - $allocationCogs,
                         'created_at' => $billDate,
                     ]);
-                }
 
-                // GST Ledger Entry
-                if ($totalLineGst > 0) {
-                    GstOutputLedger::create([
-                        'sales_bill_id' => $bill->id,
-                        'sales_bill_line_id' => $salesLine->id,
-                        'product_id' => $product->id,
-                        'gst_rate_id' => $product->gst_rate_id,
-                        'cgst' => $cgst,
-                        'sgst' => $sgst,
-                        'igst' => $igst,
-                        'total_gst' => $totalLineGst,
-                        'created_at' => $billDate,
-                    ]);
+                    if ($isOverridden) {
+                        \App\Models\PriceOverride::create([
+                            'sale_bill_id' => $bill->id,
+                            'sale_bill_line_id' => $salesLine->id,
+                            'product_id' => $product->id,
+                            'branch_id' => $branchId,
+                            'original_price' => $originalPrice,
+                            'override_price' => $price,
+                            'difference' => round(
+                                $originalPrice - $price,
+                                2
+                            ),
+                            'qty' => $allocation['qty'],
+                            'total_loss' => round(
+                                ($originalPrice - $price) * $allocation['qty'],
+                                2
+                            ),
+                            'overridden_by' => $user->id,
+                            'created_at' => $billDate,
+                        ]);
+                    }
+
+                    if ($allocationGst > 0) {
+                        GstOutputLedger::create([
+                            'sales_bill_id' => $bill->id,
+                            'sales_bill_line_id' => $salesLine->id,
+                            'product_id' => $product->id,
+                            'gst_rate_id' => $product->gst_rate_id,
+                            'cgst' => $allocationCgst,
+                            'sgst' => $allocationSgst,
+                            'igst' => $allocationIgst,
+                            'total_gst' => $allocationGst,
+                            'created_at' => $billDate,
+                        ]);
+                    }
+
+                    $remainingTaxable -= $allocationTaxable;
+                    $remainingAmount -= $allocationAmount;
+                    $remainingCgst -= $allocationCgst;
+                    $remainingSgst -= $allocationSgst;
+                    $remainingIgst -= $allocationIgst;
+                    $remainingGst -= $allocationGst;
+                    $remainingCogs -= $allocationCogs;
                 }
 
                 $subtotal += $lineAmount;
@@ -567,6 +772,7 @@ class SalesBillController extends Controller
                 $totalCogs += $totalLineCogs;
                 $totalProfit += ($taxable - $totalLineCogs);
                 $totalSaved += ($mrp - $price) * $requiredQty;
+
                 $processedProducts[] = $product->id;
             }
 
@@ -578,8 +784,6 @@ class SalesBillController extends Controller
                 'total_saved' => $totalSaved,
                 'total_cogs' => $totalCogs,
                 'total_profit' => $totalProfit,
-                // 'cash_received' => $request->payment_type === 'credit' ? 0 : ($request->cash_received ?? 0),
-                // 'balance_return' => $request->payment_type === 'credit' ? 0 : ($request->balance_return ?? 0),
             ]);
 
             $customerData = [
@@ -601,15 +805,23 @@ class SalesBillController extends Controller
                 ])
             );
 
-            $customer->update(array_filter($customerData, fn ($v) => $v !== null && $v !== ''));
+            $customer->update(array_filter(
+                $customerData,
+                fn ($v) => $v !== null && $v !== ''
+            ));
 
             $bill->customer_id = $customer->id;
 
             // Loyalty Points — Redemption + Earning
-            $customer = Customer::where('id', $customer->id)->lockForUpdate()->first();
+            $customer = Customer::where('id', $customer->id)
+                ->lockForUpdate()
+                ->first();
 
             $loyaltyBalance = (float) $customer->loyalty_points;
-            $requestedRedeemPoints = (float) $request->input('points_redeemed', 0);
+            $requestedRedeemPoints = (float) $request->input(
+                'points_redeemed',
+                0
+            );
 
             $pointsRedeemed = 0;
             $pointsDiscountAmount = 0;
@@ -619,20 +831,33 @@ class SalesBillController extends Controller
 
             if ($requestedRedeemPoints > 0) {
                 if ($requestedRedeemPoints > $loyaltyBalance) {
-                    throw new \Exception("Insufficient loyalty points. Available: {$loyaltyBalance}, Requested: {$requestedRedeemPoints}");
+                    throw new \Exception(
+                        'Insufficient loyalty points. '
+                            ."Available: {$loyaltyBalance}, "
+                            ."Requested: {$requestedRedeemPoints}"
+                    );
                 }
 
-                // Can't discount more than the bill is worth
                 $maxRedeemableAmount = $subtotal;
-                $pointsDiscountAmount = min($requestedRedeemPoints * $pointValue, $maxRedeemableAmount);
-                $pointsRedeemed = round($pointsDiscountAmount / $pointValue, 2);
+
+                $pointsDiscountAmount = min(
+                    $requestedRedeemPoints * $pointValue,
+                    $maxRedeemableAmount
+                );
+
+                $pointsRedeemed = round(
+                    $pointsDiscountAmount / $pointValue,
+                    2
+                );
             }
 
-            // Payable amount = bill total minus redemption discount
-            $payableAmount = max($subtotal - $pointsDiscountAmount, 0);
+            // Payable amount
+            $payableAmount = max(
+                $subtotal - $pointsDiscountAmount,
+                0
+            );
 
-            // Earn 1% of the NET payable amount (after redemption), not the gross subtotal
-            // e.g. ₹100 bill, ₹10 redeemed → payable ₹90 → earn 0.9 points
+            // Earn 1% of net payable amount
             $pointsEarned = round($payableAmount * 0.01, 2);
 
             $runningBalance = $loyaltyBalance;
@@ -664,7 +889,8 @@ class SalesBillController extends Controller
                     'points' => $pointsEarned,
                     'balance_before' => $balanceBefore,
                     'balance_after' => $runningBalance,
-                    'note' => "Earned on bill {$bill->bill_no} (1% of net payable amount)",
+                    'note' => "Earned on bill {$bill->bill_no} "
+                        .'(1% of net payable amount)',
                     'created_by' => $user->id,
                 ]);
             }
@@ -681,17 +907,28 @@ class SalesBillController extends Controller
                 $bill->due_amount = $payableAmount;
                 $bill->payment_status = 'unpaid';
             } else {
-                $cashReceived = (float) ($request->cash_received ?? 0);
-                $onlineReceived = (float) ($request->online_received ?? 0);
-                $paidAmount = min($cashReceived + $onlineReceived, $payableAmount);
+                $cashReceived = (float) (
+                    $request->cash_received ?? 0
+                );
+
+                $onlineReceived = (float) (
+                    $request->online_received ?? 0
+                );
+
+                $paidAmount = min(
+                    $cashReceived + $onlineReceived,
+                    $payableAmount
+                );
 
                 $bill->cash_received = $cashReceived;
                 $bill->online_received = $onlineReceived;
                 $bill->paid_amount = $paidAmount;
-                $bill->due_amount = max($payableAmount - $paidAmount, 0);
+                $bill->due_amount = max(
+                    $payableAmount - $paidAmount,
+                    0
+                );
 
                 if ($bill->due_amount == 0) {
-                    // Covers "fully paid via cash/online" AND "fully covered by points redemption"
                     $bill->payment_status = 'paid';
                 } elseif ($paidAmount > 0) {
                     $bill->payment_status = 'partial';
@@ -709,12 +946,20 @@ class SalesBillController extends Controller
                 'message' => 'Sales bill created successfully',
                 'data' => $bill->load('lines'),
             ]);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             DB::rollBack();
+
+            Log::error('Sales bill creation failed', [
+                'message' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
 
             return response()->json([
                 'status' => false,
-                'message' => $e->getMessage(),
+                'message' => $e instanceof \Illuminate\Database\Eloquent\ModelNotFoundException
+                    ? 'Product or inventory record was not found.'
+                    : $e->getMessage(),
             ], 500);
         }
     }
@@ -943,7 +1188,6 @@ class SalesBillController extends Controller
                 'message' => 'Payment collected successfully',
                 'bill' => $bill->load('payments'),
             ]);
-
         } catch (\Exception $e) {
             DB::rollBack();
 
@@ -969,8 +1213,10 @@ class SalesBillController extends Controller
         ])
             ->where('store_id', $user->store_id)
             ->whereIn('branch_id', $branchIds)
-            ->when($user->role === 'admin' && request()->filled('branch_id'),
-                fn ($q) => $q->where('branch_id', request('branch_id')))
+            ->when(
+                $user->role === 'admin' && request()->filled('branch_id'),
+                fn ($q) => $q->where('branch_id', request('branch_id'))
+            )
             ->whereNotNull('customer_id')
             ->where('due_amount', '>', 0)
             ->groupBy('customer_id')
@@ -1005,8 +1251,10 @@ class SalesBillController extends Controller
 
         $totalDue = SalesBill::where('customer_id', $customer->id)
             ->whereIn('branch_id', $branchIds)
-            ->when($user->role === 'admin' && request()->filled('branch_id'),
-                fn ($q) => $q->where('branch_id', request('branch_id')))
+            ->when(
+                $user->role === 'admin' && request()->filled('branch_id'),
+                fn ($q) => $q->where('branch_id', request('branch_id'))
+            )
             ->where('due_amount', '>', 0)
             ->sum('due_amount');
 
@@ -1077,21 +1325,31 @@ class SalesBillController extends Controller
 
         $response = $bills->map(function ($bill) {
             $items = $bill->lines->map(function ($line) {
-                $sellingPrice = $line->is_price_overridden && $line->override_price
-                    ? $line->override_price
-                    : ($line->inventory->selling_price ?? $line->product->selling_price);
+                $sellingPrice = (float) (
+                    $line->selling_price
+                    ?? $line->rate
+                );
 
-                $mrp = $line->inventory->mrp ?? $line->product->mrp;
+                $mrp = (float) (
+                    $line->inventory->mrp
+                    ?? $line->product->mrp
+                );
 
                 return [
                     'name' => $line->product->name,
                     'qty' => $line->qty,
                     'mrp' => round($mrp, 2),
                     'selling' => round($sellingPrice, 2),
-                    'original_price' => round($line->original_price ?? $sellingPrice, 2),
+                    'original_price' => round(
+                        $line->original_price ?? $sellingPrice,
+                        2
+                    ),
                     'is_price_overridden' => (bool) $line->is_price_overridden,
                     'amount' => $line->amount,
-                    'saved' => ($line->product->mrp - $line->product->selling_price) * $line->qty,
+                    'saved' => round(
+                        ($mrp - $sellingPrice) * (float) $line->qty,
+                        2
+                    ),
                     'cgst' => $line->cgst,
                     'sgst' => $line->sgst,
                     'igst' => $line->igst,
@@ -1294,7 +1552,6 @@ class SalesBillController extends Controller
                     'breakdown' => $paymentBreakdown,
                 ],
             ]);
-
         } catch (\Exception $e) {
             DB::rollBack();
 
@@ -1397,7 +1654,6 @@ class SalesBillController extends Controller
                 'message' => 'Payment updated successfully',
                 'bill' => $bill->load('payments'),
             ]);
-
         } catch (\Exception $e) {
             DB::rollBack();
 

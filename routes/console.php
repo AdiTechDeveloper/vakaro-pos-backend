@@ -8,7 +8,7 @@ use Illuminate\Support\Facades\Schedule;
 
 Schedule::command('ai-chat:cleanup')->dailyAt('02:00');
 Schedule::command('customer-portal:delete-expired-otps')
-    ->everyMinute();
+    ->hourly();
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
 })->purpose('Display an inspiring quote');

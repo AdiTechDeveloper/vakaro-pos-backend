@@ -20,7 +20,7 @@ use Illuminate\Support\Str;
 
 class PurchaseBillController extends Controller
 {
-    public function index()
+    public function index(Request $request)
     {
         try {
             $user = Auth::user();
@@ -45,13 +45,36 @@ class PurchaseBillController extends Controller
                 });
             }
 
-            $purchaseBills = $query
-                ->orderBy('id', 'DESC')
-                ->get();
+            if ($request->filled('search')) {
+                $term = trim($request->query('search'));
+                $query->where(function ($q) use ($term) {
+                    $q->where('bill_no', 'like', "%{$term}%")
+                        ->orWhere('inward_no', 'like', "%{$term}%")
+                        ->orWhereHas('supplier', fn ($s) => $s->where('name', 'like', "%{$term}%"));
+                });
+            }
+
+            $query->orderBy('id', 'DESC');
+
+            if ($request->filled('page') || $request->filled('per_page')) {
+                $perPage = min(max((int) $request->query('per_page', 25), 1), 100);
+                $p = $query->paginate($perPage);
+
+                return response()->json([
+                    'status' => true,
+                    'data' => $p->items(),
+                    'meta' => [
+                        'total' => $p->total(),
+                        'current_page' => $p->currentPage(),
+                        'per_page' => $p->perPage(),
+                        'last_page' => $p->lastPage(),
+                    ],
+                ], 200);
+            }
 
             return response()->json([
                 'status' => true,
-                'data' => $purchaseBills,
+                'data' => $query->get(),
             ], 200);
         } catch (\Exception $e) {
             return response()->json([
@@ -1262,9 +1285,21 @@ class PurchaseBillController extends Controller
             $query->where('store_id', $request->store_id);
         }
 
-        $bills = $query->orderByDesc('bill_date')->get([
-            'id', 'bill_no', 'bill_date', 'taxable_value', 'total_tax', 'total_amount', 'received',
-        ]);
+        $bills = $query
+            ->withSum(['payments as paid_sum' => fn ($q) => $q->where('status', 'success')], 'amount')
+            ->orderByDesc('bill_date')
+            ->get([
+                'id', 'bill_no', 'bill_date', 'taxable_value', 'total_tax', 'total_amount', 'received',
+            ])
+            ->each(function ($b) {
+                $total = round((float) $b->total_amount, 2);
+                $paid = round((float) ($b->paid_sum ?? 0), 2);
+
+                $b->setAppends([]);
+                $b->setAttribute('paid_amount', $paid);
+                $b->setAttribute('due_amount', max(0, round($total - $paid, 2)));
+                $b->setAttribute('payment_status', $paid <= 0 ? 'due' : ($paid < $total ? 'partial' : 'paid'));
+            });
 
         $monthly = $bills
             ->groupBy(fn ($b) => (int) date('n', strtotime($b->bill_date)))
