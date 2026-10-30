@@ -403,67 +403,77 @@ class ProductController extends Controller
         }
     }
 
-    public function update(Request $request, $id)
-    {
-        try {
-            $request->validate([
-                'name' => 'required|string',
-                'is_price_override' => 'nullable|boolean',
-                'barcode' => 'nullable|string|unique:products,barcode,'.$id,
-                'sale_type' => 'nullable|in:unit,weight',
-                'plu_code' => 'nullable|digits_between:1,5|required_if:sale_type,weight',
-                'price_per_kg' => 'nullable|numeric|min:0|required_if:sale_type,weight',
-            ]);
+  public function update(Request $request, $id)
+{
+    try {
+        $request->validate([
+            'name' => 'required|string',
+            'is_price_override' => 'nullable|boolean',
+            'barcode' => 'nullable|string|unique:products,barcode,'.$id,
+            'sale_type' => 'nullable|in:unit,weight',
+            'plu_code' => 'nullable|digits_between:1,5|required_if:sale_type,weight',
+            'price_per_kg' => 'nullable|numeric|min:0|required_if:sale_type,weight',
+        ]);
 
-            $user = Auth::user();
+        $user = Auth::user();
 
-            if (! in_array($user->role, ['admin', 'manager'])) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Unauthorized',
-                ], 403);
-            }
-
-            $storeId = Auth::user()->store_id;
-
-            $product = Product::where('store_id', $storeId)->where('id', $id)->first();
-
-            if (! $product) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Product not found',
-                ], 404);
-            }
-
-            $product->update([
-                'name' => $request->name,
-                'sku' => $request->sku,
-                'barcode' => $request->barcode,
-                'brand_id' => $request->brand_id,
-                'category_id' => $request->category_id,
-                'hsn_code' => $request->hsn_code,
-                'gst_rate_id' => $request->gst_rate_id,
-                'gst_inclusive' => $request->gst_inclusive ?? 0,
-                'is_price_override' => $request->input('is_price_override', 0),
-                'sale_type' => $request->input('sale_type', $product->sale_type),
-                'plu_code' => $request->plu_code,
-                'price_per_kg' => $request->price_per_kg,
-                'updated_by' => Auth::id(),
-            ]);
-
-            return response()->json([
-                'status' => true,
-                'message' => 'Product updated successfully',
-                'product' => $product,
-            ], 200);
-        } catch (\Exception $e) {
+        if (! in_array($user->role, ['admin', 'manager'])) {
             return response()->json([
                 'status' => false,
-                'message' => 'An error occurred while updating the product',
-                'error' => $e->getMessage(),
-            ], 500);
+                'message' => 'Unauthorized',
+            ], 403);
         }
+
+        $storeId = Auth::user()->store_id;
+
+        $product = Product::where('store_id', $storeId)->where('id', $id)->first();
+
+        if (! $product) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Product not found',
+            ], 404);
+        }
+
+        $barcodeChanged = $request->filled('barcode')
+            && $request->barcode !== $product->barcode;
+
+        $product->update([
+            'name' => $request->name,
+            'sku' => $request->sku,
+            'barcode' => $request->barcode,
+            'brand_id' => $request->brand_id,
+            'category_id' => $request->category_id,
+            'hsn_code' => $request->hsn_code,
+            'gst_rate_id' => $request->gst_rate_id,
+            'gst_inclusive' => $request->gst_inclusive ?? 0,
+            'is_price_override' => $request->input('is_price_override', 0),
+            'sale_type' => $request->input('sale_type', $product->sale_type),
+            'plu_code' => $request->plu_code,
+            'price_per_kg' => $request->price_per_kg,
+            'updated_by' => Auth::id(),
+        ]);
+
+        // Keep every batch's barcode in sync with the product's master barcode,
+        // so the product list (which reads batch_barcode for in-stock items)
+        // reflects the edit immediately, not just the products table.
+        if ($barcodeChanged) {
+            $product->inventories()->update(['batch_barcode' => $request->barcode]);
+        }
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Product updated successfully',
+            'product' => $product,
+        ], 200);
+    } catch (\Exception $e) {
+        return response()->json([
+            'status' => false,
+            'message' => 'An error occurred while updating the product',
+            'error' => $e->getMessage(),
+        ], 500);
     }
+}
 
     public function updateSellingPrice(Request $request, $inventoryId)
     {
