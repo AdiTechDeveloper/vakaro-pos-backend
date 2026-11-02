@@ -22,6 +22,7 @@ return [
     'advance_payments' => ['label' => 'Advanced Payment', 'group' => 'Sales'],
     'customers' => ['label' => 'Customers', 'group' => 'Sales'],
     'price_override' => ['label' => 'Price Override (incl. Summary)', 'group' => 'Sales'],
+    'online_store' => ['label' => 'Online Store (Orders & Settings)', 'group' => 'Sales'],
 
     // Admin
     'branch_management' => ['label' => 'Branch Management', 'group' => 'Admin'],

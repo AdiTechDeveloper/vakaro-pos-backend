@@ -503,6 +503,47 @@ class ProductController extends Controller
                 'product' => $product,
             ], 200);
         } catch (\Exception $e) {
+
+            $storeId = Auth::user()->store_id;
+
+            $product = Product::where('store_id', $storeId)->where('id', $id)->first();
+
+            if (! $product) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Product not found',
+                ], 404);
+            }
+
+            $barcodeChanged = $request->filled('barcode')
+                && $request->barcode !== $product->barcode;
+
+            $product->update([
+                'name' => $request->name,
+                'sku' => $request->sku,
+                'barcode' => $request->barcode,
+                'brand_id' => $request->brand_id,
+                'category_id' => $request->category_id,
+                'hsn_code' => $request->hsn_code,
+                'gst_rate_id' => $request->gst_rate_id,
+                'gst_inclusive' => $request->gst_inclusive ?? 0,
+                'is_price_override' => $request->input('is_price_override', 0),
+                'sale_type' => $request->input('sale_type', $product->sale_type),
+                'plu_code' => $request->plu_code,
+                'price_per_kg' => $request->price_per_kg,
+                'updated_by' => Auth::id(),
+            ]);
+
+            if ($barcodeChanged) {
+                $product->inventories()->update(['batch_barcode' => $request->barcode]);
+            }
+
+            return response()->json([
+                'status' => true,
+                'message' => 'Product updated successfully',
+                'product' => $product,
+            ], 200);
+        } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
                 'message' => 'An error occurred while updating the product',

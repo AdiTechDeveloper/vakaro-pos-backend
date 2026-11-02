@@ -21,6 +21,9 @@ return Application::configure(basePath: dirname(__DIR__))
             'api.auth.response' => \App\Http\Middleware\ApiAuthResponse::class,
             'feature' => \App\Http\Middleware\CheckFeature::class,
         ]);
+
+        // Delivery role wale token ko sirf /api/delivery/* tak rakhta hai (POS ke baaki APIs band)
+        $middleware->appendToGroup('api', \App\Http\Middleware\BlockDeliveryRole::class);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         //
