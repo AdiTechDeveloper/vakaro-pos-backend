@@ -5,9 +5,11 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Branch;
 use App\Models\Inventory;
+use App\Models\PrescriptionRegister;
 use App\Models\SalesBill;
 use App\Models\SalesBillLine;
 use App\Models\SalesReturn;
+use App\Services\FeatureService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
@@ -15,13 +17,15 @@ use Illuminate\Validation\Rule;
 
 class SalesReturnController extends Controller
 {
+    private const NON_RETURNABLE_SCHEDULES = ['H1', 'X'];
+
     public function index()
     {
         $user = Auth::user();
 
         try {
             $query = SalesReturn::with([
-                'store', 'branch', 'salesBill', 'customer', 'returnLines',
+                'store', 'branch', 'salesBill', 'customer', 'returnLines.product:id,name',
             ])
                 ->where('store_id', $user->store_id)
                 ->orderBy('id', 'desc');
@@ -83,10 +87,36 @@ class SalesReturnController extends Controller
                 ], 404);
             }
 
+            $isPharmacy = collect(FeatureService::storeFeatures($user->store_id))->contains('pharmacy');
+
+            $rxByLine = $isPharmacy
+                ? PrescriptionRegister::where('sales_bill_id', $bill->id)->get()->keyBy('sales_bill_line_id')
+                : collect();
+
+            $batchById = $isPharmacy
+                ? DB::table('inventories')
+                    ->whereIn('id', $bill->lines->pluck('inventory_id')->filter()->all())
+                    ->get(['id', 'batch_no', 'expiry_date'])
+                    ->keyBy('id')
+                : collect();
+
             foreach ($bill->lines as $line) {
                 $line->total_returned_qty = DB::table('sales_return_lines')
                     ->where('sales_bill_line_id', $line->id)
                     ->sum('qty') ?: 0;
+
+                if ($isPharmacy) {
+                    $rx = $rxByLine->get($line->id);
+                    $schedule = $rx->drug_schedule ?? $line->product->drug_schedule ?? 'none';
+                    $batch = $batchById->get($line->inventory_id);
+
+                    $line->drug_schedule = $schedule;
+                    $line->return_blocked = in_array($schedule, self::NON_RETURNABLE_SCHEDULES, true);
+                    $line->batch_no = $batch->batch_no ?? null;
+                    $line->expiry_date = ($batch && $batch->expiry_date)
+                        ? substr((string) $batch->expiry_date, 0, 10)
+                        : null;
+                }
             }
 
             return response()->json([
@@ -173,6 +203,8 @@ class SalesReturnController extends Controller
 
             $branchId = (int) $originalBill->branch_id;
 
+            $isPharmacy = collect(FeatureService::storeFeatures($user->store_id))->contains('pharmacy');
+
             $storeId = str_pad($user->store_id, 2, '0', STR_PAD_LEFT);
             $brId = str_pad($branchId, 2, '0', STR_PAD_LEFT);
             $counterId = str_pad($user->id, 2, '0', STR_PAD_LEFT);
@@ -218,6 +250,26 @@ class SalesReturnController extends Controller
                 $lineAmount = round($billLine->amount * $ratio, 2);
                 $lineCogsRecovered = round($billLine->cogs * $ratio, 2);
 
+                // Pharmacy: schedule policy + prescription register
+                $rxRow = null;
+                if ($isPharmacy) {
+                    $rxRow = PrescriptionRegister::where('sales_bill_line_id', $billLine->id)
+                        ->lockForUpdate()
+                        ->first();
+
+                    $prod = DB::table('products')
+                        ->where('id', $billLine->product_id)
+                        ->first(['name', 'drug_schedule']);
+
+                    $schedule = $rxRow->drug_schedule ?? $prod->drug_schedule ?? 'none';
+
+                    if (in_array($schedule, self::NON_RETURNABLE_SCHEDULES, true)) {
+                        throw new \DomainException(
+                            ($prod->name ?? 'This medicine')." is Schedule {$schedule} and cannot be returned."
+                        );
+                    }
+                }
+
                 if (! $lineData['is_damaged']) {
                     $inventoryBatch = Inventory::where('id', $billLine->inventory_id)
                         ->where('branch_id', $branchId)
@@ -225,6 +277,13 @@ class SalesReturnController extends Controller
                         ->firstOrFail();
 
                     $inventoryBatch->decrement('sold_qty', $requiredReturnQty);
+                }
+
+                if ($rxRow) {
+                    $rxRow->update([
+                        'returned_qty' => (float) $rxRow->returned_qty + $requiredReturnQty,
+                        'last_returned_at' => now(),
+                    ]);
                 }
 
                 $processedLinesData[] = [
@@ -309,6 +368,13 @@ class SalesReturnController extends Controller
                 'data' => $salesReturn->load('returnLines'),
             ]);
 
+        } catch (\DomainException $e) {
+            DB::rollBack();
+
+            return response()->json([
+                'status' => false,
+                'message' => $e->getMessage(),
+            ], 422);
         } catch (\Exception $e) {
             DB::rollBack();
 

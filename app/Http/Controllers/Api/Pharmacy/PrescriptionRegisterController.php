@@ -88,6 +88,7 @@ class PrescriptionRegisterController extends Controller
             'batch_no' => $r->batch_no,
             'expiry_date' => $r->expiry_date ? $r->expiry_date->format('d-m-Y') : null,
             'qty' => (float) $r->qty,
+            'returned_qty' => (float) $r->returned_qty,
             'patient_name' => $r->patient_name,
             'patient_age' => $r->patient_age,
             'patient_address' => $r->patient_address,
