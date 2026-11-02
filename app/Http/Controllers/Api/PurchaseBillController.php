@@ -280,11 +280,13 @@ class PurchaseBillController extends Controller
             'payments.*.payment_date' => 'nullable|date',
         ], $this->lineMessages());
 
+
         try {
             DB::beginTransaction();
 
             $user = Auth::user();
             $storeId = $user->store_id;
+             $branchId = (int) $request->branch_id;
             $supplier = Supplier::where('store_id', $storeId)->find($validated['supplier_id']);
             $branch = Branch::where('store_id', $storeId)->find($validated['branch_id']);
 
@@ -416,26 +418,27 @@ class PurchaseBillController extends Controller
                 $batchNo = $hasBatch ? $rawBatch : $this->generateBatchNo($product->id);
 
                 // 3. Purchase Line Item Insertion
-                $line = PurchaseLine::create([
-                    'purchase_bill_id' => $bill->id,
-                    'product_id' => $product->id,
-                    'qty' => $qty,
-                    'free_qty' => $freeQty,
-                    'purchase_rate' => $enteredPurchaseRate,
-                    'mrp' => $mrp,
-                    'selling_price' => $sellingPrice,
-                    'taxable_value' => $taxable,
-                    'cgst' => $cgst,
-                    'sgst' => $sgst,
-                    'igst' => $igst,
-                    'gst_rate_id' => $lineData['gst_rate_id'],
-                    'discount_type' => $discountType,
-                    'discount' => $discount,
-                    'hsn_code' => $lineData['hsn_code'] ?? $product->hsn_code,
-                    'batch_no' => $batchNo,
-                    'expiry_date' => $lineData['expiry_date'] ?? null,
-                    'is_opening' => (int) ($lineData['is_opening'] ?? 0),
-                ]);
+                $purchaseLine = PurchaseLine::create([
+    'purchase_bill_id' => $bill->id,
+    'product_id' => $product->id,
+    'qty' => $qty,
+    'free_qty' => $freeQty,
+    'purchase_rate' => $enteredPurchaseRate,
+    'mrp' => $mrp,
+    'selling_price' => $sellingPrice,
+    'taxable_value' => $taxable,
+    'cgst' => $cgst,
+    'sgst' => $sgst,
+    'igst' => $igst,
+    'gst_rate_id' => $lineData['gst_rate_id'],
+    'discount_type' => $discountType,
+    'discount' => $discount,
+    'hsn_code' => $lineData['hsn_code'] ?? $product->hsn_code,
+    'batch_no' => $batchNo,
+    'expiry_date' => $lineData['expiry_date'] ?? null,
+    'is_opening' => (int) ($lineData['is_opening'] ?? 0),
+]);
+
 
                                 // Setup or link Barcodes safely
                 $existingBatch = Inventory::where('product_id', $product->id)
@@ -443,9 +446,9 @@ class PurchaseBillController extends Controller
                     ->where('selling_price', $sellingPrice)
                     ->where('mrp', $mrp)
                     ->where('batch_no', $batchNo)
-                    ->where('cost_price', $inventoryCostRate)
+                    ->where('cost_price',$inventoryCostPrice)
                     ->where('free', 0)
-                    ->when($isPharmacy, fn ($q) => $q->whereDate('expiry_date', $line['expiry_date']))
+                    ->when($isPharmacy, fn ($q) => $q->whereDate('expiry_date', $purchaseLine['expiry_date']))
                     ->first();
 
                 if ($existingBatch) {
@@ -470,11 +473,11 @@ class PurchaseBillController extends Controller
                         'batch_no' => $batchNo,
                         'mrp' => $mrp,
                         'selling_price' => $sellingPrice,
-                        'cost_price' => $inventoryCostRate,
+                        'cost_price' => $inventoryCostPrice,
                         'qty' => $qty,
                         'sold_qty' => 0,
                         'free' => 0,
-                        'rate' => $inventoryCostRate,
+                        'rate' => $inventoryCostPrice,
                         'amount' => $taxable,
                         'expiry_date' => $line['expiry_date'] ?? null,
                         'is_opening' => (int) ($line['is_opening'] ?? 0),
@@ -512,23 +515,23 @@ class PurchaseBillController extends Controller
                             'free' => 1,
                             'rate' => 0,
                             'amount' => 0,
-                            'expiry_date' => $line['expiry_date'] ?? null,
-                            'is_opening' => (int) ($line['is_opening'] ?? 0),
+                            'expiry_date' => $lineData['expiry_date'] ?? null,
+                            'is_opening' => (int) ($lineData['is_opening'] ?? 0),
                         ]);
                     }
                 }
 
                 // ITC Record keeping
-                ItcEntry::create([
-                    'purchase_bill_id' => $bill->id,
-                    'purchase_line_id' => $line->id,
-                    'product_id' => $product->id,
-                    'cgst' => $cgst,
-                    'sgst' => $sgst,
-                    'igst' => $igst,
-                    'total_itc' => round($cgst + $sgst + $igst, 2),
-                    'created_by' => $user->id,
-                ]);
+             ItcEntry::create([
+    'purchase_bill_id' => $bill->id,
+    'purchase_line_id' => $purchaseLine->id,
+    'product_id'       => $product->id,
+    'cgst'             => $cgst,
+    'sgst'             => $sgst,
+    'igst'             => $igst,
+    'total_itc'        => round($cgst + $sgst + $igst, 2),
+    'created_by'       => $user->id,
+]);
 
                 $totals['taxable'] += $taxable;
                 $totals['cgst'] += $cgst;
@@ -1133,25 +1136,27 @@ if ($existingInventory) {
     if (Inventory::where('batch_barcode', $batchBarcode)->exists()) {
         $batchBarcode = $product->barcode . '-' . strtoupper(Str::random(4));
     }
+    $expiryDate = $lineData['expiry_date'] ?? null;
 
-    Inventory::create([
-        'product_id' => $product->id,
-        'branch_id' => $branchId,
-        'purchase_bill_id' => $bill->id,
-        'purchase_line_id' => $purchaseLine->id,
-        'batch_barcode' => $batchBarcode,
-        'batch_no' => $batchNo,
-        'mrp' => $mrp,
-        'selling_price' => $sellingPrice,
-        'cost_price' => $inventoryCostRate,
-        'qty' => $qty,
-        'sold_qty' => 0,
-        'free' => 0,
-        'rate' => $inventoryCostRate,
-        'amount' => $qty * $inventoryCostRate,
-        'expiry_date' => $line['expiry_date'] ?? null,
-        'is_opening' => (int) ($line['is_opening'] ?? 0),
-    ]);
+   Inventory::create([
+    'product_id'       => $product->id,
+    'branch_id'        => $branchId,
+    'purchase_bill_id' => $bill->id,
+    'purchase_line_id' => $line->id,
+    'batch_barcode'    => $batchBarcode,
+    'batch_no'         => $batchNo,
+    'mrp'              => $mrp,
+    'selling_price'    => $sellingPrice,
+    'cost_price'       => $inventoryCostPrice,
+    'qty'              => $qty,
+    'sold_qty'          => 0,
+    'expired_qty'       => 0,
+    'free'              => 0,
+    'rate'              => $inventoryCostPrice,
+    'amount'            => $qty * $inventoryCostPrice,
+    'expiry_date'       => $expiryDate,
+    'is_opening'        => (int) ($lineData['is_opening'] ?? 0),
+]);
 }
 
                 // Repopulate Free Promotional Stock Inventory
