@@ -113,6 +113,8 @@ class ProductController extends Controller
 
         $showOutOfStock = $request->boolean('show_out_of_stock', false);
 
+       
+
         $products = Product::where('products.store_id', $storeId)
             ->when($request->category_id, function ($q) use ($request) {
                 $q->where('category_id', $request->category_id);
@@ -130,21 +132,26 @@ class ProductController extends Controller
             })
             ->with(['store', 'brand', 'category', 'gstRate'])
             ->with(['inventories' => function ($q) use ($branchIds) {
-                $q->whereIn('branch_id', $branchIds)
-                    ->whereRaw(
-                        '(qty - sold_qty - COALESCE(expired_qty, 0)) > 0'
-                    )
-                    ->where(function ($q2) {
-                        $q2->whereNull('expiry_date')
-                            ->orWhereDate(
-                                'expiry_date',
-                                '>=',
-                                now()->toDateString()
-                            );
-                    })
-                    ->orderByRaw('expiry_date IS NULL, expiry_date ASC')
-                    ->orderBy('id', 'asc');
-            }])
+    $q->whereIn('branch_id', $branchIds)
+        ->orderByRaw('expiry_date IS NULL, expiry_date ASC')
+        ->orderBy('id', 'asc');
+}])
+            // ->with(['inventories' => function ($q) use ($branchIds) {
+            //     $q->whereIn('branch_id', $branchIds)
+            //         ->whereRaw(
+            //             '(qty - sold_qty - COALESCE(expired_qty, 0)) > 0'
+            //         )
+            //         ->where(function ($q2) {
+            //             $q2->whereNull('expiry_date')
+            //                 ->orWhereDate(
+            //                     'expiry_date',
+            //                     '>=',
+            //                     now()->toDateString()
+            //                 );
+            //         })
+            //         ->orderByRaw('expiry_date IS NULL, expiry_date ASC')
+            //         ->orderBy('id', 'asc');
+            // }])
             ->addSelect([
                 'total_stock' => Inventory::selectRaw(
                     'COALESCE(SUM(qty - sold_qty - COALESCE(expired_qty, 0)), 0)'
@@ -163,6 +170,7 @@ class ProductController extends Controller
                             );
                     }),
             ])
+           
             ->addSelect([
                 'nearest_expiry' => Inventory::selectRaw('MIN(expiry_date)')
                     ->whereColumn('inventories.product_id', 'products.id')
@@ -202,13 +210,26 @@ class ProductController extends Controller
             $batches = $groupedBatches->map(function ($invGroup) {
 
                 // Ignore records without sellable stock.
-                $eligibleRows = $invGroup->filter(function ($inv) {
-                    $available = (float) $inv->qty
-                        - (float) $inv->sold_qty
-                        - (float) ($inv->expired_qty ?? 0);
+                // $eligibleRows = $invGroup->filter(function ($inv) {
+                //     $available = (float) $inv->qty
+                //         - (float) $inv->sold_qty
+                //         - (float) ($inv->expired_qty ?? 0);
 
-                    return $available > 0;
-                });
+                //     return $available > 0;
+                // });
+
+                $eligibleRows = $invGroup->filter(function ($inv) {
+    $available = (float) $inv->qty
+        - (float) $inv->sold_qty
+        - (float) ($inv->expired_qty ?? 0);
+
+    return $available > 0
+        && (
+            !$inv->expiry_date
+            || \Carbon\Carbon::parse($inv->expiry_date)->startOfDay()
+                ->gte(now()->startOfDay())
+        );
+});
 
                 if ($eligibleRows->isEmpty()) {
                     return null;
@@ -279,7 +300,28 @@ class ProductController extends Controller
                 ->pluck('selling_price')
                 ->filter(fn ($price) => $price !== null);
 
+            // $data = $product->toArray();
+
+            // $data['min_price'] = $prices->min();
+            // $data['max_price'] = $prices->max();
+
+            // $data['has_multiple_prices'] =
+            //     $prices->unique()->count() > 1;
+
+            // $data['batch_count'] = $batches->count();
+            // $data['batches'] = $batches;
+
+            // unset($data['inventories']);
+
+            // return $data;
+
             $data = $product->toArray();
+
+            // Use calculated sellable inventory stock instead of stale products.stock
+            $calculatedStock = (float) ($product->total_stock ?? 0);
+
+            $data['stock'] = $calculatedStock;
+            $data['total_stock'] = $calculatedStock;
 
             $data['min_price'] = $prices->min();
             $data['max_price'] = $prices->max();
@@ -299,6 +341,8 @@ class ProductController extends Controller
             'status' => true,
             'products' => $products,
         ], 200);
+
+        
     }
 
     public function show($id)
