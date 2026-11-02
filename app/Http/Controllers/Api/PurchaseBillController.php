@@ -437,59 +437,54 @@ class PurchaseBillController extends Controller
                     'is_opening' => (int) ($lineData['is_opening'] ?? 0),
                 ]);
 
-                // 4. Stock Allocation (Using Calculated Pre-Tax Cost Price)
-                $existingBatch = null;
-                if ($hasBatch) {
-                    $existingBatch = Inventory::where('product_id', $product->id)
-                        ->where('branch_id', $validated['branch_id'])
-                        ->where('selling_price', $sellingPrice)
-                        ->where('mrp', $mrp)
-                        ->where('batch_no', $batchNo)
-                        ->where('cost_price', $inventoryCostPrice)
-                        ->where('free', 0)
-                        ->when($isPharmacy, fn ($q) => $q->whereDate('expiry_date', $lineData['expiry_date']))
-                        ->first();
-                }
+                                // Setup or link Barcodes safely
+                $existingBatch = Inventory::where('product_id', $product->id)
+                    ->where('branch_id', $branchId)
+                    ->where('selling_price', $sellingPrice)
+                    ->where('mrp', $mrp)
+                    ->where('batch_no', $batchNo)
+                    ->where('cost_price', $inventoryCostRate)
+                    ->where('free', 0)
+                    ->when($isPharmacy, fn ($q) => $q->whereDate('expiry_date', $line['expiry_date']))
+                    ->first();
 
                 if ($existingBatch) {
                     $existingBatch->increment('qty', $qty);
-                    $batchBarcode = $existingBatch->batch_barcode;
                     $existingBatch->amount = $existingBatch->qty * $existingBatch->cost_price;
+                    // Re-point this batch at the current line so future edits can find it again
+                    $existingBatch->purchase_line_id = $purchaseLine->id;
                     $existingBatch->save();
+                    $batchBarcode = $existingBatch->batch_barcode;
                 } else {
                     $batchBarcode = $product->barcode;
                     if (Inventory::where('batch_barcode', $batchBarcode)->exists()) {
                         $batchBarcode = $product->barcode.'-'.strtoupper(Str::random(4));
                     }
 
-                    $isOpening = (int) ($lineData['is_opening'] ?? 0);
-
                     Inventory::create([
                         'product_id' => $product->id,
-                        'branch_id' => $validated['branch_id'],
+                        'branch_id' => $branchId,
                         'purchase_bill_id' => $bill->id,
-                        'purchase_line_id' => $line->id,
+                        'purchase_line_id' => $purchaseLine->id,
                         'batch_barcode' => $batchBarcode,
                         'batch_no' => $batchNo,
                         'mrp' => $mrp,
                         'selling_price' => $sellingPrice,
-                        'cost_price' => $inventoryCostPrice,
+                        'cost_price' => $inventoryCostRate,
                         'qty' => $qty,
                         'sold_qty' => 0,
-                        'free' => false,
-                        'rate' => $inventoryCostPrice,
-                        'amount' => $qty * $inventoryCostPrice,
-                        'expiry_date' => $lineData['expiry_date'] ?? null,
-                        'is_opening' => $isOpening,
+                        'free' => 0,
+                        'rate' => $inventoryCostRate,
+                        'amount' => $taxable,
+                        'expiry_date' => $line['expiry_date'] ?? null,
+                        'is_opening' => (int) ($line['is_opening'] ?? 0),
                     ]);
                 }
 
-                // Free items entry sequence
+                // Repopulate Free Promotional Stock Inventory
                 if ($freeQty > 0) {
-                    $isOpening = (int) ($lineData['is_opening'] ?? 0);
-
                     $existingFreeBatch = Inventory::where('product_id', $product->id)
-                        ->where('branch_id', $validated['branch_id'])
+                        ->where('branch_id', $branchId)
                         ->where('batch_no', $batchNo)
                         ->where('mrp', $mrp)
                         ->where('selling_price', $sellingPrice)
@@ -499,12 +494,14 @@ class PurchaseBillController extends Controller
 
                     if ($existingFreeBatch) {
                         $existingFreeBatch->increment('qty', $freeQty);
+                        $existingFreeBatch->purchase_line_id = $purchaseLine->id;
+                        $existingFreeBatch->save();
                     } else {
                         Inventory::create([
                             'product_id' => $product->id,
-                            'branch_id' => $validated['branch_id'],
+                            'branch_id' => $branchId,
                             'purchase_bill_id' => $bill->id,
-                            'purchase_line_id' => $line->id,
+                            'purchase_line_id' => $purchaseLine->id,
                             'batch_barcode' => $batchBarcode,
                             'batch_no' => $batchNo,
                             'mrp' => $mrp,
@@ -512,11 +509,11 @@ class PurchaseBillController extends Controller
                             'cost_price' => 0,
                             'qty' => $freeQty,
                             'sold_qty' => 0,
-                            'free' => true,
+                            'free' => 1,
                             'rate' => 0,
                             'amount' => 0,
-                            'expiry_date' => $lineData['expiry_date'] ?? null,
-                            'is_opening' => $isOpening,
+                            'expiry_date' => $line['expiry_date'] ?? null,
+                            'is_opening' => (int) ($line['is_opening'] ?? 0),
                         ]);
                     }
                 }
@@ -906,15 +903,31 @@ class PurchaseBillController extends Controller
             }
 
             // STEP 1: Delete only unsold inventory items tied to this bill
-            foreach ($bill->lines as $oldLine) {
-                Inventory::where('purchase_line_id', $oldLine->id)
-                    ->where('sold_qty', 0)
-                    ->delete();
-            }
+            // foreach ($bill->lines as $oldLine) {
+            //     Inventory::where('purchase_line_id', $oldLine->id)
+            //         ->where('sold_qty', 0)
+            //         ->delete();
+            // }
+
+            // STEP 1: Keep existing inventory records.
+// We will update their quantities instead of deleting them.
+
+$oldInventory = Inventory::where('purchase_bill_id', $bill->id)
+    ->get();
+
+$oldInventoryIds = $oldInventory->pluck('id')->toArray();
+
+// Delete previous purchase lines and ITC records.
+// Inventory records are intentionally preserved.
+PurchaseLine::where('purchase_bill_id', $bill->id)->delete();
+
+ItcEntry::where('purchase_bill_id', $bill->id)->delete();
+
+
 
             // Delete previous related line records and tax inputs
-            PurchaseLine::where('purchase_bill_id', $bill->id)->delete();
-            ItcEntry::where('purchase_bill_id', $bill->id)->delete();
+            // PurchaseLine::where('purchase_bill_id', $bill->id)->delete();
+            // ItcEntry::where('purchase_bill_id', $bill->id)->delete();
 
             // STEP 2: Update bill global header variables
             $bill->update([
@@ -1038,46 +1051,195 @@ class PurchaseBillController extends Controller
                 }
 
                 // Repopulate Primary Stock Inventory
-                Inventory::create([
-                    'product_id' => $product->id,
-                    'branch_id' => $branchId,
-                    'purchase_bill_id' => $bill->id,
-                    'purchase_line_id' => $purchaseLine->id,
-                    'batch_barcode' => $batchBarcode,
-                    'batch_no' => $batchNo,
-                    'mrp' => $mrp,
-                    'selling_price' => $sellingPrice,
-                    'cost_price' => $inventoryCostRate,
-                    'qty' => $qty,
-                    'sold_qty' => 0,
-                    'free' => 0,
-                    'rate' => $inventoryCostRate,
-                    'amount' => $taxable,
-                    'expiry_date' => $line['expiry_date'] ?? null,
-                    'is_opening' => (int) ($line['is_opening'] ?? 0),
-                ]);
+                // Inventory::create([
+                //     'product_id' => $product->id,
+                //     'branch_id' => $branchId,
+                //     'purchase_bill_id' => $bill->id,
+                //     'purchase_line_id' => $purchaseLine->id,
+                //     'batch_barcode' => $batchBarcode,
+                //     'batch_no' => $batchNo,
+                //     'mrp' => $mrp,
+                //     'selling_price' => $sellingPrice,
+                //     'cost_price' => $inventoryCostRate,
+                //     'qty' => $qty,
+                //     'sold_qty' => 0,
+                //     'free' => 0,
+                //     'rate' => $inventoryCostRate,
+                //     'amount' => $taxable,
+                //     'expiry_date' => $line['expiry_date'] ?? null,
+                //     'is_opening' => (int) ($line['is_opening'] ?? 0),
+                // ]);
+
+                // Update existing inventory for this bill and batch.
+// If no matching inventory exists, create a new record.
+
+// $existingInventory = Inventory::where('purchase_bill_id', $bill->id)
+//     ->where('product_id', $product->id)
+//     ->where('branch_id', $branchId)
+//     ->where('batch_no', $batchNo)
+//     ->where('mrp', $mrp)
+//     ->where('selling_price', $sellingPrice)
+//     ->where('free', 0)
+//     ->where('cost_price', $inventoryCostRate)
+//     ->where(function ($q) use ($line) {
+//         if (!empty($line['expiry_date'])) {
+//             $q->whereDate('expiry_date', $line['expiry_date']);
+//         } else {
+//             $q->whereNull('expiry_date');
+//         }
+//     })
+//     ->whereIn('id', $oldInventoryIds)
+//     ->first();
+
+$existingInventory = Inventory::where('purchase_bill_id', $bill->id)
+    ->where('product_id', $product->id)
+    ->where('branch_id', $branchId)
+    ->where('batch_no', $batchNo)
+    ->where('free', 0)
+    ->whereIn('id', $oldInventoryIds)
+    ->orderBy('id')
+    ->first();
+
+if ($existingInventory) {
+
+    $minimumQty = (float) $existingInventory->sold_qty
+        + (float) ($existingInventory->expired_qty ?? 0);
+
+    if ($qty < $minimumQty) {
+        throw new \Exception(
+            "Purchase quantity cannot be less than sold/expired quantity for {$product->name}"
+        );
+    }
+
+    // Update same inventory row with edited purchase details
+    $existingInventory->qty = $qty;
+    $existingInventory->purchase_line_id = $purchaseLine->id;
+    $existingInventory->mrp = $mrp;
+    $existingInventory->selling_price = $sellingPrice;
+    $existingInventory->cost_price = $inventoryCostRate;
+    $existingInventory->rate = $inventoryCostRate;
+    $existingInventory->amount = $qty * $inventoryCostRate;
+    $existingInventory->expiry_date = $line['expiry_date'] ?? null;
+    $existingInventory->is_opening = (int) ($line['is_opening'] ?? 0);
+    $existingInventory->save();
+
+
+
+} else {
+
+    // No existing batch record: create inventory normally.
+    $batchBarcode = $product->barcode;
+
+    if (Inventory::where('batch_barcode', $batchBarcode)->exists()) {
+        $batchBarcode = $product->barcode . '-' . strtoupper(Str::random(4));
+    }
+
+    Inventory::create([
+        'product_id' => $product->id,
+        'branch_id' => $branchId,
+        'purchase_bill_id' => $bill->id,
+        'purchase_line_id' => $purchaseLine->id,
+        'batch_barcode' => $batchBarcode,
+        'batch_no' => $batchNo,
+        'mrp' => $mrp,
+        'selling_price' => $sellingPrice,
+        'cost_price' => $inventoryCostRate,
+        'qty' => $qty,
+        'sold_qty' => 0,
+        'free' => 0,
+        'rate' => $inventoryCostRate,
+        'amount' => $qty * $inventoryCostRate,
+        'expiry_date' => $line['expiry_date'] ?? null,
+        'is_opening' => (int) ($line['is_opening'] ?? 0),
+    ]);
+}
 
                 // Repopulate Free Promotional Stock Inventory
+                // if ($freeQty > 0) {
+                //     Inventory::create([
+                //         'product_id' => $product->id,
+                //         'branch_id' => $branchId,
+                //         'purchase_bill_id' => $bill->id,
+                //         'purchase_line_id' => $purchaseLine->id,
+                //         'batch_barcode' => $batchBarcode,
+                //         'batch_no' => $batchNo,
+                //         'mrp' => $mrp,
+                //         'selling_price' => $sellingPrice,
+                //         'cost_price' => 0,
+                //         'qty' => $freeQty,
+                //         'sold_qty' => 0,
+                //         'free' => 1,
+                //         'rate' => 0,
+                //         'amount' => 0,
+                //         'expiry_date' => $line['expiry_date'] ?? null,
+                //         'is_opening' => (int) ($line['is_opening'] ?? 0),
+                //     ]);
+                // }
+
                 if ($freeQty > 0) {
-                    Inventory::create([
-                        'product_id' => $product->id,
-                        'branch_id' => $branchId,
-                        'purchase_bill_id' => $bill->id,
-                        'purchase_line_id' => $purchaseLine->id,
-                        'batch_barcode' => $batchBarcode,
-                        'batch_no' => $batchNo,
-                        'mrp' => $mrp,
-                        'selling_price' => $sellingPrice,
-                        'cost_price' => 0,
-                        'qty' => $freeQty,
-                        'sold_qty' => 0,
-                        'free' => 1,
-                        'rate' => 0,
-                        'amount' => 0,
-                        'expiry_date' => $line['expiry_date'] ?? null,
-                        'is_opening' => (int) ($line['is_opening'] ?? 0),
-                    ]);
-                }
+
+    // $existingFreeInventory = Inventory::where('purchase_bill_id', $bill->id)
+    //     ->where('product_id', $product->id)
+    //     ->where('branch_id', $branchId)
+    //     ->where('batch_no', $batchNo)
+    //     ->where('mrp', $mrp)
+    //     ->where('selling_price', $sellingPrice)
+    //     ->where('free', 1)
+    //     ->whereIn('id', $oldInventoryIds)
+    //     ->first();
+
+    $existingFreeInventory = Inventory::where('purchase_bill_id', $bill->id)
+    ->where('product_id', $product->id)
+    ->where('branch_id', $branchId)
+    ->where('batch_no', $batchNo)
+    ->where('free', 1)
+    ->whereIn('id', $oldInventoryIds)
+    ->first();
+
+    if ($existingFreeInventory) {
+
+        $minimumQty = (float) $existingFreeInventory->sold_qty
+            + (float) ($existingFreeInventory->expired_qty ?? 0);
+
+        if ($freeQty < $minimumQty) {
+            throw new \Exception(
+                "Free stock cannot be less than sold/expired quantity for {$product->name}"
+            );
+        }
+
+        // $existingFreeInventory->qty = $freeQty;
+        // $existingFreeInventory->purchase_line_id = $purchaseLine->id;
+        // $existingFreeInventory->save();
+
+        $existingFreeInventory->qty = $freeQty;
+$existingFreeInventory->purchase_line_id = $purchaseLine->id;
+$existingFreeInventory->mrp = $mrp;
+$existingFreeInventory->selling_price = $sellingPrice;
+$existingFreeInventory->expiry_date = $line['expiry_date'] ?? null;
+$existingFreeInventory->save();
+
+    } else {
+
+        Inventory::create([
+            'product_id' => $product->id,
+            'branch_id' => $branchId,
+            'purchase_bill_id' => $bill->id,
+            'purchase_line_id' => $purchaseLine->id,
+            'batch_barcode' => $batchBarcode,
+            'batch_no' => $batchNo,
+            'mrp' => $mrp,
+            'selling_price' => $sellingPrice,
+            'cost_price' => 0,
+            'qty' => $freeQty,
+            'sold_qty' => 0,
+            'free' => 1,
+            'rate' => 0,
+            'amount' => 0,
+            'expiry_date' => $line['expiry_date'] ?? null,
+            'is_opening' => (int) ($line['is_opening'] ?? 0),
+        ]);
+    }
+}
 
                 // Document modern ITC Records
                 ItcEntry::create([
