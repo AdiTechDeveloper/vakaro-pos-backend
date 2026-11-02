@@ -194,6 +194,8 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
     Route::get('/products/{id}', [ProductController::class, 'show']);
     Route::post('/products', [ProductController::class, 'store']);
     Route::put('/products/{id}', [ProductController::class, 'update']);
+    Route::post('/products/{id}/image', [ProductController::class, 'uploadImage']);
+    Route::delete('/products/{id}/image', [ProductController::class, 'deleteImage']);
     Route::delete('/products/{id}', [ProductController::class, 'destroy']);
     Route::get('/products/{id}/barcode', [ProductController::class, 'barcodeImage']);
     Route::put('/inventory/{inventoryId}/selling-price', [ProductController::class, 'updateSellingPrice']);
@@ -368,7 +370,6 @@ Route::middleware(['auth:sanctum'])->group(function () {
         '/dashboard/insights',
         [DashboardInsightsController::class, 'show']
     );
-
 });
 
 Route::middleware(['auth:sanctum', 'extend.token'])->group(function () {
@@ -379,7 +380,6 @@ Route::middleware(['auth:sanctum', 'extend.token'])->group(function () {
         '/dashboard/money-summary',
         [\App\Http\Controllers\Api\DashboardMoneyController::class, 'summary']
     );
-
 });
 
 Route::get('/test-product-template', function () {

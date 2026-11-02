@@ -107,7 +107,7 @@ class StorefrontAddressController extends Controller
     private function validated(Request $request): array
     {
         return $request->validate([
-            'label' => ['required', 'in:home,work,other'],
+            'label' => ['required', 'in:home,work,hotel,other'],
             'name' => ['required', 'string', 'max:60'],
             'mobile' => ['required', 'regex:/^[6-9]\d{9}$/'],
             'line1' => ['required', 'string', 'max:150'],

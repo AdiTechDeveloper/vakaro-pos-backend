@@ -165,6 +165,7 @@ class StorefrontController extends Controller
                 'p.name',
                 'p.sku',
                 'p.barcode',
+                'p.image',
                 'p.category_id',
                 'p.sale_type',
                 'p.price_per_kg',
@@ -215,7 +216,7 @@ class StorefrontController extends Controller
                 'sku' => $p->sku,
                 'barcode' => $p->barcode,
                 'category_id' => $p->category_id,
-                'image' => null, // products table mein image column abhi nahi hai
+                'image' => $p->image ? '/storage/'.$p->image : null, // relative path: storefront apne API ke origin se jodta hai
                 'sale_type' => $p->sale_type ?: 'unit',
                 'price_unit' => $isUnit ? 'piece' : 'kg',
                 'mrp' => $mrp,

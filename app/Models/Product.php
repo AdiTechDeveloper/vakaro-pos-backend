@@ -30,6 +30,7 @@ class Product extends Model
         'sale_type',
         'plu_code',
         'price_per_kg',
+        'image',
 
         // Pharmacy columns
         'salt_composition', 
@@ -39,6 +40,14 @@ class Product extends Model
         'pack_type', 
         'units_per_pack',
     ];
+
+    // JSON mein `image_url` (poora URL) bhi jaye, taaki admin list/edit seedha dikha sake
+    protected $appends = ['image_url'];
+
+    public function getImageUrlAttribute(): ?string
+    {
+        return $this->image ? asset('storage/'.$this->image) : null;
+    }
 
     public function store()
     {
