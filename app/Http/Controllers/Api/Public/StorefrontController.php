@@ -216,7 +216,13 @@ class StorefrontController extends Controller
                 'sku' => $p->sku,
                 'barcode' => $p->barcode,
                 'category_id' => $p->category_id,
-                'image' => $p->image ? '/storage/'.$p->image : null, // relative path: storefront apne API ke origin se jodta hai
+                'image' => $p->image
+                    ? url('/storage/' . $p->image)
+                    : null,
+
+                'image_url' => $p->image
+                    ? url('/storage/' . $p->image)
+                    : null,
                 'sale_type' => $p->sale_type ?: 'unit',
                 'price_unit' => $isUnit ? 'piece' : 'kg',
                 'mrp' => $mrp,
