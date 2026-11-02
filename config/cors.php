@@ -12,6 +12,7 @@ return [
         'http://127.0.0.1:3000',
         'https://loyality.theaditech.in',
         'https://pos.vakaro.in',
+        'http://192.168.1.17:3000',
     ],
 
     'allowed_origins_patterns' => [],

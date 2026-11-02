@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\OnlineOrder;
 use App\Models\RegisterShift;
 use App\Models\SalesBillPayment;
 use App\Models\User;
@@ -28,7 +29,7 @@ class StaffController extends Controller
 
             if ($role === 'admin') {
                 $staff = User::where('store_id', $user->store_id)
-                    ->whereIn('role', ['manager', 'cashier'])
+                    ->whereIn('role', ['manager', 'cashier', 'delivery'])
                     ->with('store', 'branches')
                     ->get();
             }
@@ -37,7 +38,7 @@ class StaffController extends Controller
                 $branchIds = $user->branches()->pluck('branches.id');
 
                 $staff = User::where('store_id', $user->store_id)
-                    ->where('role', 'cashier')
+                    ->whereIn('role', ['cashier', 'delivery'])
                     ->whereHas('branches', function ($q) use ($branchIds) {
                         $q->whereIn('branches.id', $branchIds);
                     })
@@ -70,7 +71,7 @@ class StaffController extends Controller
             $validator = Validator::make($request->all(), [
                 'name' => 'required|string|max:255',
                 'username' => 'required|string|max:255|unique:users,username',
-                'role' => 'required|in:manager,cashier',
+                'role' => 'required|in:manager,cashier,delivery',
                 'pin' => 'nullable|required_if:role,cashier|digits:4',
                 'branch_ids' => 'required|array|min:1',
                 'branch_ids.*' => [
@@ -79,6 +80,7 @@ class StaffController extends Controller
                 ],
                 'features' => 'nullable|array',
                 'features.*' => 'string',
+                'is_delivery' => 'sometimes|boolean',
             ]);
 
             if ($validator->fails()) {
@@ -113,6 +115,16 @@ class StaffController extends Controller
                 'must_change_credentials' => $data['role'] !== 'cashier',
                 'created_by' => $request->user()->id,
             ]);
+
+            // "Can deliver": sirf admin set kar sakta hai (manager ka value ignore hota hai).
+            // Delivery role wale ka is_delivery hamesha on (assign list isi se banti hai).
+            if ($data['role'] === 'delivery') {
+                $staff->is_delivery = true;
+                $staff->save();
+            } elseif ($request->user()->role === 'admin') {
+                $staff->is_delivery = (bool) ($data['is_delivery'] ?? false);
+                $staff->save();
+            }
 
             if ($data['role'] === 'manager') {
                 FeatureService::setUserFeatures($staff, $data['features'] ?? []);
@@ -323,7 +335,7 @@ class StaffController extends Controller
             }
 
             $validator = Validator::make($request->all(), [
-                'role' => 'required|in:manager,cashier',
+                'role' => 'required|in:manager,cashier,delivery',
                 'branch_ids' => 'required|array|min:1',
                 'branch_ids.*' => [
                     'exists:branches,id',
@@ -331,6 +343,7 @@ class StaffController extends Controller
                 ],
                 'features' => 'nullable|array',
                 'features.*' => 'string',
+                'is_delivery' => 'sometimes|boolean',
             ]);
 
             if ($validator->fails()) {
@@ -338,8 +351,37 @@ class StaffController extends Controller
             }
 
             $data = $validator->validated();
+
+            // "Can deliver": sirf admin badal sakta hai
+            $changeDelivery = $authUser->role === 'admin' && array_key_exists('is_delivery', $data);
+
+            $wasDelivery = $staff->role === 'delivery';
+            $leavesDelivery = $wasDelivery && $data['role'] !== 'delivery';
+
+            // Band karne ya role badalne se pehle: uske chalte hue delivery orders kisi aur ko do
+            if (($leavesDelivery || ($changeDelivery && ! $data['is_delivery'] && $staff->is_delivery)) && $staff->is_delivery) {
+                $busy = OnlineOrder::where('delivery_user_id', $staff->id)
+                    ->where('status', 'out_for_delivery')
+                    ->exists();
+                if ($busy) {
+                    return response()->json([
+                        'status' => false,
+                        'message' => 'This person has orders out for delivery. Assign them to someone else first.',
+                    ], 422);
+                }
+            }
+
             $staff->role = $data['role'];
             $staff->updated_by = $authUser->id;
+
+            if ($data['role'] === 'delivery') {
+                $staff->is_delivery = true;
+            } elseif ($leavesDelivery) {
+                $staff->is_delivery = $changeDelivery ? (bool) $data['is_delivery'] : false;
+                $staff->on_duty = false;
+            } elseif ($changeDelivery) {
+                $staff->is_delivery = (bool) $data['is_delivery'];
+            }
 
             if ($data['role'] === 'cashier') {
                 $staff->password = null;
@@ -415,18 +457,26 @@ class StaffController extends Controller
             return response()->json(['status' => false, 'message' => 'You cannot delete your own account'], 422);
         }
 
-        if (! in_array($staff->role, ['manager', 'cashier'], true)) {
+        if (! in_array($staff->role, ['manager', 'cashier', 'delivery'], true)) {
             return response()->json(['status' => false, 'message' => 'This user cannot be deleted'], 403);
         }
 
         if ($authUser->role === 'manager') {
             $managerBranchIds = $authUser->branches()->pluck('branches.id');
-            $sameBranch = $staff->role === 'cashier'
+            $sameBranch = in_array($staff->role, ['cashier', 'delivery'], true)
                 && $staff->branches()->whereIn('branches.id', $managerBranchIds)->exists();
 
             if (! $sameBranch) {
                 return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
             }
+        }
+
+        $activeDeliveries = OnlineOrder::where('delivery_user_id', $staff->id)->where('status', 'out_for_delivery')->count();
+        if ($activeDeliveries > 0) {
+            return response()->json([
+                'status' => false,
+                'message' => "This person has {$activeDeliveries} order(s) out for delivery. Reassign them first.",
+            ], 409);
         }
 
         $hasOpenShift = RegisterShift::where('user_id', $staff->id)->where('status', 'open')->exists();
@@ -440,6 +490,7 @@ class StaffController extends Controller
         DB::transaction(function () use ($staff, $authUser) {
             $staff->tokens()->delete();
             $staff->update(['deleted_by' => $authUser->id, 'is_active' => false]);
+            $staff->forceFill(['on_duty' => false])->save();
             $staff->delete();
         });
 
@@ -471,8 +522,23 @@ class StaffController extends Controller
                 ], 403);
             }
 
+            // Delivery person ko band karne se pehle uske chalte orders kisi aur ko do
+            if ($staff->is_active && ($staff->role === 'delivery' || $staff->is_delivery)) {
+                $busy = OnlineOrder::where('delivery_user_id', $staff->id)->where('status', 'out_for_delivery')->count();
+                if ($busy > 0) {
+                    return response()->json([
+                        'status' => false,
+                        'message' => "This person has {$busy} order(s) out for delivery. Reassign them first.",
+                    ], 422);
+                }
+            }
+
             $staff->is_active = ! $staff->is_active;
             $staff->updated_by = $authUser->id;
+            if (! $staff->is_active && ($staff->role === 'delivery' || $staff->is_delivery)) {
+                $staff->on_duty = false;
+                $staff->tokens()->delete(); // band kiye gaye delivery person ka login turant khatam
+            }
             $staff->save();
 
             return response()->json([

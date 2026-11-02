@@ -384,3 +384,5 @@ Route::get('/test-product-template', function () {
         'product-import-template.xlsx'
     );
 })->middleware(['auth:sanctum', 'extend.token']);
+
+require __DIR__ . '/public_api.php';
