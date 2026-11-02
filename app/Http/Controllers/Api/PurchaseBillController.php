@@ -13,6 +13,7 @@ use App\Models\PurchaseLine;
 use App\Models\PurchasePayment;
 use App\Models\Store;
 use App\Models\Supplier;
+use App\Services\FeatureService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
@@ -173,6 +174,11 @@ class PurchaseBillController extends Controller
         }
     }
 
+    private function isPharmacyStore($storeId): bool
+    {
+        return collect(FeatureService::storeFeatures($storeId))->contains('pharmacy');
+    }
+
     public function generateBatchNo(int $productId)
     {
         $date = now()->format('Ymd');
@@ -220,8 +226,21 @@ class PurchaseBillController extends Controller
         ];
     }
 
+    private function lineMessages(): array
+    {
+        return [
+            'lines.*.batch_no.required' => 'Line :position: Batch number is required.',
+            'lines.*.batch_no.max' => 'Line :position: Batch number can be at most 50 characters.',
+            'lines.*.expiry_date.required' => 'Line :position: Expiry date is required.',
+            'lines.*.expiry_date.date' => 'Line :position: Expiry date is not valid.',
+            'lines.*.expiry_date.after' => 'Line :position: Expiry date must be a future date. Expired medicines cannot be purchased.',
+        ];
+    }
+
     public function store(Request $request)
     {
+        $isPharmacy = $this->isPharmacyStore(Auth::user()->store_id);
+
         $validated = $request->validate([
             'branch_id' => 'required|integer',
             'supplier_id' => 'required|integer',
@@ -248,8 +267,8 @@ class PurchaseBillController extends Controller
             'lines.*.mrp' => 'required|numeric|min:0',
             'lines.*.selling_price' => 'required|numeric|min:0',
             'lines.*.gst_rate_id' => 'required|integer',
-            'lines.*.batch_no' => 'nullable|string',
-            'lines.*.expiry_date' => 'nullable|date',
+            'lines.*.batch_no' => $isPharmacy ? 'required|string|max:50' : 'nullable|string',
+            'lines.*.expiry_date' => $isPharmacy ? 'required|date|after:today' : 'nullable|date',
             'lines.*.discount' => 'nullable|numeric|min:0',
             'lines.*.discount_type' => 'nullable|string|in:percent,fixed',
             'lines.*.is_opening' => 'sometimes|in:0,1',
@@ -259,7 +278,7 @@ class PurchaseBillController extends Controller
             'payments.*.method' => 'required_with:payments|string|in:cash,online,bank',
             'payments.*.reference' => 'nullable|string|max:255',
             'payments.*.payment_date' => 'nullable|date',
-        ]);
+        ], $this->lineMessages());
 
         try {
             DB::beginTransaction();
@@ -341,6 +360,15 @@ class PurchaseBillController extends Controller
                 }
                 $taxRate = (float) $gst->rate;
 
+                if ($isPharmacy && $sellingPrice > $mrp) {
+                    DB::rollBack();
+
+                    return response()->json([
+                        'status' => false,
+                        'message' => "Selling price can not more than MRP: {$product->name}",
+                    ], 422);
+                }
+
                 $discount = isset($lineData['discount']) ? (float) $lineData['discount'] : 0.0;
                 $discountType = $lineData['discount_type'] ?? null;
 
@@ -380,8 +408,12 @@ class PurchaseBillController extends Controller
                     $inventoryCostPrice = $enteredPurchaseRate;
                 }
 
-                $hasBatch = ! empty($lineData['batch_no']);
-                $batchNo = $hasBatch ? $lineData['batch_no'] : $this->generateBatchNo($product->id);
+                $rawBatch = isset($lineData['batch_no']) ? trim($lineData['batch_no']) : '';
+                if ($isPharmacy) {
+                    $rawBatch = strtoupper($rawBatch);
+                }
+                $hasBatch = $rawBatch !== '';
+                $batchNo = $hasBatch ? $rawBatch : $this->generateBatchNo($product->id);
 
                 // 3. Purchase Line Item Insertion
                 $line = PurchaseLine::create([
@@ -415,6 +447,7 @@ class PurchaseBillController extends Controller
                         ->where('batch_no', $batchNo)
                         ->where('cost_price', $inventoryCostPrice)
                         ->where('free', 0)
+                        ->when($isPharmacy, fn ($q) => $q->whereDate('expiry_date', $lineData['expiry_date']))
                         ->first();
                 }
 
@@ -786,6 +819,8 @@ class PurchaseBillController extends Controller
 
     public function update(Request $request, int $id)
     {
+        $isPharmacy = $this->isPharmacyStore(Auth::user()->store_id);
+
         $request->validate([
             'supplier_id' => 'required|integer',
             'bill_no' => 'sometimes|string',
@@ -802,8 +837,8 @@ class PurchaseBillController extends Controller
             'lines.*.mrp' => 'required|numeric|min:0',
             'lines.*.selling_price' => 'required|numeric|min:0',
             'lines.*.gst_rate_id' => 'required|integer',
-            'lines.*.batch_no' => 'nullable|string',
-            'lines.*.expiry_date' => 'nullable|date',
+            'lines.*.batch_no' => $isPharmacy ? 'required|string|max:50' : 'nullable|string',
+            'lines.*.expiry_date' => $isPharmacy ? 'required|date' : 'nullable|date',
             'lines.*.discount' => 'nullable|numeric|min:0',
             'lines.*.discount_type' => 'nullable|in:percent,fixed',
             'lines.*.hsn_code' => 'nullable|string',
@@ -819,7 +854,7 @@ class PurchaseBillController extends Controller
             'payments.*.method' => 'required_with:payments|string|in:cash,online,bank',
             'payments.*.reference' => 'nullable|string|max:255',
             'payments.*.payment_date' => 'nullable|date',
-        ]);
+        ], $this->lineMessages());
 
         DB::beginTransaction();
 
@@ -915,6 +950,15 @@ class PurchaseBillController extends Controller
                 $mrp = (float) $line['mrp'];
                 $sellingPrice = (float) $line['selling_price'];
                 $gstRateId = $line['gst_rate_id'];
+
+                if ($isPharmacy && $sellingPrice > $mrp) {
+                    DB::rollBack();
+
+                    return response()->json([
+                        'status' => false,
+                        'message' => "Selling price MRP se zyada nahi ho sakta: {$product->name}",
+                    ], 422);
+                }
 
                 $gstRate = optional(GstRate::where('store_id', $user->store_id)->find($gstRateId))->rate ?? 0;
                 $discountType = $line['discount_type'] ?? null;

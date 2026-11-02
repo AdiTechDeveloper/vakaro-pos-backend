@@ -589,32 +589,60 @@ class ReportController extends Controller
     public function getExpiryReport(Request $request)
     {
         try {
-            $branchIds = $this->resolveBranchIds($request);
+            $request->validate([
+                'days' => 'nullable|integer|min:0|max:730',
+            ]);
 
-            $expiryData = Inventory::with(['product:id,name'])
+            $branchIds = $this->resolveBranchIds($request);
+            $today = Carbon::today();
+
+            $query = Inventory::with(['product:id,name', 'branch:id,name'])
                 ->whereIn('branch_id', $branchIds)
                 ->whereNotNull('expiry_date')
-                ->whereColumn('qty', '>', 'sold_qty')
-                ->orderBy('expiry_date', 'asc')
-                ->get([
-                    'id',
-                    'product_id',
-                    'branch_id',
-                    'batch_no',
-                    'expiry_date',
-                    'qty',
-                    'sold_qty',
-                ]);
+                ->whereRaw('(qty - sold_qty - COALESCE(expired_qty, 0)) > 0')
+                ->orderBy('expiry_date', 'asc');
 
-            $formattedData = $expiryData->map(function ($item) {
-                return [
-                    'inventory_id' => $item->id,
-                    'product_name' => $item->product->name ?? 'Unknown Product',
-                    'batch_no' => $item->batch_no,
-                    'expiry_date' => $item->expiry_date,
-                    'remaining_qty' => $item->qty - $item->sold_qty,
-                ];
-            });
+            if ($request->filled('days')) {
+                $query->whereDate(
+                    'expiry_date',
+                    '<=',
+                    $today->copy()->addDays((int) $request->days)->toDateString()
+                );
+            }
+
+            $rows = $query->get([
+                'id', 'product_id', 'branch_id', 'batch_no', 'expiry_date',
+                'qty', 'sold_qty', 'expired_qty', 'cost_price',
+            ]);
+
+            // Same branch + product + batch + expiry = 1 row (free-stock rows merged)
+            $formattedData = $rows
+                ->groupBy(fn ($i) => $i->branch_id.'|'.$i->product_id.'|'.$i->batch_no.'|'
+                    .substr((string) $i->expiry_date, 0, 10))
+                ->map(function ($group) use ($today) {
+                    $first = $group->first();
+                    $expiry = Carbon::parse(substr((string) $first->expiry_date, 0, 10))->startOfDay();
+
+                    $remaining = $group->sum(fn ($i) => (float) $i->qty
+                        - (float) $i->sold_qty
+                        - (float) ($i->expired_qty ?? 0));
+
+                    $stockValue = $group->sum(fn ($i) => ((float) $i->qty
+                        - (float) $i->sold_qty
+                        - (float) ($i->expired_qty ?? 0)) * (float) $i->cost_price);
+
+                    return [
+                        'inventory_id' => $first->id,
+                        'product_name' => $first->product->name ?? 'Unknown Product',
+                        'branch_name' => $first->branch->name ?? '-',
+                        'batch_no' => $first->batch_no,
+                        'expiry_date' => $expiry->toDateString(),
+                        'days_left' => (int) $today->diffInDays($expiry, false),
+                        'remaining_qty' => $remaining,
+                        'stock_value' => round($stockValue, 2),
+                    ];
+                })
+                ->values();
 
             return response()->json([
                 'success' => true,
@@ -623,6 +651,8 @@ class ReportController extends Controller
             ], 200);
 
         } catch (\Symfony\Component\HttpKernel\Exception\HttpException $e) {
+            throw $e;
+        } catch (\Illuminate\Validation\ValidationException $e) {
             throw $e;
         } catch (\Exception $e) {
             return response()->json([

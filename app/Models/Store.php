@@ -18,7 +18,12 @@ class Store extends Model
         'contact_person_name',
         'gstin',
         'tagline',
-        'logo'
+        'logo',
+
+        // Pharmacy columns
+        'drug_licence_no',
+        'pharmacist_name',
+        'pharmacist_reg_no',
     ];
 
     public function branches()

@@ -40,4 +40,8 @@ return [
 
     // AI Reports
     'ai_insights' => ['label' => 'AI Business Insights', 'group' => 'Reports'],
+
+    // Pharmacy
+    'pharmacy' => ['label' => 'Pharmacy (Salt, Schedule H/H1, Prescription Register)', 'group' => 'Catalog'],
+    'batch_entry' => ['label' => 'Batch No Entry (Purchase)', 'group' => 'Catalog'],
 ];

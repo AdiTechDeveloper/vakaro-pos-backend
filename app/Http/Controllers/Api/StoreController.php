@@ -30,6 +30,9 @@ class StoreController extends Controller
                 'phone' => $store->phone,
                 'contact_person_name' => $store->contact_person_name,
                 'gstin' => $store->gstin,
+                'drug_licence_no' => $store->drug_licence_no,
+                'pharmacist_name' => $store->pharmacist_name,
+                'pharmacist_reg_no' => $store->pharmacist_reg_no,
                 'tagline' => $store->tagline,
                 'logo' => $store->logo,
                 'username' => optional($store->users->first())->username,
@@ -90,6 +93,11 @@ class StoreController extends Controller
             'password' => 'required|string|min:6|confirmed',
             'features' => 'present|array',
             'features.*' => 'string',
+
+            // Pharmacy
+            'drug_licence_no' => 'nullable|string|max:100',
+            'pharmacist_name' => 'nullable|string|max:150',
+            'pharmacist_reg_no' => 'nullable|string|max:100',
         ]);
         try {
             DB::beginTransaction();
@@ -114,6 +122,11 @@ class StoreController extends Controller
                 'gstin' => $validated['gstin'],
                 'tagline' => $validated['tagline'] ?? null,
                 'logo' => $logoPath,
+
+                // Pharmacy
+                'drug_licence_no' => $validated['drug_licence_no'] ?? null,
+                'pharmacist_name' => $validated['pharmacist_name'] ?? null,
+                'pharmacist_reg_no' => $validated['pharmacist_reg_no'] ?? null,
             ]);
 
             $admin = User::create([
@@ -141,6 +154,9 @@ class StoreController extends Controller
                     'contact_person_name' => $store->contact_person_name,
                     'gstin' => $store->gstin,
                     'tagline' => $store->tagline,
+                    'drug_licence_no' => $store->drug_licence_no,
+                    'pharmacist_name' => $store->pharmacist_name,
+                    'pharmacist_reg_no' => $store->pharmacist_reg_no,
                     'logo_url' => $store->logo ? asset('storage/'.$store->logo) : null,
                 ],
                 'admin_user' => [
@@ -199,6 +215,11 @@ class StoreController extends Controller
             'logo' => 'nullable|image|mimes:jpg,jpeg,png,svg',
             'features' => 'nullable|array',
             'features.*' => 'string',
+
+            // Pharmacy
+            'drug_licence_no' => 'nullable|string|max:100',
+            'pharmacist_name' => 'nullable|string|max:150',
+            'pharmacist_reg_no' => 'nullable|string|max:100',
         ]);
 
         try {
@@ -234,6 +255,9 @@ class StoreController extends Controller
                     'contact_person_name' => $store->contact_person_name,
                     'gstin' => $store->gstin,
                     'tagline' => $store->tagline,
+                    'drug_licence_no' => $store->drug_licence_no,
+                    'pharmacist_name' => $store->pharmacist_name,
+                    'pharmacist_reg_no' => $store->pharmacist_reg_no,
                     'logo_url' => $store->logo ? asset('storage/'.$store->logo) : null,
                 ],
             ], 200);

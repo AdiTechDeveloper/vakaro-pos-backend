@@ -16,6 +16,7 @@ use App\Http\Controllers\Api\FinancialReportController;
 use App\Http\Controllers\Api\GSTOutputReportController;
 use App\Http\Controllers\Api\GstRateController;
 use App\Http\Controllers\Api\ManagerBranchController;
+use App\Http\Controllers\Api\Pharmacy\PrescriptionRegisterController;
 use App\Http\Controllers\Api\PosTerminalController;
 use App\Http\Controllers\Api\PriceOverrideController;
 use App\Http\Controllers\Api\ProductController;
@@ -280,7 +281,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
     Route::get('/reports/monthly-sales', [SalesReportController::class, 'monthlySales']);
     Route::post('/reports/ai-sales-download', [AiSalesReportDownloadController::class, 'download']);
     Route::post('/reports/ai-report-download', [AiReportDownloadController::class, 'download']);
- 
+
     // NEW
     Route::get('/dashboard/sales-report', [DashboardInsightsController::class, 'salesReport']);
 });
@@ -292,6 +293,10 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:price_override'])->group(function () {
     Route::get('price-override-report', [PriceOverrideController::class, 'index']);
+});
+
+Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:pharmacy'])->group(function () {
+    Route::get('/reports/prescription-register', [PrescriptionRegisterController::class, 'index']);
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:reports_gst'])->group(function () {
@@ -349,7 +354,6 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::apiResource('expenses', ExpenseController::class);
     Route::apiResource('expense-categories', ExpenseCategoryController::class)->except(['show']);
 });
-
 
 Route::prefix('customer-portal')->group(function () {
     Route::post('/send-otp', [CustomerPortalController::class, 'sendOtp']);

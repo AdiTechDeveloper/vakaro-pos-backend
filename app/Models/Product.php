@@ -30,6 +30,14 @@ class Product extends Model
         'sale_type',
         'plu_code',
         'price_per_kg',
+
+        // Pharmacy columns
+        'salt_composition', 
+        'manufacturer', 
+        'drug_schedule',
+        'requires_prescription', 
+        'pack_type', 
+        'units_per_pack',
     ];
 
     public function store()

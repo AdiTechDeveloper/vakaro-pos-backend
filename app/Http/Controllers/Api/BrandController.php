@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Brand;
+use App\Models\Product;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 
@@ -16,7 +17,7 @@ class BrandController extends Controller
 
         return response()->json([
             'status' => true,
-            'brands' => $brands
+            'brands' => $brands,
         ], 200);
     }
 
@@ -25,16 +26,16 @@ class BrandController extends Controller
         $storeId = Auth::user()->store_id;
         $brand = Brand::where('store_id', $storeId)->where('id', $id)->first();
 
-        if (!$brand) {
+        if (! $brand) {
             return response()->json([
                 'status' => false,
-                'message' => 'Brand not found'
+                'message' => 'Brand not found',
             ], 404);
         }
 
         return response()->json([
             'status' => true,
-            'brand' => $brand
+            'brand' => $brand,
         ], 200);
     }
 
@@ -48,10 +49,10 @@ class BrandController extends Controller
 
             $user = Auth::user();
 
-            if (!in_array($user->role, ['admin', 'manager'])) {
+            if (! in_array($user->role, ['admin', 'manager'])) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Unauthorized'
+                    'message' => 'Unauthorized',
                 ], 403);
             }
 
@@ -67,13 +68,13 @@ class BrandController extends Controller
             return response()->json([
                 'status' => true,
                 'message' => 'Brand created successfully',
-                'brand' => $brand
+                'brand' => $brand,
             ], 201);
         } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
                 'message' => 'An error occurred while creating the brand.',
-                'error' => $e->getMessage()
+                'error' => $e->getMessage(),
             ], 500);
         }
     }
@@ -88,10 +89,10 @@ class BrandController extends Controller
 
             $user = Auth::user();
 
-            if (!in_array($user->role, ['admin', 'manager'])) {
+            if (! in_array($user->role, ['admin', 'manager'])) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Unauthorized'
+                    'message' => 'Unauthorized',
                 ], 403);
             }
 
@@ -99,10 +100,10 @@ class BrandController extends Controller
 
             $brand = Brand::where('store_id', $storeId)->where('id', $id)->first();
 
-            if (!$brand) {
+            if (! $brand) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Brand not found'
+                    'message' => 'Brand not found',
                 ], 404);
             }
 
@@ -112,16 +113,18 @@ class BrandController extends Controller
                 'updated_by' => Auth::id(),
             ]);
 
+            Product::where('brand_id', $brand->id)->update(['manufacturer' => $brand->name]);
+
             return response()->json([
                 'status' => true,
                 'message' => 'Brand updated successfully',
-                'brand' => $brand
+                'brand' => $brand,
             ], 200);
         } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
                 'message' => 'An error occurred while updating the brand.',
-                'error' => $e->getMessage()
+                'error' => $e->getMessage(),
             ], 500);
         }
     }
@@ -131,10 +134,10 @@ class BrandController extends Controller
         try {
             $user = Auth::user();
 
-            if (!in_array($user->role, ['admin', 'manager'])) {
+            if (! in_array($user->role, ['admin', 'manager'])) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Unauthorized'
+                    'message' => 'Unauthorized',
                 ], 403);
             }
 
@@ -142,10 +145,10 @@ class BrandController extends Controller
 
             $brand = Brand::where('store_id', $storeId)->where('id', $id)->first();
 
-            if (!$brand) {
+            if (! $brand) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Brand not found'
+                    'message' => 'Brand not found',
                 ], 404);
             }
 
@@ -153,13 +156,13 @@ class BrandController extends Controller
 
             return response()->json([
                 'status' => true,
-                'message' => 'Brand deleted successfully'
+                'message' => 'Brand deleted successfully',
             ], 200);
         } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
                 'message' => 'An error occurred while deleting the brand.',
-                'error' => $e->getMessage()
+                'error' => $e->getMessage(),
             ], 500);
         }
     }

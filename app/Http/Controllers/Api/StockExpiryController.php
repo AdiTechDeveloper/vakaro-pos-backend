@@ -55,19 +55,16 @@ class StockExpiryController extends Controller
             ->whereIn('product_id', $alerts->pluck('product_id'))
             ->whereIn('branch_id', $alerts->pluck('branch_id'))
             ->get()
-            ->groupBy(function ($item) {
-                return $item->product_id.'_'.$item->batch_no;
-            })
-            ->map(function ($items) {
-                return $items->sum(function ($item) {
-                    return $item->qty - $item->sold_qty ?? 0;
-                });
-            });
+            ->groupBy(fn ($item) => $item->product_id.'_'.$item->branch_id.'_'.$item->batch_no.'_'.substr((string) $item->expiry_date, 0, 10))
+            ->map(fn ($items) => $items->sum(fn ($item) => max(
+                0,
+                (float) $item->qty - (float) $item->sold_qty - (float) ($item->expired_qty ?? 0)
+            )));
 
         return response()->json([
             'total' => $alerts->count(),
             'alerts' => $alerts->map(function ($a) use ($expiredQty) {
-                $key = $a->product_id.'_'.($a->purchaseLine->batch_no ?? '');
+                $key = $a->product_id.'_'.$a->branch_id.'_'.($a->purchaseLine->batch_no ?? '').'_'.substr((string) $a->expiry_date, 0, 10);
 
                 return [
                     'id' => $a->id,

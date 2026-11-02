@@ -9,11 +9,13 @@ use App\Models\CustomerLoyaltyTransaction;
 use App\Models\CustomerWalletTransaction;
 use App\Models\GstOutputLedger;
 use App\Models\Inventory;
+use App\Models\PrescriptionRegister;
 use App\Models\Product;
 use App\Models\SalesBill;
 use App\Models\SalesBillLine;
 use App\Models\SalesBillPayment;
 use App\Models\Store;
+use App\Services\FeatureService;
 use App\Services\WeightBarcodeService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -180,7 +182,7 @@ class SalesBillController extends Controller
 
             return $stock > 0 && $notExpired;
         })
-            ->groupBy(fn ($b) => $b->batch_no.'|'.number_format((float) $b->selling_price, 2, '.', ''))
+            ->groupBy(fn ($b) => $b->batch_no.'|'.number_format((float) $b->selling_price, 2, '.', '').'|'.($b->expiry_date ? substr((string) $b->expiry_date, 0, 10) : 'none'))
             ->map(function ($g) {
                 $first = $g->first();
 
@@ -230,6 +232,9 @@ class SalesBillController extends Controller
                 'sale_type' => $product->sale_type ?? 'unit',
                 'gst_rate' => $product->gstRate,
                 'is_price_override' => $product->is_price_override,
+                'drug_schedule' => $product->drug_schedule ?? 'none',
+                'requires_prescription' => (int) ($product->requires_prescription ?? 0),
+                'salt_composition' => $product->salt_composition,
             ],
             'batches' => $batches,
         ]);
@@ -383,6 +388,14 @@ class SalesBillController extends Controller
             'lines.*.is_price_overridden' => 'nullable|boolean',
             'selected_date' => 'nullable|date',
             'points_redeemed' => 'nullable|numeric|min:0',
+            'prescription' => 'nullable|array',
+            'prescription.patient_name' => 'nullable|string|max:150',
+            'prescription.patient_age' => 'nullable|integer|min:0|max:130',
+            'prescription.patient_address' => 'nullable|string|max:255',
+            'prescription.doctor_name' => 'nullable|string|max:150',
+            'prescription.doctor_reg_no' => 'nullable|string|max:100',
+            'prescription.prescription_no' => 'nullable|string|max:100',
+            'prescription.prescription_date' => 'nullable|date',
         ]);
 
         try {
@@ -392,6 +405,8 @@ class SalesBillController extends Controller
             $store = Store::whereKey($user->store_id)
                 ->lockForUpdate()
                 ->firstOrFail();
+
+            $isPharmacy = collect(FeatureService::storeFeatures($user->store_id))->contains('pharmacy');
 
             $existing = SalesBill::where('store_id', $user->store_id)
                 ->where('last_idempotency_key_store', $idempotencyKey)
@@ -477,8 +492,15 @@ class SalesBillController extends Controller
                 $product = Product::with('gstRate')
                     ->findOrFail($lineData['product_id']);
 
-                // Validate the selected inventory belongs to
-                // the requested product and current branch.
+                $needsRx = $isPharmacy && (
+                    (int) $product->requires_prescription === 1
+                    || in_array($product->drug_schedule, ['H', 'H1', 'X'], true)
+                );
+
+                if ($needsRx) {
+                    $this->assertPrescription($request->input('prescription', []), $product);
+                }
+
                 $selectedInventory = Inventory::where(
                     'id',
                     $lineData['inventory_id']
@@ -518,6 +540,13 @@ class SalesBillController extends Controller
                     ->where('branch_id', $branchId)
                     ->where('batch_no', $batchNo)
                     ->where('selling_price', $selectedSellingPrice)
+                    ->where(function ($q) use ($selectedInventory) {
+                        if ($selectedInventory->expiry_date) {
+                            $q->whereDate('expiry_date', $selectedInventory->expiry_date);
+                        } else {
+                            $q->whereNull('expiry_date');
+                        }
+                    })
                     ->whereNull('deleted_at')
                     ->whereRaw(
                         '(qty - sold_qty - COALESCE(expired_qty, 0)) > 0'
@@ -593,6 +622,8 @@ class SalesBillController extends Controller
                         'inventory_id' => $batch->id,
                         'qty' => $consume,
                         'cost_price' => $purchaseRate,
+                        'batch_no' => $batch->batch_no,
+                        'expiry_date' => $batch->expiry_date,
                     ];
 
                     $batch->sold_qty = (float) $batch->sold_qty + $consume;
@@ -734,6 +765,32 @@ class SalesBillController extends Controller
                         'profit' => $allocationTaxable - $allocationCogs,
                         'created_at' => $billDate,
                     ]);
+
+                    if ($needsRx) {
+                        $rx = $request->input('prescription', []);
+
+                        PrescriptionRegister::create([
+                            'store_id' => $user->store_id,
+                            'branch_id' => $branchId,
+                            'sales_bill_id' => $bill->id,
+                            'sales_bill_line_id' => $salesLine->id,
+                            'product_id' => $product->id,
+                            'inventory_id' => $allocation['inventory_id'],
+                            'batch_no' => $allocation['batch_no'],
+                            'expiry_date' => $allocation['expiry_date'],
+                            'drug_schedule' => $product->drug_schedule ?? 'none',
+                            'qty' => $allocation['qty'],
+                            'patient_name' => trim($rx['patient_name']),
+                            'patient_age' => $rx['patient_age'] ?? null,
+                            'patient_address' => $rx['patient_address'] ?? null,
+                            'doctor_name' => trim($rx['doctor_name']),
+                            'doctor_reg_no' => $rx['doctor_reg_no'] ?? null,
+                            'prescription_no' => $rx['prescription_no'] ?? null,
+                            'prescription_date' => $rx['prescription_date'] ?? null,
+                            'dispensed_by' => $user->id,
+                            'dispensed_at' => $billDate,
+                        ]);
+                    }
 
                     if ($isOverridden) {
                         \App\Models\PriceOverride::create([
@@ -1277,6 +1334,31 @@ class SalesBillController extends Controller
         ]);
     }
 
+    private function assertPrescription(array $rx, Product $product): void
+    {
+        $strict = in_array($product->drug_schedule, ['H1', 'X'], true);
+
+        $required = [
+            'patient_name' => 'Patient name',
+            'doctor_name' => 'Doctor name',
+        ];
+
+        if ($strict) {
+            $required['patient_address'] = 'Patient address';
+            $required['doctor_reg_no'] = 'Doctor registration no.';
+        }
+
+        $tag = ($product->drug_schedule ?? 'none') !== 'none'
+            ? "Schedule {$product->drug_schedule}"
+            : 'prescription medicine';
+
+        foreach ($required as $key => $label) {
+            if (trim((string) ($rx[$key] ?? '')) === '') {
+                throw new \Exception("{$label} is required for {$product->name} ({$tag}).");
+            }
+        }
+    }
+
     private function allowedCustomerBranchIds($user): array
     {
         if ($user->role === 'admin') {
@@ -1337,7 +1419,13 @@ class SalesBillController extends Controller
         }
 
         $response = $bills->map(function ($bill) {
-            $items = $bill->lines->map(function ($line) {
+            $isPharmacy = collect(FeatureService::storeFeatures($bill->store_id))->contains('pharmacy');
+
+            $rx = $isPharmacy
+                ? PrescriptionRegister::where('sales_bill_id', $bill->id)->orderBy('id')->first()
+                : null;
+
+            $items = $bill->lines->map(function ($line) use ($isPharmacy) {
                 $sellingPrice = (float) (
                     $line->selling_price
                     ?? $line->rate
@@ -1368,6 +1456,11 @@ class SalesBillController extends Controller
                     'igst' => $line->igst,
                     'cess' => $line->cess,
                     'gst_total' => $line->total_gst,
+                    'batch_no' => $isPharmacy ? ($line->inventory->batch_no ?? null) : null,
+                    'expiry' => ($isPharmacy && ! empty($line->inventory?->expiry_date))
+                        ? Carbon::parse($line->inventory->expiry_date)->format('m/y')
+                        : null,
+                    'drug_schedule' => $isPharmacy ? ($line->product->drug_schedule ?? 'none') : 'none',
                 ];
             });
 
@@ -1378,6 +1471,11 @@ class SalesBillController extends Controller
                     'name' => $bill->store->name,
                     'state' => $bill->store->state,
                     'phone' => $bill->store->phone,
+                    'gst' => $bill->store->gstin,
+                    'is_pharmacy' => $isPharmacy,
+                    'drug_licence_no' => $isPharmacy ? $bill->store->drug_licence_no : null,
+                    'pharmacist_name' => $isPharmacy ? $bill->store->pharmacist_name : null,
+                    'pharmacist_reg_no' => $isPharmacy ? $bill->store->pharmacist_reg_no : null,
                 ],
 
                 'branch' => [
@@ -1403,6 +1501,11 @@ class SalesBillController extends Controller
                     'igst_total' => $items->sum('igst'),
                     'cess_total' => $items->sum('cess'),
                 ],
+
+                'prescription' => $rx ? [
+                    'patient_name' => $rx->patient_name,
+                    'doctor_name' => $rx->doctor_name,
+                ] : null,
 
                 'items' => $items,
                 'barcode' => $barcode,

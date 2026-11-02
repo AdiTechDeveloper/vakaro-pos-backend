@@ -121,7 +121,12 @@ class ProductController extends Controller
                 $q->where('brand_id', $request->brand_id);
             })
             ->when($request->search, function ($q) use ($request) {
-                $q->where('name', 'like', '%'.$request->search.'%');
+                $term = '%'.$request->search.'%';
+                $q->where(function ($q2) use ($term) {
+                    $q2->where('name', 'like', $term)
+                        ->orWhere('salt_composition', 'like', $term)
+                        ->orWhere('manufacturer', 'like', $term);
+                });
             })
             ->with(['store', 'brand', 'category', 'gstRate'])
             ->with(['inventories' => function ($q) use ($branchIds) {
@@ -188,12 +193,9 @@ class ProductController extends Controller
             $groupedBatches = $product->inventories->groupBy(
                 function ($inv) {
                     return $inv->batch_no.'|'
-                        .number_format(
-                            (float) $inv->selling_price,
-                            2,
-                            '.',
-                            ''
-                        );
+                        .number_format((float) $inv->selling_price, 2, '.', '')
+                        .'|'
+                        .($inv->expiry_date ? substr((string) $inv->expiry_date, 0, 10) : 'none');
                 }
             );
 
@@ -346,6 +348,14 @@ class ProductController extends Controller
                 'sale_type' => 'nullable|in:unit,weight',
                 'plu_code' => 'nullable|digits_between:1,5|required_if:sale_type,weight',
                 'price_per_kg' => 'nullable|numeric|min:0|required_if:sale_type,weight',
+
+                // Pharmacy columns
+                'salt_composition' => 'nullable|string|max:255',
+                'manufacturer' => 'nullable|string|max:255',
+                'drug_schedule' => 'nullable|in:none,G,H,H1,X',
+                'requires_prescription' => 'nullable|boolean',
+                'pack_type' => 'nullable|string|max:30',
+                'units_per_pack' => 'nullable|integer|min:1',
             ]);
 
             $user = Auth::user();
@@ -372,13 +382,25 @@ class ProductController extends Controller
                 }
             }
 
-            $product = Product::create([
+            $pharmacy = $request->only([
+                'salt_composition', 'manufacturer', 'drug_schedule',
+                'requires_prescription', 'pack_type', 'units_per_pack',
+            ]);
+
+            $pharmacy['drug_schedule'] = $pharmacy['drug_schedule'] ?? 'none';
+            // if H, H1, X then prescription always required
+            if (in_array($pharmacy['drug_schedule'], ['H', 'H1', 'X'], true)) {
+                $pharmacy['requires_prescription'] = true;
+            }
+
+            $product = Product::create(array_merge([
                 'store_id' => $storeId,
                 'sku' => $request->sku,
                 'barcode' => $barcode, // Master barcode
                 'name' => $request->name,
                 'brand_id' => $request->brand_id,
                 'category_id' => $request->category_id,
+                'manufacturer' => Brand::where('id', $request->brand_id)->value('name'),
                 'hsn_code' => $request->hsn_code,
                 'gst_rate_id' => $request->gst_rate_id,
                 'gst_inclusive' => $request->gst_inclusive ?? 0,
@@ -387,7 +409,7 @@ class ProductController extends Controller
                 'plu_code' => $request->plu_code,
                 'price_per_kg' => $request->price_per_kg,
                 'created_by' => Auth::id(),
-            ]);
+            ], $pharmacy));
 
             return response()->json([
                 'status' => true,
@@ -413,6 +435,14 @@ class ProductController extends Controller
                 'sale_type' => 'nullable|in:unit,weight',
                 'plu_code' => 'nullable|digits_between:1,5|required_if:sale_type,weight',
                 'price_per_kg' => 'nullable|numeric|min:0|required_if:sale_type,weight',
+
+                // Pharmacy columns
+                'salt_composition' => 'nullable|string|max:255',
+                'manufacturer' => 'nullable|string|max:255',
+                'drug_schedule' => 'nullable|in:none,G,H,H1,X',
+                'requires_prescription' => 'nullable|boolean',
+                'pack_type' => 'nullable|string|max:30',
+                'units_per_pack' => 'nullable|integer|min:1',
             ]);
 
             $user = Auth::user();
@@ -440,16 +470,32 @@ class ProductController extends Controller
                 'sku' => $request->sku,
                 'barcode' => $request->barcode,
                 'brand_id' => $request->brand_id,
+                'manufacturer' => $request->has('brand_id')
+                    ? Brand::where('id', $request->brand_id)->value('name')
+                    : $product->manufacturer,
                 'category_id' => $request->category_id,
                 'hsn_code' => $request->hsn_code,
                 'gst_rate_id' => $request->gst_rate_id,
                 'gst_inclusive' => $request->gst_inclusive ?? 0,
-                'is_price_override' => $request->input('is_price_override', 0),
+                'is_price_override' => $request->has('is_price_override')
+                    ? (int) $request->input('is_price_override')
+                    : $product->is_price_override,
                 'sale_type' => $request->input('sale_type', $product->sale_type),
-                'plu_code' => $request->plu_code,
-                'price_per_kg' => $request->price_per_kg,
+                'plu_code' => $request->has('plu_code') ? $request->plu_code : $product->plu_code,
+                'price_per_kg' => $request->has('price_per_kg') ? $request->price_per_kg : $product->price_per_kg,
                 'updated_by' => Auth::id(),
             ]);
+
+            $pharmacy = $request->only([
+                'salt_composition', 'manufacturer', 'drug_schedule',
+                'requires_prescription', 'pack_type', 'units_per_pack',
+            ]);
+            if (array_key_exists('drug_schedule', $pharmacy) && in_array($pharmacy['drug_schedule'], ['H', 'H1', 'X'], true)) {
+                $pharmacy['requires_prescription'] = true;
+            }
+            if (! empty($pharmacy)) {
+                $product->update($pharmacy);
+            }
 
             return response()->json([
                 'status' => true,
@@ -776,11 +822,7 @@ class ProductController extends Controller
             $query->whereDate('expiry_date', '<=', $toDate->toDateString());
         }
 
-        if (! $fromDate && ! $toDate) {
-            $query->where('expiry_date', '<', now()->toDateString());
-        } else {
-            $query->where('expiry_date', '<=', now()->toDateString());
-        }
+        $query->whereDate('expiry_date', '<', now()->toDateString());
 
         $expiredBatches = $query
             ->select(
@@ -1037,7 +1079,6 @@ class ProductController extends Controller
                         'name' => $data['name'],
                         'sku' => $data['sku'] !== '' ? $data['sku'] : null,
                         'barcode' => $barcodeToSave,
-                        'plu_code' => null,
                         'brand_id' => $brandId,
                         'category_id' => $categoryId,
                         'hsn_code' => $data['hsn_code'] !== '' ? $data['hsn_code'] : null,
@@ -1089,10 +1130,6 @@ class ProductController extends Controller
             ]);
         } catch (\Throwable $e) {
             report($e);
-            dd(
-                get_class($e),
-                $e->getMessage()
-            );
 
             return response()->json([
                 'status' => false,
