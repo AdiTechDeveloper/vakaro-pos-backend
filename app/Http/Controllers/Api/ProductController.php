@@ -14,6 +14,7 @@ use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Maatwebsite\Excel\Facades\Excel;
 use Milon\Barcode\Facades\DNS1DFacade as DNS1D;
@@ -669,6 +670,66 @@ class ProductController extends Controller
                 'error' => $e->getMessage(),
             ], 500);
         }
+    }
+
+    // POST /api/products/{id}/image   (multipart: image)
+    public function uploadImage(Request $request, $id)
+    {
+        $user = Auth::user();
+
+        if (! in_array($user->role, ['admin', 'manager'])) {
+            return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
+        }
+
+        $product = Product::where('store_id', $user->store_id)->where('id', $id)->first();
+
+        if (! $product) {
+            return response()->json(['status' => false, 'message' => 'Product not found'], 404);
+        }
+
+        // SVG jaan-boojhkar allowed nahi (script chhupa sakta hai)
+        $request->validate([
+            'image' => ['required', 'file', 'mimes:jpg,jpeg,png,webp', 'max:3072'],
+        ]);
+
+        $old = $product->image;
+        $path = $request->file('image')->store("products/{$user->store_id}", 'public');
+
+        $product->update(['image' => $path, 'updated_by' => $user->id]);
+
+        if ($old && $old !== $path) {
+            Storage::disk('public')->delete($old);
+        }
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Product image updated',
+            'image_url' => $product->image_url,
+            'product' => $product,
+        ], 200);
+    }
+
+    // DELETE /api/products/{id}/image
+    public function deleteImage($id)
+    {
+        $user = Auth::user();
+
+        if (! in_array($user->role, ['admin', 'manager'])) {
+            return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
+        }
+
+        $product = Product::where('store_id', $user->store_id)->where('id', $id)->first();
+
+        if (! $product) {
+            return response()->json(['status' => false, 'message' => 'Product not found'], 404);
+        }
+
+        if ($product->image) {
+            Storage::disk('public')->delete($product->image);
+            $product->update(['image' => null, 'updated_by' => $user->id]);
+        }
+
+        return response()->json(['status' => true, 'message' => 'Product image removed'], 200);
     }
 
     public function destroy($id)

@@ -30,7 +30,7 @@ class SalesReturnLine extends Model
 
     public function salesBillLines()
     {
-        return $this->belongsToMany(SalesBillLine::class, 'sales_bill_line_id', 'id');
+        return $this->belongsTo(SalesBillLine::class, 'sales_bill_line_id', 'id');
     }
 
     public function product()
@@ -40,6 +40,6 @@ class SalesReturnLine extends Model
 
     public function inventory()
     {
-        return $this->belongsToMany(Inventory::class, 'inventory_id', 'id');
+        return $this->belongsTo(Inventory::class, 'inventory_id', 'id');
     }
 }
