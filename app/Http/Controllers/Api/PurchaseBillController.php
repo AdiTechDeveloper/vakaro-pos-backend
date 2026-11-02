@@ -199,31 +199,94 @@ class PurchaseBillController extends Controller
         return "POS-{$productId}-{$date}-{$nextNumber}";
     }
 
+    /**
+     * Indian financial year code (Apr-Mar): Nov 2026 => "2627", Feb 2027 => "2627", Apr 2027 => "2728".
+     */
+    private function financialYearCode(?\Carbon\Carbon $date = null): string
+    {
+        $date = $date ?? now();
+        $startYear = $date->month >= 4 ? $date->year : $date->year - 1;
+
+        return substr((string) $startYear, -2).substr((string) ($startYear + 1), -2);
+    }
+
     protected function generateInwardNumber($branchId)
     {
         $user = Auth::user();
         $storeId = $user->store_id;
 
+        $financialYear = $this->financialYearCode();
+        $prefix = "INW/{$storeId}/{$branchId}/{$financialYear}/";
+
         $lastBill = PurchaseBill::withTrashed()
             ->where('store_id', $storeId)
             ->where('branch_id', $branchId)
-            ->orderBy('id', 'desc')
+            ->where('inward_no', 'like', $prefix.'%')
+            ->orderByDesc('inward_sequence')
+            ->lockForUpdate()
             ->first();
 
-        $sequence = 1;
-        if ($lastBill && $lastBill->inward_sequence) {
-            $sequence = (int) $lastBill->inward_sequence + 1;
-        }
-
-        $financialYear = '2627';
-        $formattedSeq = str_pad($sequence, 4, '0', STR_PAD_LEFT);
-
-        $inwardNo = "INW/{$storeId}/{$branchId}/{$financialYear}/{$formattedSeq}";
+        $sequence = $lastBill && $lastBill->inward_sequence
+            ? (int) $lastBill->inward_sequence + 1
+            : 1;
 
         return [
-            'inward_no' => $inwardNo,
+            'inward_no' => $prefix.str_pad($sequence, 4, '0', STR_PAD_LEFT),
             'inward_sequence' => $sequence,
         ];
+    }
+
+    private function syncProductStock(array $productIds, bool $updateCost = true): void
+    {
+        foreach (array_unique($productIds) as $pid) {
+            $product = Product::find($pid);
+            if (! $product) {
+                continue;
+            }
+
+            $remaining = (float) Inventory::where('product_id', $pid)
+                ->sum(DB::raw('qty - sold_qty - COALESCE(expired_qty, 0)'));
+
+            $product->stock = $remaining;
+
+            if ($updateCost) {
+                $paidQty = (float) Inventory::where('product_id', $pid)->where('free', 0)->sum('qty');
+                $totalValue = (float) Inventory::where('product_id', $pid)
+                    ->where('free', 0)
+                    ->sum(DB::raw('qty * rate'));
+
+                if ($paidQty > 0) {
+                    $product->cost_price = round($totalValue / $paidQty, 2);
+                }
+            }
+
+            $product->save();
+        }
+    }
+
+    private function assertInventoryRemovable(PurchaseBill $bill, $inventories): void
+    {
+        foreach ($inventories as $inv) {
+            $name = DB::table('products')->where('id', $inv->product_id)->value('name') ?? "Product #{$inv->product_id}";
+
+            $used = (float) $inv->sold_qty + (float) ($inv->expired_qty ?? 0);
+            if ($used > 0) {
+                throw new \DomainException(
+                    "Cannot delete: {$used} unit(s) of {$name} (batch {$inv->batch_no}) are already sold/written off. Use a purchase return instead."
+                );
+            }
+
+            $expected = (float) $bill->lines
+                ->filter(fn ($l) => (int) $l->product_id === (int) $inv->product_id
+                    && strtoupper((string) $l->batch_no) === strtoupper((string) $inv->batch_no))
+                ->sum(fn ($l) => $inv->free ? (float) $l->free_qty : (float) $l->qty);
+
+            if (abs((float) $inv->qty - $expected) > 0.0001) {
+                throw new \DomainException(
+                    "Cannot delete: batch {$inv->batch_no} of {$name} was merged with another purchase. Use a purchase return instead."
+                );
+            }
+        }
     }
 
     private function lineMessages(): array
@@ -698,6 +761,7 @@ class PurchaseBillController extends Controller
 
             $totalTaxable = $totalCgst = $totalSgst = $totalIgst = 0;
             $processedProducts = [];
+            $keptInventoryIds = [];
 
             foreach ($request->lines as $line) {
                 $product = Product::where('store_id', $user->store_id)->find($line['product_id']);
@@ -839,6 +903,7 @@ class PurchaseBillController extends Controller
                     $existingInventory->expiry_date = $line['expiry_date'] ?? null;
                     $existingInventory->is_opening = (int) ($line['is_opening'] ?? 0);
                     $existingInventory->save();
+                    $keptInventoryIds[] = $existingInventory->id;
 
                 } else {
                     $batchBarcode = $product->barcode;
@@ -895,6 +960,7 @@ class PurchaseBillController extends Controller
                         $existingFreeInventory->selling_price = $sellingPrice;
                         $existingFreeInventory->expiry_date = $line['expiry_date'] ?? null;
                         $existingFreeInventory->save();
+                        $keptInventoryIds[] = $existingFreeInventory->id;
                     } else {
                         Inventory::create([
                             'product_id' => $product->id,
@@ -936,6 +1002,25 @@ class PurchaseBillController extends Controller
                 $totalIgst += $igst;
 
                 $processedProducts[] = $product->id;
+            }
+
+            $staleIds = array_values(array_diff($oldInventoryIds, $keptInventoryIds));
+            if (! empty($staleIds)) {
+                $staleRows = Inventory::whereIn('id', $staleIds)->lockForUpdate()->get();
+
+                foreach ($staleRows as $stale) {
+                    $used = (float) $stale->sold_qty + (float) ($stale->expired_qty ?? 0);
+                    if ($used > 0) {
+                        $staleName = Product::where('id', $stale->product_id)->value('name') ?? "Product #{$stale->product_id}";
+
+                        throw new \Exception(
+                            "Cannot remove/change batch {$stale->batch_no} of {$staleName}: {$used} unit(s) already sold/written off."
+                        );
+                    }
+
+                    $processedProducts[] = $stale->product_id;
+                    $stale->delete();
+                }
             }
 
             if ($request->has('payments')) {
@@ -985,22 +1070,7 @@ class PurchaseBillController extends Controller
                 'received' => $dueAmount == 0,
             ]);
 
-            foreach (array_unique($processedProducts) as $pid) {
-                $product = Product::find($pid);
-
-                $totalQty = Inventory::where('product_id', $pid)->sum('qty');
-                $totalValue = Inventory::where('product_id', $pid)
-                    ->where('free', 0)
-                    ->sum(DB::raw('qty * rate'));
-
-                $paidQty = Inventory::where('product_id', $pid)->where('free', 0)->sum('qty');
-
-                $product->stock = $totalQty;
-                $product->cost_price = $paidQty > 0
-                    ? round($totalValue / $paidQty, 2)
-                    : $product->cost_price;
-                $product->save();
-            }
+            $this->syncProductStock($processedProducts);
 
             DB::commit();
 
@@ -1026,10 +1096,35 @@ class PurchaseBillController extends Controller
         DB::beginTransaction();
 
         try {
-            $bill = PurchaseBill::with('lines')->findOrFail($id);
             $user = Auth::user();
+            $bill = PurchaseBill::with('lines')->findOrFail($id);
+
+            if (! in_array($user->role, ['admin', 'manager'], true) || $bill->store_id != $user->store_id) {
+                DB::rollBack();
+
+                return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
+            }
+
+            if ($user->role === 'manager' && ! $user->branches()->whereKey($bill->branch_id)->exists()) {
+                DB::rollBack();
+
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Unauthorized - Manager can delete purchase bills of their assigned branch only',
+                ], 403);
+            }
 
             $processedProducts = $bill->lines->pluck('product_id')->unique()->toArray();
+
+            $inventories = Inventory::where('purchase_bill_id', $bill->id)->lockForUpdate()->get();
+            $this->assertInventoryRemovable($bill, $inventories);
+
+            foreach ($inventories as $inv) {
+                $processedProducts[] = $inv->product_id;
+                $inv->delete();
+            }
+
+            ItcEntry::where('purchase_bill_id', $bill->id)->delete();
 
             $bill->update([
                 'deleted_by' => $user->id,
@@ -1037,35 +1132,18 @@ class PurchaseBillController extends Controller
 
             $bill->delete();
 
-            foreach ($processedProducts as $pid) {
-                $product = Product::find($pid);
-                if ($product) {
-                    $totalQty = Inventory::where('product_id', $pid)->sum('qty');
-
-                    $totalValue = Inventory::where('product_id', $pid)
-                        ->where('free', 0)
-                        ->sum(DB::raw('qty * rate'));
-
-                    $paidQty = Inventory::where('product_id', $pid)
-                        ->where('free', 0)
-                        ->sum('qty');
-
-                    $product->stock = $totalQty;
-                    $product->cost_price = $paidQty > 0
-                        ? round($totalValue / $paidQty, 2)
-                        : $product->cost_price;
-
-                    $product->save();
-                }
-            }
+            $this->syncProductStock($processedProducts);
 
             DB::commit();
 
             return response()->json([
                 'status' => true,
-                'message' => 'Purchase bill and all nested items soft-deleted successfully',
+                'message' => 'Purchase bill deleted and its stock removed successfully',
             ]);
+        } catch (\DomainException $e) {
+            DB::rollBack();
 
+            return response()->json(['status' => false, 'message' => $e->getMessage()], 422);
         } catch (\Exception $e) {
             DB::rollBack();
 
