@@ -191,6 +191,10 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
     Route::get('/products/import-template', [ProductController::class, 'downloadImportTemplate']);
     Route::get('/all-products', [ProductController::class, 'getAllProducts']);
     Route::get('/products', [ProductController::class, 'index']);
+    Route::post(
+    '/products/bulk-images',
+    [ProductController::class, 'bulkUploadImages']
+);
     Route::get('/products/{id}', [ProductController::class, 'show']);
     Route::post('/products', [ProductController::class, 'store']);
     Route::put('/products/{id}', [ProductController::class, 'update']);
