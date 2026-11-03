@@ -13,7 +13,7 @@ class OnlineStoreSetting extends Model
         'lat', 'lng', 'is_online_enabled', 'open_time', 'close_time',
         'fulfil_branch_id', 'online_stock_percent',
         'accepts_delivery', 'accepts_pickup', 'min_order_amount', 'delivery_charge',
-        'free_delivery_above', 'prep_minutes',
+        'free_delivery_above', 'prep_minutes','max_qty_per_product'
     ];
 
     protected $casts = [

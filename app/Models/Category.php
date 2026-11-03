@@ -11,9 +11,18 @@ class Category extends Model
         'name',
         'parent_id',
         'description',
+        'image',
         'created_by',
         'updated_by',
     ];
+
+    // JSON mein `image_url` (poora URL) bhi jaye, taaki admin seedha dikha sake
+    protected $appends = ['image_url'];
+
+    public function getImageUrlAttribute(): ?string
+    {
+        return $this->image ? asset('storage/'.$this->image) : null;
+    }
 
     public function parent()
     {

@@ -144,6 +144,8 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
     Route::get('/categories/{id}', [CategoryController::class, 'show']);
     Route::post('/categories', [CategoryController::class, 'store']);
     Route::put('/categories/{id}', [CategoryController::class, 'update']);
+    Route::post('/categories/{id}/image', [CategoryController::class, 'uploadImage']);
+Route::delete('/categories/{id}/image', [CategoryController::class, 'deleteImage']);
     Route::delete('/categories/{id}', [CategoryController::class, 'destroy']);
 });
 

@@ -4,6 +4,7 @@ use App\Http\Controllers\Api\DeliveryOrderController;
 use App\Http\Controllers\Api\OnlineOrderController;
 use App\Http\Controllers\Api\OnlineStoreController;
 use App\Http\Controllers\Api\Public\GeocodeController;
+use App\Http\Controllers\Api\Public\OnlineProductLimitController;
 use App\Http\Controllers\Api\Public\StorefrontAddressController;
 use App\Http\Controllers\Api\Public\StorefrontAuthController;
 use App\Http\Controllers\Api\Public\StorefrontController;
@@ -87,6 +88,8 @@ Route::prefix('online')
         Route::post('pincodes', [OnlineStoreController::class, 'addPincodes']);
         Route::put('pincodes/{id}', [OnlineStoreController::class, 'updatePincode'])->whereNumber('id');
         Route::delete('pincodes/{id}', [OnlineStoreController::class, 'destroyPincode'])->whereNumber('id');
+                Route::get('product-limits', [OnlineProductLimitController::class, 'index']);
+        Route::put('product-limits/{productId}', [OnlineProductLimitController::class, 'update'])->whereNumber('productId');
     });
 
 // Delivery person (role = delivery, ya is_delivery wala staff). URL: /api/delivery/...

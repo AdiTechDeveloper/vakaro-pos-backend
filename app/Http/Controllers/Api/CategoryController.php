@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Category;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Storage;
 
 class CategoryController extends Controller
 {
@@ -153,6 +154,11 @@ class CategoryController extends Controller
                 ], 404);
             }
 
+            // Category hard-delete hoti hai, to uski photo bhi disk se hatao
+            if ($category->image) {
+                Storage::disk('public')->delete($category->image);
+            }
+
             $category->delete();
 
             return response()->json([
@@ -166,6 +172,85 @@ class CategoryController extends Controller
                 'error' => $e->getMessage()
             ], 500);
         }
+    }
+
+    // POST /api/categories/{id}/image   (multipart: image)
+    public function uploadImage(Request $request, $id)
+    {
+        $user = Auth::user();
+
+        if (! in_array($user->role, ['admin', 'manager'])) {
+            return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
+        }
+
+        $category = Category::where('store_id', $user->store_id)->where('id', $id)->first();
+
+        if (! $category) {
+            return response()->json(['status' => false, 'message' => 'Category not found'], 404);
+        }
+
+        // Validation se pehle saaf wajah batao: "image field is required" se pata nahi chalta ki galti kahan hai
+        $file = $request->file('image');
+
+        if (! $file) {
+            $why = $request->isJson()
+                ? 'The request was sent as JSON. Send it as multipart/form-data (FormData).'
+                : 'No file named "image" was received. Send multipart/form-data with the field name "image".';
+
+            return response()->json(['status' => false, 'message' => $why], 422);
+        }
+
+        if (! $file->isValid()) {
+            // jaise: file php.ini ki upload_max_filesize / post_max_size se badi hai
+            return response()->json([
+                'status' => false,
+                'message' => 'Upload failed: '.$file->getErrorMessage(),
+            ], 422);
+        }
+
+        // SVG jaan-boojhkar allowed nahi (script chhupa sakta hai)
+        $request->validate([
+            'image' => ['required', 'file', 'mimes:jpg,jpeg,png,webp', 'max:3072'],
+        ]);
+
+        $old = $category->image;
+        $path = $file->store("categories/{$user->store_id}", 'public');
+
+        $category->update(['image' => $path, 'updated_by' => $user->id]);
+
+        if ($old && $old !== $path) {
+            Storage::disk('public')->delete($old);
+        }
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Category image updated',
+            'image_url' => $category->image_url,
+            'category' => $category,
+        ], 200);
+    }
+
+    // DELETE /api/categories/{id}/image
+    public function deleteImage($id)
+    {
+        $user = Auth::user();
+
+        if (! in_array($user->role, ['admin', 'manager'])) {
+            return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
+        }
+
+        $category = Category::where('store_id', $user->store_id)->where('id', $id)->first();
+
+        if (! $category) {
+            return response()->json(['status' => false, 'message' => 'Category not found'], 404);
+        }
+
+        if ($category->image) {
+            Storage::disk('public')->delete($category->image);
+            $category->update(['image' => null, 'updated_by' => $user->id]);
+        }
+
+        return response()->json(['status' => true, 'message' => 'Category image removed'], 200);
     }
 
     public function parentCategories()

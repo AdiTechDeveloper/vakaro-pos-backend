@@ -57,6 +57,7 @@ class OnlineStoreController extends Controller
             'free_delivery_above' => ['nullable', 'numeric', 'min:0', 'max:1000000'],
             'prep_minutes' => ['nullable', 'integer', 'min:0', 'max:1440'],
             'online_stock_percent' => ['required', 'integer', 'min:0', 'max:100'],
+            'max_qty_per_product' => ['nullable', 'integer', 'min:1', 'max:10000'],
         ], [
             'slug.regex' => 'Store link can have only small letters, numbers and hyphens (for example: my-store).',
             'slug.not_regex' => 'Store link cannot end with -b and a number (that is used for branches).',
@@ -104,6 +105,7 @@ class OnlineStoreController extends Controller
                 'free_delivery_above' => $blank($data['free_delivery_above'] ?? null),
                 'prep_minutes' => $data['prep_minutes'] ?? 30,
                 'online_stock_percent' => (int) $data['online_stock_percent'],
+                   'max_qty_per_product' => $blank($data['max_qty_per_product'] ?? null),
             ]
         );
 
@@ -259,6 +261,7 @@ class OnlineStoreController extends Controller
             'free_delivery_above' => $set && $set->free_delivery_above !== null ? (float) $set->free_delivery_above : null,
             'prep_minutes' => $set ? (int) $set->prep_minutes : 30,
             'online_stock_percent' => $set ? (int) $set->online_stock_percent : 50,
+               'max_qty_per_product' => $set && $set->max_qty_per_product !== null ? (int) $set->max_qty_per_product : null,
         ];
 
         // Storefront par har branch ka apna link: "<slug>-b<branch_id>"

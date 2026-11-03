@@ -155,7 +155,7 @@ class StorefrontOrderController extends Controller
 
             // Stock kam / item hat gaya: cart ko theek karne ke liye taaza price + stock wapas bhejte hain
             if ($problems) {
-                return $this->conflict('STOCK', 'Some items are no longer available in the quantity you chose.', $wanted, $live);
+                return $this->conflict('STOCK', 'Some items are not available in the quantity you chose (low stock or order limit). Your cart has been updated.', $wanted, $live);
             }
 
             $subtotal = round($subtotal, 2);
