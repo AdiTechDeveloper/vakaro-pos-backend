@@ -91,6 +91,8 @@ class StorefrontOrderController extends Controller
 
             $listing->pin_delivery_charge = $pin->delivery_charge;
             $listing->pin_min_order = $pin->min_order_amount;
+
+            $listing->pin_delivery_minutes = $pin->delivery_minutes;   // nayi line
         }
 
         $name = trim((string) ($isDelivery ? $address->name : ($data['name'] ?? $customer->name ?? '')));
@@ -109,7 +111,16 @@ class StorefrontOrderController extends Controller
         $catalog = app(StorefrontCatalog::class);
 
         $result = $this->lockedTransaction(function () use (
-            $customer, $key, $data, $listing, $terms, $catalog, $wanted, $isDelivery, $address, $name
+            $customer,
+            $key,
+            $data,
+            $listing,
+            $terms,
+            $catalog,
+            $wanted,
+            $isDelivery,
+            $address,
+            $name
         ) {
             // Is store ke orders ek ek karke: warna do customers ek hi bache hue stock ke liye aage-peeche nikal jayenge
             // OVERSELLING SE BACHAV (tatkal jaisa): is store ke orders ek ek karke chalte hain. Jab tak ek order
@@ -162,7 +173,7 @@ class StorefrontOrderController extends Controller
 
             $minOrder = (float) $terms['min_order_amount'];
             if ($isDelivery && $subtotal + 1e-9 < $minOrder) {
-                return $this->fail('Minimum order for delivery is ₹'.rtrim(rtrim(number_format($minOrder, 2, '.', ''), '0'), '.').'.', 422);
+                return $this->fail('Minimum order for delivery is ₹' . rtrim(rtrim(number_format($minOrder, 2, '.', ''), '0'), '.') . '.', 422);
             }
 
             $freeAbove = $terms['free_delivery_above'];
@@ -177,7 +188,8 @@ class StorefrontOrderController extends Controller
             if (isset($data['expected_total']) && abs((float) $data['expected_total'] - $total) > 0.011) {
                 return $this->conflict('PRICE_CHANGED', 'Prices or charges have changed. Please check your cart.', $wanted, $live, $total);
             }
-
+            $prep = max(1, min(1440, (int) ($terms['prep_minutes'] ?? $listing->prep_minutes ?? 30)));
+            $travel = $isDelivery ? (int) ($listing->pin_delivery_minutes ?? 20) : 0;
             $order = OnlineOrder::create([
                 'order_no' => Str::random(16), // neeche id ke hisaab se pakka number lagta hai
                 'storefront_customer_id' => $customer->id,
@@ -202,15 +214,20 @@ class StorefrontOrderController extends Controller
                 'addr_mobile' => $address?->mobile,
                 'addr_line1' => $address?->line1,
                 'addr_line2' => $address?->line2,
+                'addr_lat' => $address?->lat,
+                'addr_lng' => $address?->lng,
                 'addr_landmark' => $address?->landmark,
                 'addr_city' => $address?->city,
                 'addr_pincode' => $address?->pincode,
                 'note' => isset($data['note']) ? trim($data['note']) ?: null : null,
                 'idempotency_key' => $key,
+                'prep_minutes' => $prep,
+                'travel_minutes' => $travel,
+                'eta_ts' => time() + ($prep + $travel) * 60,
                 'placed_at' => now(),
             ]);
 
-            $order->update(['order_no' => 'VK'.now()->format('ymd').str_pad((string) $order->id, 5, '0', STR_PAD_LEFT)]);
+            $order->update(['order_no' => 'VK' . now()->format('ymd') . str_pad((string) $order->id, 5, '0', STR_PAD_LEFT)]);
 
             foreach ($lines as $l) {
                 $order->items()->create([
@@ -252,7 +269,7 @@ class StorefrontOrderController extends Controller
 
         return response()->json([
             'status' => true,
-            'data' => $page->getCollection()->map(fn (OnlineOrder $o) => $o->summaryArray())->values(),
+            'data' => $page->getCollection()->map(fn(OnlineOrder $o) => $o->summaryArray())->values(),
             'meta' => [
                 'current_page' => $page->currentPage(),
                 'last_page' => $page->lastPage(),

@@ -30,11 +30,12 @@ Route::prefix('public')->middleware('throttle:120,1,sf-browse')->group(function 
 });
 
 // Location: GPS se pincode / area, aur pincode se area (frontend: /api/public/geo/...)
+// Location: GPS se pincode / area, pincode se area, aur naam se place search (frontend: /api/public/geo/...)
 Route::prefix('public/geo')->middleware('throttle:30,1,sf-geo')->group(function () {
     Route::get('reverse', [GeocodeController::class, 'reverse']);
     Route::get('pincode', [GeocodeController::class, 'pincode']);
+    Route::get('search', [GeocodeController::class, 'search']);
 });
-
 // Storefront customer login (mobile + OTP). Sanctum / POS auth se alag.
 Route::prefix('public/auth')->group(function () {
     Route::post('send-otp', [StorefrontAuthController::class, 'sendOtp'])->middleware('throttle:10,1,sf-otp-send');
