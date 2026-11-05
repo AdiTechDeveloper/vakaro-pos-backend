@@ -494,7 +494,7 @@ class StorefrontController extends Controller
             'name' => $s->display_name ?: $s->store_name,
             'store_name' => $s->store_name,
             'branch_name' => $s->branch_name ?? null,
-            'logo' => $s->logo,
+            'logo' => $this->publicUrl($s->logo),
             'banner' => $s->banner,
             'about' => $s->about,
             'phone' => $s->phone,
@@ -523,4 +523,21 @@ class StorefrontController extends Controller
             ? ($now >= $open && $now <= $close)
             : ($now >= $open || $now <= $close); // raat paar karne wale timings
     }
+    // Settings me saved logo ("online-logos/1/abc.png") -> poora URL, products ki image jaisa
+private function publicUrl(?string $value): ?string
+{
+    if (!$value) {
+        return null;
+    }
+    if (preg_match('#^https?://#i', $value)) {
+        return $value;
+    }
+
+    $rel = ltrim($value, '/');
+    if (str_starts_with($rel, 'storage/')) {
+        $rel = substr($rel, 8);
+    }
+
+    return url('/storage/' . $rel);
+}
 }

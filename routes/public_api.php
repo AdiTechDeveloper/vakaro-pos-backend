@@ -1,9 +1,11 @@
+
 <?php
 
 use App\Http\Controllers\Api\DeliveryLocationController;
 use App\Http\Controllers\Api\DeliveryOrderController;
 use App\Http\Controllers\Api\OnlineOrderController;
 use App\Http\Controllers\Api\OnlineStoreController;
+use App\Http\Controllers\Api\OnlineStoreLogoController;
 use App\Http\Controllers\Api\Public\GeocodeController;
 use App\Http\Controllers\Api\Public\OnlineProductLimitController;
 use App\Http\Controllers\Api\Public\StorefrontAddressController;
@@ -14,16 +16,7 @@ use App\Http\Controllers\Api\Public\StorefrontTrackController;
 use App\Http\Middleware\StorefrontAuth;
 use Illuminate\Support\Facades\Route;
 
-/*
- | THROTTLE: 'throttle:30,1' jaisa numeric throttle sab routes ka count ek hi counter mein jodta hai
- | (IP ke hisaab se). Isliye har throttle ko alag naam (teesra hissa, jaise ,sf-otp-send) diya hai,
- | taaki ek route ki requests doosre ko block na karein.
- |
- | Public storefront routes (bina login ke).
- | routes/api.php ke END mein ye line jodo:
- |     require __DIR__ . '/public_api.php';
- | (api.php ka '/api' prefix automatically lag jayega)
- */
+// Public storefront routes
 Route::prefix('public')->middleware('throttle:120,1,sf-browse')->group(function () {
     Route::get('stores', [StorefrontController::class, 'stores']);
     Route::get('stores/{slug}', [StorefrontController::class, 'show']);
@@ -31,13 +24,14 @@ Route::prefix('public')->middleware('throttle:120,1,sf-browse')->group(function 
     Route::get('stores/{slug}/products', [StorefrontController::class, 'products']);
 });
 
-// Location: GPS se pincode / area, pincode se area, aur naam se place search (frontend: /api/public/geo/...)
+// Location routes
 Route::prefix('public/geo')->middleware('throttle:30,1,sf-geo')->group(function () {
     Route::get('reverse', [GeocodeController::class, 'reverse']);
     Route::get('pincode', [GeocodeController::class, 'pincode']);
     Route::get('search', [GeocodeController::class, 'search']);
 });
-// Storefront customer login (mobile + OTP). Sanctum / POS auth se alag.
+
+// Customer authentication
 Route::prefix('public/auth')->group(function () {
     Route::post('send-otp', [StorefrontAuthController::class, 'sendOtp'])->middleware('throttle:10,1,sf-otp-send');
     Route::post('verify-otp', [StorefrontAuthController::class, 'verifyOtp'])->middleware('throttle:20,1,sf-otp-verify');
@@ -48,7 +42,7 @@ Route::prefix('public/auth')->group(function () {
     });
 });
 
-// Logged-in customer ke addresses
+// Customer addresses
 Route::prefix('public/addresses')->middleware([StorefrontAuth::class, 'throttle:60,1,sf-addresses'])->group(function () {
     Route::get('/', [StorefrontAddressController::class, 'index']);
     Route::post('/', [StorefrontAddressController::class, 'store']);
@@ -56,18 +50,16 @@ Route::prefix('public/addresses')->middleware([StorefrontAuth::class, 'throttle:
     Route::delete('{id}', [StorefrontAddressController::class, 'destroy'])->whereNumber('id');
 });
 
-// Online orders (login chahiye)
-Route::prefix('public/orders')->middleware([StorefrontAuth::class])->group(function () {
+// Customer online orders
+Route::prefix('public/orders')->middleware(StorefrontAuth::class)->group(function () {
     Route::get('/', [StorefrontOrderController::class, 'index'])->middleware('throttle:60,1,sf-orders-read');
     Route::post('/', [StorefrontOrderController::class, 'store'])->middleware('throttle:30,1,sf-order-create');
     Route::get('{orderNo}', [StorefrontOrderController::class, 'show'])->middleware('throttle:60,1,sf-orders-read');
-    // Delivery wale ki live location (customer ka "Track" button). Map har 8 second me poochta hai.
     Route::get('{orderNo}/track', [StorefrontTrackController::class, 'show'])->middleware('throttle:60,1,sf-order-track');
     Route::post('{orderNo}/cancel', [StorefrontOrderController::class, 'cancel'])->middleware('throttle:20,1,sf-order-cancel');
 });
 
-// Store ke staff ke liye online orders (POS login, Sanctum). URL: /api/online-orders
-// "online_store" feature jis store ko superadmin ne chalu kiya ho sirf wahi use kar sakta hai.
+// POS staff online orders
 Route::prefix('online-orders')
     ->middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:online_store'])
     ->group(function () {
@@ -75,7 +67,6 @@ Route::prefix('online-orders')
         Route::get('delivery-staff', [OnlineOrderController::class, 'deliveryStaff']);
         Route::get('{id}', [OnlineOrderController::class, 'show'])->whereNumber('id');
         Route::post('{id}/status', [OnlineOrderController::class, 'updateStatus'])->whereNumber('id');
-        // Delivery ka time badhao / badlo (accept ke baad "Change time" button). Method OnlineOrderController me jodna hai.
         Route::post('{id}/eta', [OnlineOrderController::class, 'updateEta'])->whereNumber('id');
         Route::post('{id}/assign', [OnlineOrderController::class, 'assign'])->whereNumber('id');
         Route::post('{id}/unassign', [OnlineOrderController::class, 'unassign'])->whereNumber('id');
@@ -84,36 +75,45 @@ Route::prefix('online-orders')
             ->middleware('throttle:10,1,pos-otp-resend');
     });
 
-// POS Admin: Online Store Settings + delivery pincodes. URL: /api/online/settings, /api/online/pincodes
+// Online store settings
 Route::prefix('online')
     ->middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:online_store'])
     ->group(function () {
         Route::get('settings', [OnlineStoreController::class, 'show']);
         Route::put('settings', [OnlineStoreController::class, 'update']);
+
         Route::get('pincodes', [OnlineStoreController::class, 'pincodes']);
         Route::post('pincodes', [OnlineStoreController::class, 'addPincodes']);
         Route::put('pincodes/{id}', [OnlineStoreController::class, 'updatePincode'])->whereNumber('id');
         Route::delete('pincodes/{id}', [OnlineStoreController::class, 'destroyPincode'])->whereNumber('id');
+
         Route::get('product-limits', [OnlineProductLimitController::class, 'index']);
         Route::put('product-limits/{productId}', [OnlineProductLimitController::class, 'update'])->whereNumber('productId');
+
+        // Store logo
+        Route::get('logo', [OnlineStoreLogoController::class, 'show']);
+        Route::post('logo', [OnlineStoreLogoController::class, 'store'])->middleware('throttle:20,1,online-logo');
+        Route::delete('logo', [OnlineStoreLogoController::class, 'destroy']);
     });
 
-// Delivery person (role = delivery, ya is_delivery wala staff). URL: /api/delivery/...
-// "feature:online_store" yahan nahi: delivery role ke apne features nahi hote. Store ka online_store feature
-// DeliveryOrderController andar check karta hai. Baaki POS ke APIs delivery token ke liye BlockDeliveryRole se band hain.
+// Delivery person routes
 Route::prefix('delivery')
     ->middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response'])
     ->group(function () {
         Route::get('orders', [DeliveryOrderController::class, 'index']);
         Route::get('history', [DeliveryOrderController::class, 'history']);
         Route::post('duty', [DeliveryOrderController::class, 'duty']);
-        // Delivery wale ka phone har 15 second me apni location yahan bhejta hai (jab tak order raste me ho)
-        Route::post('location', [DeliveryLocationController::class, 'store'])->middleware('throttle:30,1,delivery-location');
+
+        Route::post('location', [DeliveryLocationController::class, 'store'])
+            ->middleware('throttle:30,1,delivery-location');
+
         Route::post('orders/{id}/resend-otp', [DeliveryOrderController::class, 'resendOtp'])
             ->whereNumber('id')
             ->middleware('throttle:10,1,delivery-otp-resend');
+
         Route::post('orders/{id}/delivered', [DeliveryOrderController::class, 'delivered'])
             ->whereNumber('id')
             ->middleware('throttle:30,1,delivery-otp-verify');
+
         Route::post('orders/{id}/failed', [DeliveryOrderController::class, 'failed'])->whereNumber('id');
     });
