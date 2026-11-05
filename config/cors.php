@@ -12,8 +12,10 @@ return [
         'http://127.0.0.1:3000',
         'https://loyality.theaditech.in',
         'https://pos.vakaro.in',
+        'https://store.vakaro.in',
         'http://192.168.1.17:3000',
         'http://192.168.1.16:3000',
+         '#^http://192\.168\.\d{1,3}\.\d{1,3}:3000$#',
     ],
 
     'allowed_origins_patterns' => [],

@@ -43,7 +43,17 @@ class OnlineOrder extends Model
         'addr_lat' => 'float',
         'addr_lng' => 'float',
         'eta_ts' => 'integer',
+        'rider_lat' => 'float',
+        'rider_lng' => 'float',
+        'rider_ts' => 'integer',
     ];
+
+    /** Raste ka andaza: seedhi doori ko 1.35 se guna karke 25 km/h ki speed se. Baad mein admin setting bana sakte hain. */
+    public const ROAD_FACTOR = 1.35;
+    public const SPEED_KMPH = 25;
+
+    /** Store sabse zyada kitne din aage ka time de sakta hai. */
+    public const MAX_EXTEND_DAYS = 7;
 
     protected static function booted(): void
     {
@@ -54,6 +64,14 @@ class OnlineOrder extends Model
                 && $order->status === 'out_for_delivery'
                 && $order->mode === 'delivery') {
                 $order->eta_ts = time() + ((int) $order->travel_minutes) * 60;
+                $order->eta_note = null; // "store ne time badhaya" wali baat ab purani ho gayi
+            }
+
+            // Order raste se hat gaya (deliver / cancel / wapas store): delivery wale ki location mita do
+            if ($order->isDirty('status') && $order->status !== 'out_for_delivery') {
+                $order->rider_lat = null;
+                $order->rider_lng = null;
+                $order->rider_ts = null;
             }
         });
     }
@@ -108,6 +126,76 @@ class OnlineOrder extends Model
         return $text !== '' ? 'https://www.google.com/maps/search/?api=1&query='.rawurlencode($text) : null;
     }
 
+    /**
+     * Store delivery ka time badhata hai (Swiggy / Zomato jaisa). Order raste mein jaane se pehle hi.
+     *  - $addMinutes: abhi ke time me itne minute jodo ("+30 min")
+     *  - $untilTs:    seedha ye time (unix seconds), jaise kal subah 10 baje
+     * Authorization (ye order is staff ka hai ya nahi) calling controller me check karo, jaise accept me hota hai.
+     *
+     * @throws \DomainException  galat status / galat time
+     */
+    public function extendEta(?int $addMinutes, ?int $untilTs = null, ?string $note = null): void
+    {
+        if (! in_array($this->status, ['placed', 'accepted', 'preparing', 'ready'], true)) {
+            throw new \DomainException('The delivery time can only be changed before the order goes out for delivery.');
+        }
+
+        $now = time();
+
+        if ($untilTs) {
+            $target = $untilTs;
+        } elseif ($addMinutes) {
+            $target = max((int) $this->eta_ts, $now) + $addMinutes * 60;
+        } else {
+            return; // koi badlav nahi: default time hi rahega
+        }
+
+        if ($target <= $now) {
+            throw new \DomainException('Please choose a time in the future.');
+        }
+        if ($target > $now + self::MAX_EXTEND_DAYS * 86400) {
+            throw new \DomainException('The delivery time cannot be more than '.self::MAX_EXTEND_DAYS.' days away.');
+        }
+
+        $note = trim((string) $note);
+
+        $this->eta_ts = $target;
+        $this->eta_note = $note !== '' ? mb_substr($note, 0, 200) : 'The store has updated your delivery time.';
+        $this->save();
+
+        $this->events()->create([
+            'status' => $this->status,
+            'actor' => 'staff',
+            'note' => 'Delivery time changed by the store. '.$this->eta_note,
+        ]);
+    }
+
+    /** Delivery wale se customer ke pin tak seedhi doori (km). Dono jagah ki location ho tabhi. */
+    public function distanceToCustomerKm(): ?float
+    {
+        if (! $this->addr_lat || ! $this->addr_lng || ! $this->rider_lat || ! $this->rider_lng) {
+            return null;
+        }
+
+        $earth = 6371.0;
+        $dLat = deg2rad($this->addr_lat - $this->rider_lat);
+        $dLng = deg2rad($this->addr_lng - $this->rider_lng);
+        $a = sin($dLat / 2) ** 2
+            + cos(deg2rad($this->rider_lat)) * cos(deg2rad($this->addr_lat)) * sin($dLng / 2) ** 2;
+
+        return round($earth * 2 * atan2(sqrt($a), sqrt(1 - $a)), 2);
+    }
+
+    /** Delivery wale ki abhi ki jagah se customer tak kitne minute lagenge (andaza). */
+    public function liveEtaMinutes(): ?int
+    {
+        $km = $this->distanceToCustomerKm();
+
+        return $km === null
+            ? null
+            : max(1, (int) ceil(($km * self::ROAD_FACTOR / self::SPEED_KMPH) * 60));
+    }
+
     /** Poora order (storefront aur staff dono ke liye). $staff = true par andar ki ids bhi. */
     public function apiArray(bool $staff = false): array
     {
@@ -149,6 +237,7 @@ class OnlineOrder extends Model
             'placed_at' => $this->placed_at?->toIso8601String(),
             'eta_at' => $this->etaAt()?->toIso8601String(),
             'eta_minutes' => $this->etaMinutes(),
+            'eta_note' => $this->eta_note,
             'items' => $this->items->map(fn($i) => [
                 'product_id' => $i->product_id,
                 'name' => $i->name,

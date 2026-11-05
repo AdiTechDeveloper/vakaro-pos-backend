@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Api\DeliveryLocationController;
 use App\Http\Controllers\Api\DeliveryOrderController;
 use App\Http\Controllers\Api\OnlineOrderController;
 use App\Http\Controllers\Api\OnlineStoreController;
@@ -9,6 +10,7 @@ use App\Http\Controllers\Api\Public\StorefrontAddressController;
 use App\Http\Controllers\Api\Public\StorefrontAuthController;
 use App\Http\Controllers\Api\Public\StorefrontController;
 use App\Http\Controllers\Api\Public\StorefrontOrderController;
+use App\Http\Controllers\Api\Public\StorefrontTrackController;
 use App\Http\Middleware\StorefrontAuth;
 use Illuminate\Support\Facades\Route;
 
@@ -29,7 +31,6 @@ Route::prefix('public')->middleware('throttle:120,1,sf-browse')->group(function 
     Route::get('stores/{slug}/products', [StorefrontController::class, 'products']);
 });
 
-// Location: GPS se pincode / area, aur pincode se area (frontend: /api/public/geo/...)
 // Location: GPS se pincode / area, pincode se area, aur naam se place search (frontend: /api/public/geo/...)
 Route::prefix('public/geo')->middleware('throttle:30,1,sf-geo')->group(function () {
     Route::get('reverse', [GeocodeController::class, 'reverse']);
@@ -60,6 +61,8 @@ Route::prefix('public/orders')->middleware([StorefrontAuth::class])->group(funct
     Route::get('/', [StorefrontOrderController::class, 'index'])->middleware('throttle:60,1,sf-orders-read');
     Route::post('/', [StorefrontOrderController::class, 'store'])->middleware('throttle:30,1,sf-order-create');
     Route::get('{orderNo}', [StorefrontOrderController::class, 'show'])->middleware('throttle:60,1,sf-orders-read');
+    // Delivery wale ki live location (customer ka "Track" button). Map har 8 second me poochta hai.
+    Route::get('{orderNo}/track', [StorefrontTrackController::class, 'show'])->middleware('throttle:60,1,sf-order-track');
     Route::post('{orderNo}/cancel', [StorefrontOrderController::class, 'cancel'])->middleware('throttle:20,1,sf-order-cancel');
 });
 
@@ -72,6 +75,8 @@ Route::prefix('online-orders')
         Route::get('delivery-staff', [OnlineOrderController::class, 'deliveryStaff']);
         Route::get('{id}', [OnlineOrderController::class, 'show'])->whereNumber('id');
         Route::post('{id}/status', [OnlineOrderController::class, 'updateStatus'])->whereNumber('id');
+        // Delivery ka time badhao / badlo (accept ke baad "Change time" button). Method OnlineOrderController me jodna hai.
+        Route::post('{id}/eta', [OnlineOrderController::class, 'updateEta'])->whereNumber('id');
         Route::post('{id}/assign', [OnlineOrderController::class, 'assign'])->whereNumber('id');
         Route::post('{id}/unassign', [OnlineOrderController::class, 'unassign'])->whereNumber('id');
         Route::post('{id}/resend-otp', [OnlineOrderController::class, 'resendOtp'])
@@ -89,7 +94,7 @@ Route::prefix('online')
         Route::post('pincodes', [OnlineStoreController::class, 'addPincodes']);
         Route::put('pincodes/{id}', [OnlineStoreController::class, 'updatePincode'])->whereNumber('id');
         Route::delete('pincodes/{id}', [OnlineStoreController::class, 'destroyPincode'])->whereNumber('id');
-                Route::get('product-limits', [OnlineProductLimitController::class, 'index']);
+        Route::get('product-limits', [OnlineProductLimitController::class, 'index']);
         Route::put('product-limits/{productId}', [OnlineProductLimitController::class, 'update'])->whereNumber('productId');
     });
 
@@ -102,6 +107,8 @@ Route::prefix('delivery')
         Route::get('orders', [DeliveryOrderController::class, 'index']);
         Route::get('history', [DeliveryOrderController::class, 'history']);
         Route::post('duty', [DeliveryOrderController::class, 'duty']);
+        // Delivery wale ka phone har 15 second me apni location yahan bhejta hai (jab tak order raste me ho)
+        Route::post('location', [DeliveryLocationController::class, 'store'])->middleware('throttle:30,1,delivery-location');
         Route::post('orders/{id}/resend-otp', [DeliveryOrderController::class, 'resendOtp'])
             ->whereNumber('id')
             ->middleware('throttle:10,1,delivery-otp-resend');
