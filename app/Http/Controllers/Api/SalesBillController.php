@@ -182,7 +182,7 @@ class SalesBillController extends Controller
 
             return $stock > 0 && $notExpired;
         })
-            ->groupBy(fn ($b) => $b->batch_no.'|'.number_format((float) $b->selling_price, 2, '.', '').'|'.($b->expiry_date ? substr((string) $b->expiry_date, 0, 10) : 'none'))
+            ->groupBy(fn ($b) => $b->batch_no.'|'.number_format((float) $b->selling_price, 6, '.', '').'|'.($b->expiry_date ? substr((string) $b->expiry_date, 0, 10) : 'none'))
             ->map(function ($g) {
                 $first = $g->first();
 
@@ -201,6 +201,8 @@ class SalesBillController extends Controller
                     'mrp' => $first->mrp,
                     'selling_price' => $first->selling_price,
                     'cost_price' => $first->cost_price,
+                    'units_per_pack' => max(1, (int) $first->units_per_pack),
+                    'pack_price' => round((float) $first->selling_price * max(1, (int) $first->units_per_pack), 2),
                     'expiry_date' => $first->expiry_date,
 
                     'qty' => $qty,
@@ -235,6 +237,10 @@ class SalesBillController extends Controller
                 'drug_schedule' => $product->drug_schedule ?? 'none',
                 'requires_prescription' => (int) ($product->requires_prescription ?? 0),
                 'salt_composition' => $product->salt_composition,
+                'allow_loose' => (int) $product->allow_loose,
+                'loose_unit' => $product->loose_unit,
+                'pack_type' => $product->pack_type,
+                'units_per_pack' => $product->units_per_pack,
             ],
             'batches' => $batches,
         ]);
@@ -372,6 +378,7 @@ class SalesBillController extends Controller
             'lines.*.product_id' => 'required|integer',
             'lines.*.inventory_id' => 'required|integer',
             'lines.*.qty' => 'required|numeric|min:0.01',
+            'lines.*.sale_unit' => 'nullable|in:pack,loose',
 
             'customer_id' => 'nullable|exists:customers,id',
             'customer' => 'required|array',
@@ -510,6 +517,19 @@ class SalesBillController extends Controller
                     ->lockForUpdate()
                     ->firstOrFail();
 
+                // Loose selling: inventory of loose-enabled products is stored in single units
+                $factor = max(1, (int) $selectedInventory->units_per_pack);
+                $saleUnit = ($factor > 1 && ($lineData['sale_unit'] ?? 'pack') === 'loose') ? 'loose' : 'pack';
+                $isPackSale = $factor > 1 && $saleUnit === 'pack';
+                $enteredQty = (float) $lineData['qty'];
+
+                if ($factor > 1 && floor($enteredQty) != $enteredQty) {
+                    throw new \Exception("Quantity must be a whole number for {$product->name}.");
+                }
+
+                // From here on every quantity is in single units, exactly like the inventory
+                $requiredQty = $isPackSale ? $enteredQty * $factor : $enteredQty;
+
                 $inventoryPrice = (float) $selectedInventory->selling_price;
 
                 $isOverridden = ! empty($lineData['is_price_overridden']) && $lineData['is_price_overridden'] == true;
@@ -524,8 +544,16 @@ class SalesBillController extends Controller
                 );
 
                 $overridePrice = $isOverridden ? $price : null;
+
+                if ($factor > 1) {
+                    if ($isOverridden) {
+                        throw new \Exception("Price override is not supported for loose-enabled product {$product->name}.");
+                    }
+                    // The client sends pack prices; the stored original price is always per single unit
+                    $originalPrice = $inventoryPrice;
+                }
+
                 $mrp = (float) $selectedInventory->mrp;
-                $requiredQty = (float) $lineData['qty'];
 
                 if ($price <= 0) {
                     throw new \Exception(
@@ -750,6 +778,8 @@ class SalesBillController extends Controller
                         'branch_id' => $branchId,
                         'inventory_id' => $allocation['inventory_id'],
                         'qty' => $allocation['qty'],
+                        'sale_unit' => $saleUnit,
+                        'units_per_pack' => $factor,
                         'rate' => $price,
                         'selling_price' => $price,
                         'original_price' => $originalPrice,
@@ -780,6 +810,8 @@ class SalesBillController extends Controller
                             'expiry_date' => $allocation['expiry_date'],
                             'drug_schedule' => $product->drug_schedule ?? 'none',
                             'qty' => $allocation['qty'],
+                            'sale_unit' => $saleUnit,
+                            'units_per_pack' => $factor,
                             'patient_name' => trim($rx['patient_name']),
                             'patient_age' => $rx['patient_age'] ?? null,
                             'patient_address' => $rx['patient_address'] ?? null,
@@ -1436,11 +1468,19 @@ class SalesBillController extends Controller
                     ?? $line->product->mrp
                 );
 
+                $upp = max(1, (int) $line->units_per_pack);
+                $isPackLine = $upp > 1 && $line->sale_unit === 'pack' && fmod((float) $line->qty, $upp) == 0.0;
+                $displayFactor = $isPackLine ? $upp : 1;
+                $unitLabel = $upp > 1
+                    ? ucfirst($isPackLine ? ($line->product->pack_type ?: 'pack') : ($line->product->loose_unit ?: 'unit'))
+                    : null;
+
                 return [
                     'name' => $line->product->name,
-                    'qty' => $line->qty,
-                    'mrp' => round($mrp, 2),
-                    'selling' => round($sellingPrice, 2),
+                    'qty' => $upp > 1 ? (float) $line->qty / $displayFactor : $line->qty,
+                    'unit' => $unitLabel,
+                    'mrp' => round($mrp * $displayFactor, 2),
+                    'selling' => round($sellingPrice * $displayFactor, 2),
                     'original_price' => round(
                         $line->original_price ?? $sellingPrice,
                         2

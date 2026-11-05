@@ -33,12 +33,14 @@ class Product extends Model
         'image',
 
         // Pharmacy columns
-        'salt_composition', 
-        'manufacturer', 
+        'salt_composition',
+        'manufacturer',
         'drug_schedule',
-        'requires_prescription', 
-        'pack_type', 
+        'requires_prescription',
+        'pack_type',
         'units_per_pack',
+        'allow_loose',
+        'loose_unit',
     ];
 
     // JSON mein `image_url` (poora URL) bhi jaye, taaki admin list/edit seedha dikha sake

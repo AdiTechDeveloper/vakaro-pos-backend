@@ -143,7 +143,7 @@ class ReportController extends Controller
 
         $query = DB::table('products as p')
             ->selectRaw('
-                p.id as product_id,
+                p.id as product_id, p.allow_loose, p.units_per_pack,
                 p.name as product_name,
                 p.barcode as barcode,
                 COALESCE(pur_before.total_purchase, 0) - COALESCE(sal_before.total_sale, 0) as opening_stock,
@@ -156,7 +156,7 @@ class ReportController extends Controller
             ->when($request->search, fn ($q) => $q->where('p.name', 'like', "%{$request->search}%"))
             ->when($request->product_id, fn ($q) => $q->where('p.id', (int) $request->product_id));
 
-        // Specific branch (manager ya admin ne branch choose ki) ho to sirf us branch ka stock wale products
+        // When a manager, or an admin who picked a branch, is viewing: only products stocked in that branch
         if ($user->role === 'manager' || (int) $request->input('branch_id', 0) > 0) {
             $query->whereExists(function ($q) use ($branchIds) {
                 $q->select(DB::raw(1))
@@ -167,9 +167,10 @@ class ReportController extends Controller
         }
 
         $query->leftJoin(DB::raw("(
-            SELECT pl.product_id, SUM(pl.qty + pl.free_qty) AS total_purchase
+            SELECT pl.product_id, SUM((pl.qty + pl.free_qty) * CASE WHEN pr.allow_loose = 1 AND pr.units_per_pack >= 2 THEN pr.units_per_pack ELSE 1 END) AS total_purchase
             FROM purchase_lines pl
             JOIN purchase_bills pb ON pb.id = pl.purchase_bill_id
+            JOIN products pr ON pr.id = pl.product_id
             WHERE pb.bill_date < '{$startDate}' {$branchWherePb}
             GROUP BY pl.product_id
         ) AS pur_before"), 'pur_before.product_id', '=', 'p.id');
@@ -183,9 +184,10 @@ class ReportController extends Controller
         ) AS sal_before"), 'sal_before.product_id', '=', 'p.id');
 
         $query->leftJoin(DB::raw("(
-            SELECT pl.product_id, SUM(pl.qty + pl.free_qty) AS total_purchase
+            SELECT pl.product_id, SUM((pl.qty + pl.free_qty) * CASE WHEN pr.allow_loose = 1 AND pr.units_per_pack >= 2 THEN pr.units_per_pack ELSE 1 END) AS total_purchase
             FROM purchase_lines pl
             JOIN purchase_bills pb ON pb.id = pl.purchase_bill_id
+            JOIN products pr ON pr.id = pl.product_id
             WHERE pb.bill_date BETWEEN '{$startDate}' AND '{$endDate}' {$branchWherePb}
             GROUP BY pl.product_id
         ) AS pur_month"), 'pur_month.product_id', '=', 'p.id');
@@ -247,6 +249,8 @@ class ReportController extends Controller
                 'trend' => $trend,
                 'stock_health' => $stockHealth,
                 'dead_stock' => ($item->sold == 0 && $item->closing_stock > 0),
+                'allow_loose' => (bool) $item->allow_loose,
+                'units_per_pack' => (int) $item->units_per_pack,
             ];
         });
 
@@ -449,7 +453,7 @@ class ReportController extends Controller
 
         $branchId = $request->input('branch_id');
 
-        // Reusable base queries: store + branch scope hamesha lagega
+        // Reusable base queries: the store and branch scope is always applied
         $bills = fn () => DB::table('sales_bills')
             ->where('store_id', $storeId)
             ->whereIn('branch_id', $branchIds)
@@ -596,7 +600,7 @@ class ReportController extends Controller
             $branchIds = $this->resolveBranchIds($request);
             $today = Carbon::today();
 
-            $query = Inventory::with(['product:id,name', 'branch:id,name'])
+            $query = Inventory::with(['product:id,name,pack_type,loose_unit', 'branch:id,name'])
                 ->whereIn('branch_id', $branchIds)
                 ->whereNotNull('expiry_date')
                 ->whereRaw('(qty - sold_qty - COALESCE(expired_qty, 0)) > 0')
@@ -612,7 +616,7 @@ class ReportController extends Controller
 
             $rows = $query->get([
                 'id', 'product_id', 'branch_id', 'batch_no', 'expiry_date',
-                'qty', 'sold_qty', 'expired_qty', 'cost_price',
+                'qty', 'sold_qty', 'expired_qty', 'cost_price', 'units_per_pack',
             ]);
 
             // Same branch + product + batch + expiry = 1 row (free-stock rows merged)
@@ -639,6 +643,12 @@ class ReportController extends Controller
                         'expiry_date' => $expiry->toDateString(),
                         'days_left' => (int) $today->diffInDays($expiry, false),
                         'remaining_qty' => $remaining,
+                        'remaining_label' => \App\Support\StockLabel::format(
+                            $remaining,
+                            (int) ($first->units_per_pack ?? 1),
+                            $first->product->pack_type ?? null,
+                            $first->product->loose_unit ?? null
+                        ),
                         'stock_value' => round($stockValue, 2),
                     ];
                 })

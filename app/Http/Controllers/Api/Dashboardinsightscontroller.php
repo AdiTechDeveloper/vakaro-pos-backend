@@ -1124,6 +1124,16 @@ class DashboardInsightsController extends Controller
         }
 
         $stock = $this->stockByProduct($sm, $branchId, $storeId);
+
+        // Loose-selling products are counted in packs so the low-stock limit means the same thing for everyone
+        $factors = DB::table('products')
+            ->where('store_id', $storeId)
+            ->where('allow_loose', 1)
+            ->where('units_per_pack', '>=', 2)
+            ->pluck('units_per_pack', 'id');
+
+        $stock = $stock->map(fn ($q, $pid) => round((float) $q / max(1, (int) ($factors[$pid] ?? 1)), 2));
+
         $limit = self::LOW_STOCK_LIMIT;
 
         $out = $stock->filter(fn ($q) => (float) $q <= 0)->count();
@@ -1148,7 +1158,7 @@ class DashboardInsightsController extends Controller
                 if ($left <= $limit) {
                     $bestLow[] = [
                         'name' => $b->name,
-                        'sold' => (float) $b->sold,
+                        'sold' => round((float) $b->sold / max(1, (int) ($factors[$b->id] ?? 1)), 2),
                         'left' => $left,
                     ];
                 }
@@ -1209,10 +1219,17 @@ class DashboardInsightsController extends Controller
             $costs = $vq->pluck('v', 'pid');
         }
 
-        $rows = $stock->map(function ($qty, $pid) use ($names, $costs) {
+        // Loose-selling products are shown in packs, like the low-stock numbers
+        $factors = DB::table('products')
+            ->where('store_id', $storeId)
+            ->where('allow_loose', 1)
+            ->where('units_per_pack', '>=', 2)
+            ->pluck('units_per_pack', 'id');
+
+        $rows = $stock->map(function ($qty, $pid) use ($names, $costs, $factors) {
             return [
                 'name' => $names[$pid] ?? 'Unknown',
-                'qty' => (float) $qty,
+                'qty' => round((float) $qty / max(1, (int) ($factors[$pid] ?? 1)), 2),
                 'value' => round(max(0, (float) ($costs[$pid] ?? 0)), 2),
             ];
         })->sortByDesc('value')->values();

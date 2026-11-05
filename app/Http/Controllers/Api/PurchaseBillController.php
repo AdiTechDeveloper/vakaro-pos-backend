@@ -179,6 +179,18 @@ class PurchaseBillController extends Controller
         return collect(FeatureService::storeFeatures($storeId))->contains('pharmacy');
     }
 
+    /**
+     * Number of single units (tablets, capsules...) in one purchased pack.
+     * Only products with "allow_loose" enabled are stocked in single units; every other
+     * product (grocery etc.) keeps factor 1, so its behaviour is unchanged.
+     */
+    private function packFactor(Product $product): int
+    {
+        return ($product->allow_loose && (int) $product->units_per_pack >= 2)
+            ? (int) $product->units_per_pack
+            : 1;
+    }
+
     public function generateBatchNo(int $productId)
     {
         $date = now()->format('Ymd');
@@ -256,7 +268,8 @@ class PurchaseBillController extends Controller
                     ->sum(DB::raw('qty * rate'));
 
                 if ($paidQty > 0) {
-                    $product->cost_price = round($totalValue / $paidQty, 2);
+                    // inventory rate is per single unit for loose products; products.cost_price stays per pack
+                    $product->cost_price = round(($totalValue / $paidQty) * $this->packFactor($product), 2);
                 }
             }
 
@@ -279,7 +292,8 @@ class PurchaseBillController extends Controller
             $expected = (float) $bill->lines
                 ->filter(fn ($l) => (int) $l->product_id === (int) $inv->product_id
                     && strtoupper((string) $l->batch_no) === strtoupper((string) $inv->batch_no))
-                ->sum(fn ($l) => $inv->free ? (float) $l->free_qty : (float) $l->qty);
+                ->sum(fn ($l) => $inv->free ? (float) $l->free_qty : (float) $l->qty)
+                * max(1, (int) $inv->units_per_pack);
 
             if (abs((float) $inv->qty - $expected) > 0.0001) {
                 throw new \DomainException(
@@ -430,7 +444,7 @@ class PurchaseBillController extends Controller
 
                     return response()->json([
                         'status' => false,
-                        'message' => "Selling price can not more than MRP: {$product->name}",
+                        'message' => "Selling price cannot be more than MRP: {$product->name}",
                     ], 422);
                 }
 
@@ -471,6 +485,14 @@ class PurchaseBillController extends Controller
                     $inventoryCostPrice = $enteredPurchaseRate;
                 }
 
+                // Purchase lines stay in packs. Stock of loose-enabled products is kept in single units.
+                $factor = $this->packFactor($product);
+                $unitQty = $qty * $factor;
+                $unitFreeQty = $freeQty * $factor;
+                $unitCost = round($inventoryCostPrice / $factor, 6);
+                $unitMrp = round($mrp / $factor, 6);
+                $unitSellingPrice = round($sellingPrice / $factor, 6);
+
                 $rawBatch = isset($lineData['batch_no']) ? trim($lineData['batch_no']) : '';
                 if ($isPharmacy) {
                     $rawBatch = strtoupper($rawBatch);
@@ -503,16 +525,17 @@ class PurchaseBillController extends Controller
                 // Setup or link Barcodes safely
                 $existingBatch = Inventory::where('product_id', $product->id)
                     ->where('branch_id', $branchId)
-                    ->where('selling_price', $sellingPrice)
-                    ->where('mrp', $mrp)
+                    ->where('selling_price', $unitSellingPrice)
+                    ->where('mrp', $unitMrp)
                     ->where('batch_no', $batchNo)
-                    ->where('cost_price', $inventoryCostPrice)
+                    ->where('cost_price', $unitCost)
+                    ->where('units_per_pack', $factor)
                     ->where('free', 0)
                     ->when($isPharmacy, fn ($q) => $q->whereDate('expiry_date', $purchaseLine['expiry_date']))
                     ->first();
 
                 if ($existingBatch) {
-                    $existingBatch->increment('qty', $qty);
+                    $existingBatch->increment('qty', $unitQty);
                     $existingBatch->amount = $existingBatch->qty * $existingBatch->cost_price;
                     // Re-point this batch at the current line so future edits can find it again
                     $existingBatch->purchase_line_id = $purchaseLine->id;
@@ -531,13 +554,14 @@ class PurchaseBillController extends Controller
                         'purchase_line_id' => $purchaseLine->id,
                         'batch_barcode' => $batchBarcode,
                         'batch_no' => $batchNo,
-                        'mrp' => $mrp,
-                        'selling_price' => $sellingPrice,
-                        'cost_price' => $inventoryCostPrice,
-                        'qty' => $qty,
+                        'mrp' => $unitMrp,
+                        'selling_price' => $unitSellingPrice,
+                        'cost_price' => $unitCost,
+                        'units_per_pack' => $factor,
+                        'qty' => $unitQty,
                         'sold_qty' => 0,
                         'free' => 0,
-                        'rate' => $inventoryCostPrice,
+                        'rate' => $unitCost,
                         'amount' => $taxable,
                         'expiry_date' => $lineData['expiry_date'] ?? null,
                         'is_opening' => (int) ($lineData['is_opening'] ?? 0),
@@ -549,14 +573,15 @@ class PurchaseBillController extends Controller
                     $existingFreeBatch = Inventory::where('product_id', $product->id)
                         ->where('branch_id', $branchId)
                         ->where('batch_no', $batchNo)
-                        ->where('mrp', $mrp)
-                        ->where('selling_price', $sellingPrice)
+                        ->where('mrp', $unitMrp)
+                        ->where('selling_price', $unitSellingPrice)
                         ->where('cost_price', 0)
+                        ->where('units_per_pack', $factor)
                         ->where('free', 1)
                         ->first();
 
                     if ($existingFreeBatch) {
-                        $existingFreeBatch->increment('qty', $freeQty);
+                        $existingFreeBatch->increment('qty', $unitFreeQty);
                         $existingFreeBatch->purchase_line_id = $purchaseLine->id;
                         $existingFreeBatch->save();
                     } else {
@@ -567,10 +592,11 @@ class PurchaseBillController extends Controller
                             'purchase_line_id' => $purchaseLine->id,
                             'batch_barcode' => $batchBarcode,
                             'batch_no' => $batchNo,
-                            'mrp' => $mrp,
-                            'selling_price' => $sellingPrice,
+                            'mrp' => $unitMrp,
+                            'selling_price' => $unitSellingPrice,
                             'cost_price' => 0,
-                            'qty' => $freeQty,
+                            'units_per_pack' => $factor,
+                            'qty' => $unitFreeQty,
                             'sold_qty' => 0,
                             'free' => 1,
                             'rate' => 0,
@@ -787,7 +813,7 @@ class PurchaseBillController extends Controller
 
                     return response()->json([
                         'status' => false,
-                        'message' => "Selling price MRP se zyada nahi ho sakta: {$product->name}",
+                        'message' => "Selling price cannot be more than MRP: {$product->name}",
                     ], 422);
                 }
 
@@ -833,6 +859,14 @@ class PurchaseBillController extends Controller
                 }
 
                 $totalGst = $cgst + $sgst + $igst;
+
+                // Purchase lines stay in packs. Stock of loose-enabled products is kept in single units.
+                $factor = $this->packFactor($product);
+                $unitQty = $qty * $factor;
+                $unitFreeQty = $freeQty * $factor;
+                $unitCost = round($inventoryCostRate / $factor, 6);
+                $unitMrp = round($mrp / $factor, 6);
+                $unitSellingPrice = round($sellingPrice / $factor, 6);
 
                 // Manage batches
                 $rawBatch = isset($line['batch_no']) ? trim($line['batch_no']) : '';
@@ -883,23 +917,29 @@ class PurchaseBillController extends Controller
 
                 if ($existingInventory) {
 
+                    if ((int) $existingInventory->units_per_pack !== $factor) {
+                        throw new \Exception(
+                            "Pack size of {$product->name} changed after this bill was created, so this bill cannot be edited."
+                        );
+                    }
+
                     $minimumQty = (float) $existingInventory->sold_qty
                         + (float) ($existingInventory->expired_qty ?? 0);
 
-                    if ($qty < $minimumQty) {
+                    if ($unitQty < $minimumQty) {
                         throw new \Exception(
                             "Purchase quantity cannot be less than sold/expired quantity for {$product->name}"
                         );
                     }
 
                     // Update same inventory row with edited purchase details
-                    $existingInventory->qty = $qty;
+                    $existingInventory->qty = $unitQty;
                     $existingInventory->purchase_line_id = $purchaseLine->id;
-                    $existingInventory->mrp = $mrp;
-                    $existingInventory->selling_price = $sellingPrice;
-                    $existingInventory->cost_price = $inventoryCostRate;
-                    $existingInventory->rate = $inventoryCostRate;
-                    $existingInventory->amount = $qty * $inventoryCostRate;
+                    $existingInventory->mrp = $unitMrp;
+                    $existingInventory->selling_price = $unitSellingPrice;
+                    $existingInventory->cost_price = $unitCost;
+                    $existingInventory->rate = $unitCost;
+                    $existingInventory->amount = $unitQty * $unitCost;
                     $existingInventory->expiry_date = $line['expiry_date'] ?? null;
                     $existingInventory->is_opening = (int) ($line['is_opening'] ?? 0);
                     $existingInventory->save();
@@ -920,15 +960,16 @@ class PurchaseBillController extends Controller
                         'purchase_line_id' => $purchaseLine->id,
                         'batch_barcode' => $batchBarcode,
                         'batch_no' => $batchNo,
-                        'mrp' => $mrp,
-                        'selling_price' => $sellingPrice,
-                        'cost_price' => $inventoryCostRate,
-                        'qty' => $qty,
+                        'mrp' => $unitMrp,
+                        'selling_price' => $unitSellingPrice,
+                        'cost_price' => $unitCost,
+                        'units_per_pack' => $factor,
+                        'qty' => $unitQty,
                         'sold_qty' => 0,
                         'expired_qty' => 0,
                         'free' => 0,
-                        'rate' => $inventoryCostRate,
-                        'amount' => $qty * $inventoryCostRate,
+                        'rate' => $unitCost,
+                        'amount' => $unitQty * $unitCost,
                         'expiry_date' => $expiryDate,
                         'is_opening' => (int) ($line['is_opening'] ?? 0),
                     ]);
@@ -945,19 +986,25 @@ class PurchaseBillController extends Controller
 
                     if ($existingFreeInventory) {
 
+                        if ((int) $existingFreeInventory->units_per_pack !== $factor) {
+                            throw new \Exception(
+                                "Pack size of {$product->name} changed after this bill was created, so this bill cannot be edited."
+                            );
+                        }
+
                         $minimumQty = (float) $existingFreeInventory->sold_qty
                             + (float) ($existingFreeInventory->expired_qty ?? 0);
 
-                        if ($freeQty < $minimumQty) {
+                        if ($unitFreeQty < $minimumQty) {
                             throw new \Exception(
                                 "Free stock cannot be less than sold/expired quantity for {$product->name}"
                             );
                         }
 
-                        $existingFreeInventory->qty = $freeQty;
+                        $existingFreeInventory->qty = $unitFreeQty;
                         $existingFreeInventory->purchase_line_id = $purchaseLine->id;
-                        $existingFreeInventory->mrp = $mrp;
-                        $existingFreeInventory->selling_price = $sellingPrice;
+                        $existingFreeInventory->mrp = $unitMrp;
+                        $existingFreeInventory->selling_price = $unitSellingPrice;
                         $existingFreeInventory->expiry_date = $line['expiry_date'] ?? null;
                         $existingFreeInventory->save();
                         $keptInventoryIds[] = $existingFreeInventory->id;
@@ -969,10 +1016,11 @@ class PurchaseBillController extends Controller
                             'purchase_line_id' => $purchaseLine->id,
                             'batch_barcode' => $batchBarcode,
                             'batch_no' => $batchNo,
-                            'mrp' => $mrp,
-                            'selling_price' => $sellingPrice,
+                            'mrp' => $unitMrp,
+                            'selling_price' => $unitSellingPrice,
                             'cost_price' => 0,
-                            'qty' => $freeQty,
+                            'units_per_pack' => $factor,
+                            'qty' => $unitFreeQty,
                             'sold_qty' => 0,
                             'free' => 1,
                             'rate' => 0,

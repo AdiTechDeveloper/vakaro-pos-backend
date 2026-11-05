@@ -19,6 +19,7 @@ class Inventory extends Model
         'selling_price',
         'cost_price',
         'qty',
+        'units_per_pack',
         'sold_qty',
         'expired_qty',
         'expired_at',

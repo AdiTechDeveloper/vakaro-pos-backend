@@ -12,6 +12,8 @@ class SalesBillLine extends Model
         'branch_id',
         'inventory_id',
         'qty',
+        'sale_unit',
+        'units_per_pack',
         'rate',
         'selling_price',
         'original_price',
