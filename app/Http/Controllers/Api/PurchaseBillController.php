@@ -1052,24 +1052,48 @@ class PurchaseBillController extends Controller
                 $processedProducts[] = $product->id;
             }
 
+            // $staleIds = array_values(array_diff($oldInventoryIds, $keptInventoryIds));
+            // if (! empty($staleIds)) {
+            //     $staleRows = Inventory::whereIn('id', $staleIds)->lockForUpdate()->get();
+
+            //     foreach ($staleRows as $stale) {
+            //         $used = (float) $stale->sold_qty + (float) ($stale->expired_qty ?? 0);
+            //         if ($used > 0) {
+            //             $staleName = Product::where('id', $stale->product_id)->value('name') ?? "Product #{$stale->product_id}";
+
+            //             throw new \Exception(
+            //                 "Cannot remove/change batch {$stale->batch_no} of {$staleName}: {$used} unit(s) already sold/written off."
+            //             );
+            //         }
+
+            //         $processedProducts[] = $stale->product_id;
+            //         $stale->delete();
+            //     }
+            // }
+
             $staleIds = array_values(array_diff($oldInventoryIds, $keptInventoryIds));
-            if (! empty($staleIds)) {
-                $staleRows = Inventory::whereIn('id', $staleIds)->lockForUpdate()->get();
 
-                foreach ($staleRows as $stale) {
-                    $used = (float) $stale->sold_qty + (float) ($stale->expired_qty ?? 0);
-                    if ($used > 0) {
-                        $staleName = Product::where('id', $stale->product_id)->value('name') ?? "Product #{$stale->product_id}";
+if (!empty($staleIds)) {
+    $staleRows = Inventory::whereIn('id', $staleIds)
+        ->lockForUpdate()
+        ->get();
 
-                        throw new \Exception(
-                            "Cannot remove/change batch {$stale->batch_no} of {$staleName}: {$used} unit(s) already sold/written off."
-                        );
-                    }
+    foreach ($staleRows as $stale) {
+        $used = (float) $stale->sold_qty
+            + (float) ($stale->expired_qty ?? 0);
 
-                    $processedProducts[] = $stale->product_id;
-                    $stale->delete();
-                }
-            }
+        // Sold / written-off inventory must be preserved.
+        // Do not fail the entire bill update just because a row
+        // was not matched during reconciliation.
+        if ($used > 0) {
+            $processedProducts[] = $stale->product_id;
+            continue;
+        }
+
+        $processedProducts[] = $stale->product_id;
+        $stale->delete();
+    }
+}
 
             if ($request->has('payments')) {
                 PurchasePayment::where('purchase_bill_id', $bill->id)

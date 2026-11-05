@@ -1456,4 +1456,290 @@ class ProductController extends Controller
 
         return (int) $cache[$key];
     }
+
+    public function bulkUploadImages(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'file' => 'required|file|mimes:zip|max:51200',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => false,
+                'message' => $validator->errors()->first(),
+            ], 422);
+        }
+
+        $user = Auth::user();
+
+        if (! $user || ! in_array($user->role, ['admin', 'manager'])) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Unauthorized access.',
+            ], 403);
+        }
+
+        if (! class_exists(\ZipArchive::class)) {
+            return response()->json([
+                'status' => false,
+                'message' => 'PHP ZIP extension is not enabled.',
+            ], 500);
+        }
+
+        $zip = new \ZipArchive;
+
+        $openResult = $zip->open($request->file('file')->getRealPath());
+
+        if ($openResult !== true) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Unable to open ZIP file.',
+            ], 422);
+        }
+
+        $totalFiles = 0;
+        $updated = 0;
+        $notFound = 0;
+        $failed = 0;
+
+        $results = [];
+        $processedSkus = [];
+
+        $storeId = $user->store_id;
+
+        try {
+            // Maximum 1000 ZIP entries
+            if ($zip->numFiles > 1000) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'ZIP file contains too many entries. Maximum allowed is 1000.',
+                ], 422);
+            }
+
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+
+                $entryName = $zip->getNameIndex($i);
+
+                if (! $entryName) {
+                    continue;
+                }
+
+                // Normalize Windows and Linux paths
+                $entryName = str_replace('\\', '/', $entryName);
+
+                // Skip directories
+                if (str_ends_with($entryName, '/')) {
+                    continue;
+                }
+
+                // Get filename from root or nested folder
+                $filename = basename($entryName);
+
+                $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+
+                // Only supported image formats
+                if (! in_array($extension, ['jpg', 'jpeg', 'png', 'webp'])) {
+                    continue;
+                }
+
+                $totalFiles++;
+
+                // Maximum 5 MB per image
+                $fileStat = $zip->statIndex($i);
+                $fileSize = $fileStat['size'] ?? 0;
+
+                if ($fileSize <= 0 || $fileSize > 5 * 1024 * 1024) {
+                    $failed++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'status' => 'failed',
+                        'reason' => 'Invalid image size. Maximum allowed is 5 MB.',
+                    ];
+
+                    continue;
+                }
+
+                // SKU is filename without extension
+                $sku = trim(pathinfo($filename, PATHINFO_FILENAME));
+
+                if ($sku === '') {
+                    $failed++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'status' => 'failed',
+                        'reason' => 'SKU is missing from filename.',
+                    ];
+
+                    continue;
+                }
+
+                // Prevent duplicate SKU entries in ZIP
+                if (isset($processedSkus[$sku])) {
+                    $failed++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'sku' => $sku,
+                        'status' => 'failed',
+                        'reason' => 'Duplicate SKU found in ZIP.',
+                    ];
+
+                    continue;
+                }
+
+                $processedSkus[$sku] = true;
+
+                // Read image contents
+                $contents = $zip->getFromIndex($i);
+
+                if ($contents === false) {
+                    $failed++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'sku' => $sku,
+                        'status' => 'failed',
+                        'reason' => 'Unable to read image from ZIP.',
+                    ];
+
+                    continue;
+                }
+
+                // Verify actual image MIME type
+                $finfo = new \finfo(FILEINFO_MIME_TYPE);
+                $mimeType = $finfo->buffer($contents);
+
+                $allowedMimes = [
+                    'jpg' => ['image/jpeg'],
+                    'jpeg' => ['image/jpeg'],
+                    'png' => ['image/png'],
+                    'webp' => ['image/webp'],
+                ];
+
+                if (! in_array($mimeType, $allowedMimes[$extension] ?? [])) {
+                    $failed++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'sku' => $sku,
+                        'status' => 'failed',
+                        'reason' => 'Invalid image format or file extension mismatch.',
+                    ];
+
+                    continue;
+                }
+
+                // Find product in current store
+                $products = Product::where('store_id', $storeId)
+                    ->where('sku', $sku)
+                    ->get();
+
+                if ($products->isEmpty()) {
+                    $notFound++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'sku' => $sku,
+                        'status' => 'not_found',
+                        'reason' => 'Product not found.',
+                    ];
+
+                    continue;
+                }
+
+                if ($products->count() > 1) {
+                    $failed++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'sku' => $sku,
+                        'status' => 'failed',
+                        'reason' => 'Duplicate SKU found in database.',
+                    ];
+
+                    continue;
+                }
+
+                $product = $products->first();
+
+                $oldImage = $product->image;
+                $newPath = null;
+
+                try {
+                    $newPath = 'products/'.$storeId.'/'.
+                        \Illuminate\Support\Str::uuid().'.'.$extension;
+
+                    // Save new image
+                    $saved = Storage::disk('public')->put($newPath, $contents);
+
+                    if (! $saved) {
+                        throw new \RuntimeException('Unable to save image.');
+                    }
+
+                    // Update product image
+                    $product->update([
+                        'image' => $newPath,
+                        'updated_by' => $user->id,
+                    ]);
+
+                    // Delete old image after successful update
+                    if (
+                        $oldImage &&
+                        $oldImage !== $newPath &&
+                        Storage::disk('public')->exists($oldImage)
+                    ) {
+                        Storage::disk('public')->delete($oldImage);
+                    }
+
+                    $updated++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'sku' => $sku,
+                        'product_id' => $product->id,
+                        'status' => 'updated',
+                        'message' => 'Product image uploaded successfully.',
+                    ];
+
+                } catch (\Throwable $e) {
+
+                    // Remove newly uploaded image if update fails
+                    if ($newPath && Storage::disk('public')->exists($newPath)) {
+                        Storage::disk('public')->delete($newPath);
+                    }
+
+                    $failed++;
+
+                    \Log::error('Bulk product image upload failed', [
+                        'sku' => $sku,
+                        'error' => $e->getMessage(),
+                    ]);
+
+                    $results[] = [
+                        'file' => $filename,
+                        'sku' => $sku,
+                        'status' => 'failed',
+                        'reason' => 'Failed to update product image.',
+                    ];
+                }
+            }
+
+        } finally {
+            $zip->close();
+        }
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Bulk image upload completed.',
+            'summary' => [
+                'total_files' => $totalFiles,
+                'updated' => $updated,
+                'not_found' => $notFound,
+                'failed' => $failed,
+            ],
+            'results' => $results,
+        ]);
+    }
 }

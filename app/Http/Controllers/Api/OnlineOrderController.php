@@ -118,6 +118,47 @@ class OnlineOrderController extends Controller
         return response()->json(['status' => true, 'data' => $order->fresh(['items', 'events'])->apiArray(true)]);
     }
 
+    // POST /api/online-orders/{id}/eta   { add_minutes? | until?, note? }
+    // Delivery ka time badhao (Swiggy jaisa): "+10 min" se "+3 din" tak, ya 7 din ke andar koi bhi date-time
+    // (until = unix seconds). Sirf order raste mein jaane se pehle (placed / accepted / preparing / ready).
+    // Customer ko naya time aur wajah (note) uske order page par dikhti hai.
+    public function updateEta(Request $request, int $id): JsonResponse
+    {
+        [$storeId, $branchIds] = $this->onlineScope($request);
+
+        $data = $request->validate([
+            'add_minutes' => ['nullable', 'integer', 'min:1', 'max:'.(OnlineOrder::MAX_EXTEND_DAYS * 1440)],
+            'until' => ['nullable', 'integer', 'min:1'],
+            'note' => ['nullable', 'string', 'max:200'],
+        ]);
+
+        if (empty($data['add_minutes']) && empty($data['until'])) {
+            return $this->fail('Choose how much time to add, or a date and time.', 422);
+        }
+
+        $error = null;
+        $order = null;
+
+        DB::transaction(function () use ($storeId, $branchIds, $id, $data, &$error, &$order) {
+            $order = OnlineOrder::where('store_id', $storeId)
+                ->whereIn('branch_id', $branchIds)
+                ->lockForUpdate()
+                ->findOrFail($id);
+
+            try {
+                $order->extendEta($data['add_minutes'] ?? null, $data['until'] ?? null, $data['note'] ?? null);
+            } catch (\DomainException $e) {
+                $error = $e->getMessage();
+            }
+        });
+
+        if ($error) {
+            return $this->fail($error, 422);
+        }
+
+        return response()->json(['status' => true, 'data' => $order->fresh(['items', 'events'])->apiArray(true)]);
+    }
+
     // GET /api/online-orders/delivery-staff  -> assign dropdown ke liye (branch-wise)
     // Delivery person = role "delivery" wala user, ya koi staff jiska is_delivery on hai.
     // Branch = branch_staff table. Admin (jiski branch_staff row nahi) khud ko sab branches ke liye assign kar sakta hai.

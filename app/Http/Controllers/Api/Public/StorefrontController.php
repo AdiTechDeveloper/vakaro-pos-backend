@@ -130,8 +130,16 @@ class StorefrontController extends Controller
         if ($this->hasCol('categories', 'deleted_at')) {
             $query->whereNull('c.deleted_at');
         }
+        if ($this->hasCol('categories', 'image')) {
+            $query->addSelect('c.image');
+        }
 
-        return response()->json(['data' => $query->get()]);
+        $rows = $query->get()->map(function ($r) {
+            $r->image = !empty($r->image) ? asset('storage/' . $r->image) : null;
+            return $r;
+        });
+
+        return response()->json(['data' => $rows]);
     }
 
     // GET /api/public/stores/{slug}/products?category_id=&search=&page=&per_page=
@@ -194,8 +202,11 @@ class StorefrontController extends Controller
 
         $reserved = app(\App\Services\StorefrontCatalog::class)
             ->reservedMap($branchId, $page->getCollection()->pluck('id')->all());
+        $limits = app(\App\Services\StorefrontCatalog::class)
+            ->limitMap((int) $store->store_id, $page->getCollection()->pluck('id')->all());
+        $storeLimit = $store->max_qty_per_product ?? null;
 
-        $items = $page->getCollection()->map(function ($p) use ($reserved) {
+        $items = $page->getCollection()->map(function ($p) use ($reserved, $limits, $storeLimit) {
 
             $isUnit = in_array($p->sale_type, [null, '', 'unit'], true);
 
@@ -216,7 +227,13 @@ class StorefrontController extends Controller
                 'sku' => $p->sku,
                 'barcode' => $p->barcode,
                 'category_id' => $p->category_id,
-                'image' => $p->image ? '/storage/'.$p->image : null, // relative path: storefront apne API ke origin se jodta hai
+                'image' => $p->image
+                    ? url('/storage/' . $p->image)
+                    : null,
+
+                'image_url' => $p->image
+                    ? url('/storage/' . $p->image)
+                    : null,
                 'sale_type' => $p->sale_type ?: 'unit',
                 'price_unit' => $isUnit ? 'piece' : 'kg',
                 'mrp' => $mrp,
@@ -226,6 +243,7 @@ class StorefrontController extends Controller
                     ? (int) round(($mrp - $price) / $mrp * 100)
                     : 0,
                 'online_qty' => $qty,
+                'max_per_order' => \App\Services\StorefrontCatalog::effectiveLimit($limits[$p->id] ?? null, $storeLimit, $isUnit),
                 'in_stock' => $qty > 0,
             ];
         })->values();

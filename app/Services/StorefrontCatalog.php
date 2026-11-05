@@ -17,6 +17,35 @@ class StorefrontCatalog
     }
 
     /**
+     * Ek order mein is product ki max quantity: product ka apna limit, nahi to store ka default, nahi to koi limit nahi (null).
+     * Piece wale items ke liye poora number (kam se kam 1).
+     */
+    public static function effectiveLimit($productLimit, $storeLimit, bool $isUnit): ?float
+    {
+        $v = $productLimit !== null ? (float) $productLimit : ($storeLimit !== null ? (float) $storeLimit : null);
+        if ($v === null || $v <= 0) {
+            return null;
+        }
+
+        return $isUnit ? max(1.0, floor($v)) : round($v, 2);
+    }
+
+    /** @return array<int,float>  product_id => us product ka apna limit */
+    public function limitMap(int $storeId, array $productIds): array
+    {
+        if (! $productIds) {
+            return [];
+        }
+
+        return DB::table('online_product_limits')
+            ->where('store_id', $storeId)
+            ->whereIn('product_id', $productIds)
+            ->pluck('max_qty', 'product_id')
+            ->map(fn ($v) => (float) $v)
+            ->all();
+    }
+
+    /**
      * Jo online orders abhi tak deliver nahi hue, unka product-wise qty.
      * Is branch ka online stock itna kam maana jata hai (warna do customers ko same stock bik jayega).
      *
@@ -77,6 +106,8 @@ class StorefrontCatalog
             ->get();
 
         $reserved = $this->reservedMap($branchId, $rows->pluck('id')->all());
+        $limits = $this->limitMap((int) $store->store_id, $rows->pluck('id')->all());
+        $storeLimit = $store->max_qty_per_product ?? null;
 
         $out = [];
         foreach ($rows as $p) {
@@ -91,6 +122,12 @@ class StorefrontCatalog
             $qty = max(0.0, (float) $p->online_qty - ($reserved[$p->id] ?? 0.0));
             $qty = $isUnit ? (float) floor($qty) : floor($qty * 100) / 100;
 
+            // Per-order limit: ek baar mein is se zyada nahi (stock zyada ho tab bhi)
+            $cap = self::effectiveLimit($limits[$p->id] ?? null, $storeLimit, $isUnit);
+            if ($cap !== null) {
+                $qty = min($qty, $cap);
+            }
+
             $out[(int) $p->id] = [
                 'id' => (int) $p->id,
                 'name' => $p->name,
@@ -99,6 +136,7 @@ class StorefrontCatalog
                 'price_unit' => $isUnit ? 'piece' : 'kg',
                 'is_unit' => $isUnit,
                 'available' => $qty,
+                'max_per_order' => $cap,
             ];
         }
 
