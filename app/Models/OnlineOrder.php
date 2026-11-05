@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Support\Carbon;
 
 class OnlineOrder extends Model
 {
@@ -39,7 +40,23 @@ class OnlineOrder extends Model
         'delivery_fee' => 'float',
         'total' => 'float',
         'total_saved' => 'float',
+        'addr_lat' => 'float',
+        'addr_lng' => 'float',
+        'eta_ts' => 'integer',
     ];
+
+    protected static function booted(): void
+    {
+        // Delivery wala order raste mein nikla: ab sirf raste ka time bacha hai.
+        // Ye yahin model mein hai, isliye staff ka status badalne wala code chhedna nahi padta.
+        static::updating(function (OnlineOrder $order) {
+            if ($order->isDirty('status')
+                && $order->status === 'out_for_delivery'
+                && $order->mode === 'delivery') {
+                $order->eta_ts = time() + ((int) $order->travel_minutes) * 60;
+            }
+        });
+    }
 
     public function items(): HasMany
     {
@@ -49,6 +66,46 @@ class OnlineOrder extends Model
     public function events(): HasMany
     {
         return $this->hasMany(OnlineOrderEvent::class)->orderBy('id');
+    }
+
+    /**
+     * Order kab tak pahunchega (unix seconds se, timezone ka koi asar nahi).
+     * Order khatam ho gaya, ya pickup order ready hai, to koi time nahi.
+     */
+    public function etaAt(): ?Carbon
+    {
+        if (! $this->eta_ts || ! in_array($this->status, self::PENDING_STATUSES, true)) {
+            return null;
+        }
+        if ($this->mode !== 'delivery' && $this->status === 'ready') {
+            return null;
+        }
+
+        return Carbon::createFromTimestamp((int) $this->eta_ts);
+    }
+
+    public function etaMinutes(): ?int
+    {
+        $eta = $this->etaAt();
+
+        return $eta ? max(0, (int) ceil(($eta->getTimestamp() - time()) / 60)) : null;
+    }
+
+    /**
+     * Customer ke exact pin par Google Maps. Pin na ho (address haath se likha tha) to
+     * address ke text se search, taaki delivery wale ke paas hamesha kuch na kuch ho.
+     */
+    public function mapsUrl(): ?string
+    {
+        if ($this->addr_lat && $this->addr_lng) {
+            return 'https://www.google.com/maps/dir/?api=1&destination='.$this->addr_lat.','.$this->addr_lng;
+        }
+
+        $text = trim(implode(', ', array_filter([
+            $this->addr_line1, $this->addr_line2, $this->addr_landmark, $this->addr_city, $this->addr_pincode,
+        ])));
+
+        return $text !== '' ? 'https://www.google.com/maps/search/?api=1&query='.rawurlencode($text) : null;
     }
 
     /** Poora order (storefront aur staff dono ke liye). $staff = true par andar ki ids bhi. */
@@ -79,6 +136,10 @@ class OnlineOrder extends Model
                 'landmark' => $this->addr_landmark,
                 'city' => $this->addr_city,
                 'pincode' => $this->addr_pincode,
+                'lat' => $this->addr_lat,
+                'lng' => $this->addr_lng,
+                'has_pin' => (bool) ($this->addr_lat && $this->addr_lng),
+                'maps_url' => $this->mapsUrl(),
             ] : null,
             'note' => $this->note,
             'subtotal' => $this->subtotal,
@@ -86,6 +147,8 @@ class OnlineOrder extends Model
             'total' => $this->total,
             'total_saved' => $this->total_saved,
             'placed_at' => $this->placed_at?->toIso8601String(),
+            'eta_at' => $this->etaAt()?->toIso8601String(),
+            'eta_minutes' => $this->etaMinutes(),
             'items' => $this->items->map(fn($i) => [
                 'product_id' => $i->product_id,
                 'name' => $i->name,
@@ -160,6 +223,11 @@ class OnlineOrder extends Model
                 'landmark' => $this->addr_landmark,
                 'city' => $this->addr_city,
                 'pincode' => $this->addr_pincode,
+                // Customer ne map par jahan pin rakha tha wahi exact jagah
+                'lat' => $this->addr_lat,
+                'lng' => $this->addr_lng,
+                'has_pin' => (bool) ($this->addr_lat && $this->addr_lng),
+                'maps_url' => $this->mapsUrl(),
             ],
             'note' => $this->note,
             'items' => $this->items->map(fn ($i) => [
@@ -195,6 +263,7 @@ class OnlineOrder extends Model
             'items_preview' => $this->items->take(3)->pluck('name')->values(),
         ];
     }
+
     public function deliveryUser()
     {
         return $this->belongsTo(\App\Models\User::class, 'delivery_user_id');
