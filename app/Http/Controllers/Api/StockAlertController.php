@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Inventory;
+use App\Support\StockLabel;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 
@@ -21,11 +22,13 @@ class StockAlertController extends Controller
                 branch_id,
                 batch_no,
                 SUM(qty) as total_qty,
-                SUM(sold_qty) as total_sold
+                SUM(sold_qty) as total_sold,
+                SUM(COALESCE(expired_qty, 0)) as total_expired,
+                MAX(COALESCE(units_per_pack, 1)) as pack_factor
             ')
             ->with([
-                'product:id,name,sku',
-                'branch:id,name'
+                'product:id,name,sku,pack_type,loose_unit',
+                'branch:id,name',
             ])
             ->groupBy('product_id', 'branch_id', 'batch_no');
 
@@ -45,25 +48,26 @@ class StockAlertController extends Controller
             $query->whereIn('branch_id', $branchIds);
         }
 
-        $query->havingRaw('(SUM(qty) - SUM(sold_qty)) <= 10');
+        $query->havingRaw('(SUM(qty) - SUM(sold_qty) - SUM(COALESCE(expired_qty, 0))) <= 10 * MAX(COALESCE(units_per_pack, 1))');
 
         $alerts = $query->get()->map(function ($item) {
-            $availableQty = ($item->total_qty ?? 0) - ($item->total_sold ?? 0);
+            $availableQty = ($item->total_qty ?? 0) - ($item->total_sold ?? 0) - ($item->total_expired ?? 0);
 
             return [
-                'product_id'    => $item->product_id,
-                'batch_no'       => $item->batch_no,
-                'product_name'   => $item->product->name ?? '-',
-                'sku'            => $item->product->sku ?? '-',
-                'branch_name'    => $item->branch->name ?? '-',
-                'available_qty'  => $availableQty,
-                'severity'       => $availableQty <= 0 ? 'out of stock' : 'warning',
+                'product_id' => $item->product_id,
+                'batch_no' => $item->batch_no,
+                'product_name' => $item->product->name ?? '-',
+                'sku' => $item->product->sku ?? '-',
+                'branch_name' => $item->branch->name ?? '-',
+                'available_qty' => $availableQty,
+                'available_label' => StockLabel::format($availableQty, (int) ($item->pack_factor ?? 1), $item->product->pack_type ?? null, $item->product->loose_unit ?? null),
+                'severity' => $availableQty <= 0 ? 'out of stock' : 'warning',
             ];
         });
 
         return response()->json([
-            'total'  => $alerts->count(),
-            'alerts' => $alerts
+            'total' => $alerts->count(),
+            'alerts' => $alerts,
         ]);
     }
 }

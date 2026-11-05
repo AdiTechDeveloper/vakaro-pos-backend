@@ -10,6 +10,8 @@ use App\Models\Brand;
 use App\Models\Category;
 use App\Models\Inventory;
 use App\Models\Product;
+use App\Services\FeatureService;
+use App\Support\StockLabel;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -114,8 +116,6 @@ class ProductController extends Controller
 
         $showOutOfStock = $request->boolean('show_out_of_stock', false);
 
-       
-
         $products = Product::where('products.store_id', $storeId)
             ->when($request->category_id, function ($q) use ($request) {
                 $q->where('category_id', $request->category_id);
@@ -133,26 +133,10 @@ class ProductController extends Controller
             })
             ->with(['store', 'brand', 'category', 'gstRate'])
             ->with(['inventories' => function ($q) use ($branchIds) {
-    $q->whereIn('branch_id', $branchIds)
-        ->orderByRaw('expiry_date IS NULL, expiry_date ASC')
-        ->orderBy('id', 'asc');
-}])
-            // ->with(['inventories' => function ($q) use ($branchIds) {
-            //     $q->whereIn('branch_id', $branchIds)
-            //         ->whereRaw(
-            //             '(qty - sold_qty - COALESCE(expired_qty, 0)) > 0'
-            //         )
-            //         ->where(function ($q2) {
-            //             $q2->whereNull('expiry_date')
-            //                 ->orWhereDate(
-            //                     'expiry_date',
-            //                     '>=',
-            //                     now()->toDateString()
-            //                 );
-            //         })
-            //         ->orderByRaw('expiry_date IS NULL, expiry_date ASC')
-            //         ->orderBy('id', 'asc');
-            // }])
+                $q->whereIn('branch_id', $branchIds)
+                    ->orderByRaw('expiry_date IS NULL, expiry_date ASC')
+                    ->orderBy('id', 'asc');
+            }])
             ->addSelect([
                 'total_stock' => Inventory::selectRaw(
                     'COALESCE(SUM(qty - sold_qty - COALESCE(expired_qty, 0)), 0)'
@@ -171,7 +155,7 @@ class ProductController extends Controller
                             );
                     }),
             ])
-           
+
             ->addSelect([
                 'nearest_expiry' => Inventory::selectRaw('MIN(expiry_date)')
                     ->whereColumn('inventories.product_id', 'products.id')
@@ -202,7 +186,7 @@ class ProductController extends Controller
             $groupedBatches = $product->inventories->groupBy(
                 function ($inv) {
                     return $inv->batch_no.'|'
-                        .number_format((float) $inv->selling_price, 2, '.', '')
+                        .number_format((float) $inv->selling_price, 6, '.', '')
                         .'|'
                         .($inv->expiry_date ? substr((string) $inv->expiry_date, 0, 10) : 'none');
                 }
@@ -210,27 +194,18 @@ class ProductController extends Controller
 
             $batches = $groupedBatches->map(function ($invGroup) {
 
-                // Ignore records without sellable stock.
-                // $eligibleRows = $invGroup->filter(function ($inv) {
-                //     $available = (float) $inv->qty
-                //         - (float) $inv->sold_qty
-                //         - (float) ($inv->expired_qty ?? 0);
-
-                //     return $available > 0;
-                // });
-
                 $eligibleRows = $invGroup->filter(function ($inv) {
-    $available = (float) $inv->qty
-        - (float) $inv->sold_qty
-        - (float) ($inv->expired_qty ?? 0);
+                    $available = (float) $inv->qty
+                        - (float) $inv->sold_qty
+                        - (float) ($inv->expired_qty ?? 0);
 
-    return $available > 0
-        && (
-            !$inv->expiry_date
-            || \Carbon\Carbon::parse($inv->expiry_date)->startOfDay()
-                ->gte(now()->startOfDay())
-        );
-});
+                    return $available > 0
+                        && (
+                            ! $inv->expiry_date
+                            || \Carbon\Carbon::parse($inv->expiry_date)->startOfDay()
+                                ->gte(now()->startOfDay())
+                        );
+                });
 
                 if ($eligibleRows->isEmpty()) {
                     return null;
@@ -275,6 +250,8 @@ class ProductController extends Controller
                     'mrp' => (float) $first->mrp,
                     'cost_price' => (float) $first->cost_price,
                     'selling_price' => (float) $first->selling_price,
+                    'units_per_pack' => max(1, (int) $first->units_per_pack),
+                    'pack_price' => round((float) $first->selling_price * max(1, (int) $first->units_per_pack), 2),
 
                     'qty' => $totalQty,
                     'sold_qty' => $totalSoldQty,
@@ -324,8 +301,12 @@ class ProductController extends Controller
             $data['stock'] = $calculatedStock;
             $data['total_stock'] = $calculatedStock;
 
-            $data['min_price'] = $prices->min();
-            $data['max_price'] = $prices->max();
+            // Card price is shown per pack (strip) for loose-enabled products
+            $upp = ($product->allow_loose && (int) $product->units_per_pack >= 2)
+                ? (int) $product->units_per_pack
+                : 1;
+            $data['min_price'] = $prices->isEmpty() ? null : round($prices->min() * $upp, 2);
+            $data['max_price'] = $prices->isEmpty() ? null : round($prices->max() * $upp, 2);
 
             $data['has_multiple_prices'] =
                 $prices->unique()->count() > 1;
@@ -343,7 +324,6 @@ class ProductController extends Controller
             'products' => $products,
         ], 200);
 
-        
     }
 
     public function show($id)
@@ -361,7 +341,33 @@ class ProductController extends Controller
         return response()->json([
             'status' => true,
             'product' => $product,
+            // The edit form uses this to lock "Allow loose selling" / "Units per pack"
+            'loose_locked' => $this->productHasStockHistory((int) $product->id),
         ], 200);
+    }
+
+    private function isPharmacyStore($storeId): bool
+    {
+        return collect(FeatureService::storeFeatures($storeId))->contains('pharmacy');
+    }
+
+    /**
+     * Once a product has purchase, stock or sales history its stock unit is fixed.
+     * Changing loose selling or the pack size after that would silently change the meaning
+     * of every stored quantity and price.
+     */
+    private function productHasStockHistory(int $productId): bool
+    {
+        return DB::table('inventories')->where('product_id', $productId)->whereNull('deleted_at')->exists()
+            || DB::table('purchase_lines')->where('product_id', $productId)->whereNull('deleted_at')->exists()
+            || DB::table('sales_bill_lines')->where('product_id', $productId)->exists();
+    }
+
+    private function cleanLooseUnit($unit): string
+    {
+        $unit = mb_strtolower(trim((string) $unit));
+
+        return $unit !== '' ? mb_substr($unit, 0, 20) : 'tablet';
     }
 
     private function generateEan13Barcode()
@@ -401,6 +407,8 @@ class ProductController extends Controller
                 'requires_prescription' => 'nullable|boolean',
                 'pack_type' => 'nullable|string|max:30',
                 'units_per_pack' => 'nullable|integer|min:1',
+                'allow_loose' => 'nullable|boolean',
+                'loose_unit' => 'nullable|string|max:20',
             ]);
 
             $user = Auth::user();
@@ -438,6 +446,16 @@ class ProductController extends Controller
                 $pharmacy['requires_prescription'] = true;
             }
 
+            // Loose (single unit) selling is available only for pharmacy stores
+            $allowLoose = $this->isPharmacyStore($storeId) && $request->boolean('allow_loose');
+
+            if ($allowLoose && (int) ($pharmacy['units_per_pack'] ?? 0) < 2) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Units per pack must be at least 2 to allow loose selling.',
+                ], 422);
+            }
+
             $product = Product::create(array_merge([
                 'store_id' => $storeId,
                 'sku' => $request->sku,
@@ -456,11 +474,21 @@ class ProductController extends Controller
                 'created_by' => Auth::id(),
             ], $pharmacy));
 
+            if ($allowLoose) {
+                // forceFill: works even if the columns are not in Product::$fillable
+                $product->forceFill([
+                    'allow_loose' => 1,
+                    'loose_unit' => $this->cleanLooseUnit($request->input('loose_unit')),
+                ])->save();
+            }
+
             return response()->json([
                 'status' => true,
                 'message' => 'Product created successfully',
                 'product' => $product,
             ], 201);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            throw $e;
         } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
@@ -488,6 +516,8 @@ class ProductController extends Controller
                 'requires_prescription' => 'nullable|boolean',
                 'pack_type' => 'nullable|string|max:30',
                 'units_per_pack' => 'nullable|integer|min:1',
+                'allow_loose' => 'nullable|boolean',
+                'loose_unit' => 'nullable|string|max:20',
             ]);
 
             $user = Auth::user();
@@ -508,6 +538,38 @@ class ProductController extends Controller
                     'status' => false,
                     'message' => 'Product not found',
                 ], 404);
+            }
+
+            // Loose selling rules (pharmacy only)
+            $looseUpdate = null;
+
+            if ($request->has('allow_loose') && $this->isPharmacyStore($storeId)) {
+                $wantLoose = $request->boolean('allow_loose');
+                $newPackSize = $request->has('units_per_pack')
+                    ? (int) $request->input('units_per_pack')
+                    : (int) $product->units_per_pack;
+
+                if ($wantLoose && $newPackSize < 2) {
+                    return response()->json([
+                        'status' => false,
+                        'message' => 'Units per pack must be at least 2 to allow loose selling.',
+                    ], 422);
+                }
+
+                $looseChanged = $wantLoose !== (bool) $product->allow_loose
+                    || ($wantLoose && $newPackSize !== (int) $product->units_per_pack);
+
+                if ($looseChanged && $this->productHasStockHistory((int) $product->id)) {
+                    return response()->json([
+                        'status' => false,
+                        'message' => 'Loose selling and pack size cannot be changed after this product has purchase or sales history. Create a new product instead.',
+                    ], 422);
+                }
+
+                $looseUpdate = [
+                    'allow_loose' => $wantLoose ? 1 : 0,
+                    'loose_unit' => $wantLoose ? $this->cleanLooseUnit($request->input('loose_unit')) : null,
+                ];
             }
 
             $product->update([
@@ -542,11 +604,18 @@ class ProductController extends Controller
                 $product->update($pharmacy);
             }
 
+            if ($looseUpdate !== null) {
+                // forceFill: works even if the columns are not in Product::$fillable
+                $product->forceFill($looseUpdate)->save();
+            }
+
             return response()->json([
                 'status' => true,
                 'message' => 'Product updated successfully',
                 'product' => $product,
             ], 200);
+        } catch (\Illuminate\Validation\ValidationException $e) {
+            throw $e;
         } catch (\Exception $e) {
 
             $storeId = Auth::user()->store_id;
@@ -687,7 +756,7 @@ class ProductController extends Controller
             return response()->json(['status' => false, 'message' => 'Product not found'], 404);
         }
 
-        // SVG jaan-boojhkar allowed nahi (script chhupa sakta hai)
+        // SVG is intentionally not allowed (it can hide scripts)
         $request->validate([
             'image' => ['required', 'file', 'mimes:jpg,jpeg,png,webp', 'max:3072'],
         ]);
@@ -953,12 +1022,12 @@ class ProductController extends Controller
         }
 
         $query = Inventory::with([
-            'product' => fn ($q) => $q->withTrashed()->select('id', 'name'),
+            'product' => fn ($q) => $q->withTrashed()->select('id', 'name', 'pack_type', 'loose_unit'),
             'branch:id,name',
         ])
             ->whereIn('branch_id', $branchIds)
             ->whereNotNull('expiry_date')
-            ->whereColumn('sold_qty', '<', 'qty');
+            ->whereRaw('(qty - sold_qty - COALESCE(expired_qty, 0)) > 0');
 
         if ($fromDate) {
             $query->whereDate('expiry_date', '>=', $fromDate->toDateString());
@@ -981,11 +1050,13 @@ class ProductController extends Controller
                 'cost_price',
                 'selling_price',
                 'qty',
-                'sold_qty'
+                'sold_qty',
+                'expired_qty',
+                'units_per_pack',
             )
             ->get()
             ->map(function ($item) {
-                $expiredQty = $item->qty - $item->sold_qty;
+                $expiredQty = $item->qty - $item->sold_qty - ($item->expired_qty ?? 0);
 
                 return [
                     'id' => $item->id,
@@ -997,6 +1068,12 @@ class ProductController extends Controller
                     'batch_barcode' => $item->batch_barcode,
                     'expiry_date' => $item->expiry_date,
                     'expired_qty' => $expiredQty,
+                    'expired_label' => StockLabel::format(
+                        $expiredQty,
+                        (int) ($item->units_per_pack ?? 1),
+                        $item->product->pack_type ?? null,
+                        $item->product->loose_unit ?? null
+                    ),
                     'cost_price' => $item->cost_price,
                     'loss_amount' => $expiredQty * $item->cost_price,
                 ];

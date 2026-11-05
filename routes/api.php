@@ -17,6 +17,7 @@ use App\Http\Controllers\Api\GSTOutputReportController;
 use App\Http\Controllers\Api\GstRateController;
 use App\Http\Controllers\Api\ManagerBranchController;
 use App\Http\Controllers\Api\Pharmacy\PrescriptionRegisterController;
+use App\Http\Controllers\Api\Pharmacy\StockWriteOffController;
 use App\Http\Controllers\Api\PosTerminalController;
 use App\Http\Controllers\Api\PriceOverrideController;
 use App\Http\Controllers\Api\ProductController;
@@ -299,6 +300,8 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:pharmacy'])->group(function () {
     Route::get('/reports/prescription-register', [PrescriptionRegisterController::class, 'index']);
+
+    Route::get('/prescriptions/suggestions', [PrescriptionRegisterController::class, 'suggestions']);
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:reports_gst'])->group(function () {
@@ -312,6 +315,9 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
     Route::get('/reports/expiry-details', [ReportController::class, 'getExpiryReport']);
     Route::get('/stock-expiry-alerts', [StockExpiryController::class, 'stockExpiryAlerts']);
     Route::get('/stock-alerts', [StockAlertController::class, 'index']);
+
+    Route::post('/expired-stock/write-off', [StockWriteOffController::class, 'store']);
+    Route::get('/expired-stock/write-offs', [StockWriteOffController::class, 'index']);
 });
 
 Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:reports_stock'])->group(function () {
@@ -389,4 +395,4 @@ Route::get('/test-product-template', function () {
     );
 })->middleware(['auth:sanctum', 'extend.token']);
 
-require __DIR__ . '/public_api.php';
+require __DIR__.'/public_api.php';

@@ -10,6 +10,7 @@ use App\Models\SalesBill;
 use App\Models\SalesBillLine;
 use App\Models\SalesReturn;
 use App\Services\FeatureService;
+use App\Support\StockLabel;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
@@ -104,6 +105,16 @@ class SalesReturnController extends Controller
                 $line->total_returned_qty = DB::table('sales_return_lines')
                     ->where('sales_bill_line_id', $line->id)
                     ->sum('qty') ?: 0;
+
+                $factor = max(1, (int) ($line->units_per_pack ?? 1));
+                $packType = $line->product->pack_type ?? null;
+                $looseUnit = $line->product->loose_unit ?? null;
+
+                $line->is_loose = $factor > 1;
+                $line->loose_unit = $looseUnit ?: 'unit';
+                $line->pack_type = $packType ?: 'pack';
+                $line->sold_label = StockLabel::format($line->qty, $factor, $packType, $looseUnit);
+                $line->returned_label = StockLabel::format($line->total_returned_qty, $factor, $packType, $looseUnit);
 
                 if ($isPharmacy) {
                     $rx = $rxByLine->get($line->id);
@@ -240,6 +251,11 @@ class SalesReturnController extends Controller
                     throw new \Exception("Cannot return more items than remaining sale balance for Line item ID: {$billLine->id}. Max allowed: {$maxAllowableReturn}");
                 }
 
+                if ((int) $billLine->units_per_pack > 1
+                    && abs($requiredReturnQty - round($requiredReturnQty)) > 0.0001) {
+                    throw new \DomainException('Loose-selling medicines can only be returned in whole units (for example 3 tablets).');
+                }
+
                 $ratio = $requiredReturnQty / (float) $billLine->qty;
 
                 $lineTaxable = round($billLine->taxable_amount * $ratio, 2);
@@ -249,6 +265,25 @@ class SalesReturnController extends Controller
                 $lineIgst = round($billLine->igst * $ratio, 2);
                 $lineAmount = round($billLine->amount * $ratio, 2);
                 $lineCogsRecovered = round($billLine->cogs * $ratio, 2);
+
+                // Last piece of a line: refund the exact remainder so partial returns never exceed the bill line.
+                if ($alreadyReturnedQty > 0
+                    && abs($alreadyReturnedQty + $requiredReturnQty - (float) $billLine->qty) < 0.0001) {
+                    $prev = DB::table('sales_return_lines')
+                        ->where('sales_bill_line_id', $billLine->id)
+                        ->selectRaw('COALESCE(SUM(taxable_amount),0) AS t, COALESCE(SUM(total_gst),0) AS g,
+                            COALESCE(SUM(cgst),0) AS c, COALESCE(SUM(sgst),0) AS s, COALESCE(SUM(igst),0) AS i,
+                            COALESCE(SUM(amount),0) AS a, COALESCE(SUM(cogs_recovered),0) AS cg')
+                        ->first();
+
+                    $lineTaxable = round($billLine->taxable_amount - $prev->t, 2);
+                    $lineGst = round($billLine->total_gst - $prev->g, 2);
+                    $lineCgst = round($billLine->cgst - $prev->c, 2);
+                    $lineSgst = round($billLine->sgst - $prev->s, 2);
+                    $lineIgst = round($billLine->igst - $prev->i, 2);
+                    $lineAmount = round($billLine->amount - $prev->a, 2);
+                    $lineCogsRecovered = round($billLine->cogs - $prev->cg, 2);
+                }
 
                 // Pharmacy: schedule policy + prescription register
                 $rxRow = null;
