@@ -12,6 +12,7 @@ class PurchaseReturnLine extends Model
         'purchase_bill_line_id',
         'product_id',
         'qty',
+        'units_per_pack',
         'free',
         'rate',
         'gst_rate_id',
@@ -21,6 +22,8 @@ class PurchaseReturnLine extends Model
         'sgst_amount',
         'igst_amount',
         'line_total',
+        'replacement_units',
+        'replacement_inventory_id',
     ];
 
     protected $casts = [

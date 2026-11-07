@@ -234,6 +234,7 @@ class SalesBillController extends Controller
                 'sale_type' => $product->sale_type ?? 'unit',
                 'gst_rate' => $product->gstRate,
                 'is_price_override' => $product->is_price_override,
+                'gst_inclusive' => $product->gst_inclusive,
                 'drug_schedule' => $product->drug_schedule ?? 'none',
                 'requires_prescription' => (int) ($product->requires_prescription ?? 0),
                 'salt_composition' => $product->salt_composition,

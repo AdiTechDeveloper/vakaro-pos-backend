@@ -11,6 +11,8 @@ class PurchaseReturn extends Model
         'purchase_bill_id',
         'supplier_id',
         'return_type',
+        'reason',
+        'notes',
         'branch_id',
         'return_date',
         'total_taxable',
@@ -26,15 +28,15 @@ class PurchaseReturn extends Model
         'total_amount' => 'decimal:2',
     ];
 
-     public function purchaseBill()
+    public function purchaseBill()
     {
         return $this->belongsTo(PurchaseBill::class);
-    } 
+    }
 
-     public function store()
+    public function store()
     {
         return $this->belongsTo(Store::class);
-    } 
+    }
 
     public function lines(): HasMany
     {

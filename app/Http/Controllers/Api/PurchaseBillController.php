@@ -11,6 +11,7 @@ use App\Models\Product;
 use App\Models\PurchaseBill;
 use App\Models\PurchaseLine;
 use App\Models\PurchasePayment;
+use App\Models\PurchaseReturn;
 use App\Models\Store;
 use App\Models\Supplier;
 use App\Services\FeatureService;
@@ -712,6 +713,11 @@ class PurchaseBillController extends Controller
 
         try {
             $bill = PurchaseBill::with('lines.inventory')->findOrFail($id);
+
+            if (PurchaseReturn::where('purchase_bill_id', $bill->id)->exists()) {
+                throw new \DomainException('This purchase bill has a supplier return, so it can no longer be edited or deleted.');
+            }
+
             $branchId = $bill->branch_id;
             $user = Auth::user();
             $supplier = Supplier::where('store_id', $user->store_id)->find($request->supplier_id);
@@ -1073,27 +1079,28 @@ class PurchaseBillController extends Controller
 
             $staleIds = array_values(array_diff($oldInventoryIds, $keptInventoryIds));
 
-if (!empty($staleIds)) {
-    $staleRows = Inventory::whereIn('id', $staleIds)
-        ->lockForUpdate()
-        ->get();
+            if (! empty($staleIds)) {
+                $staleRows = Inventory::whereIn('id', $staleIds)
+                    ->lockForUpdate()
+                    ->get();
 
-    foreach ($staleRows as $stale) {
-        $used = (float) $stale->sold_qty
-            + (float) ($stale->expired_qty ?? 0);
+                foreach ($staleRows as $stale) {
+                    $used = (float) $stale->sold_qty
+                        + (float) ($stale->expired_qty ?? 0);
 
-        // Sold / written-off inventory must be preserved.
-        // Do not fail the entire bill update just because a row
-        // was not matched during reconciliation.
-        if ($used > 0) {
-            $processedProducts[] = $stale->product_id;
-            continue;
-        }
+                    // Sold / written-off inventory must be preserved.
+                    // Do not fail the entire bill update just because a row
+                    // was not matched during reconciliation.
+                    if ($used > 0) {
+                        $processedProducts[] = $stale->product_id;
 
-        $processedProducts[] = $stale->product_id;
-        $stale->delete();
-    }
-}
+                        continue;
+                    }
+
+                    $processedProducts[] = $stale->product_id;
+                    $stale->delete();
+                }
+            }
 
             if ($request->has('payments')) {
                 PurchasePayment::where('purchase_bill_id', $bill->id)
@@ -1170,6 +1177,10 @@ if (!empty($staleIds)) {
         try {
             $user = Auth::user();
             $bill = PurchaseBill::with('lines')->findOrFail($id);
+
+            if (PurchaseReturn::where('purchase_bill_id', $bill->id)->exists()) {
+                throw new \DomainException('This purchase bill has a supplier return, so it can no longer be edited or deleted.');
+            }
 
             if (! in_array($user->role, ['admin', 'manager'], true) || $bill->store_id != $user->store_id) {
                 DB::rollBack();

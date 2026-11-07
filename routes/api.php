@@ -146,7 +146,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
     Route::post('/categories', [CategoryController::class, 'store']);
     Route::put('/categories/{id}', [CategoryController::class, 'update']);
     Route::post('/categories/{id}/image', [CategoryController::class, 'uploadImage']);
-Route::delete('/categories/{id}/image', [CategoryController::class, 'deleteImage']);
+    Route::delete('/categories/{id}/image', [CategoryController::class, 'deleteImage']);
     Route::delete('/categories/{id}', [CategoryController::class, 'destroy']);
 });
 
@@ -195,9 +195,9 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
     Route::get('/all-products', [ProductController::class, 'getAllProducts']);
     Route::get('/products', [ProductController::class, 'index']);
     Route::post(
-    '/products/bulk-images',
-    [ProductController::class, 'bulkUploadImages']
-);
+        '/products/bulk-images',
+        [ProductController::class, 'bulkUploadImages']
+    );
     Route::get('/products/{id}', [ProductController::class, 'show']);
     Route::post('/products', [ProductController::class, 'store']);
     Route::put('/products/{id}', [ProductController::class, 'update']);
@@ -232,6 +232,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
 // Purchasebill return routes
 Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:purchase_returns'])->group(function () {
     Route::get('/purchase-return', [PurchaseReturnController::class, 'index']);
+    Route::get('/purchase-return/bill/{id}/lines', [PurchaseReturnController::class, 'returnableLines']);
     Route::get('/purchase-return/{id}', [PurchaseReturnController::class, 'show']);
 
     // purchase replacement

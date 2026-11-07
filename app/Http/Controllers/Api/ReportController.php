@@ -146,8 +146,8 @@ class ReportController extends Controller
                 p.id as product_id, p.allow_loose, p.units_per_pack,
                 p.name as product_name,
                 p.barcode as barcode,
-                COALESCE(pur_before.total_purchase, 0) - COALESCE(sal_before.total_sale, 0) as opening_stock,
-                COALESCE(pur_month.total_purchase, 0) as purchased,
+                COALESCE(pur_before.total_purchase, 0) - COALESCE(ret_before.total_return, 0) - COALESCE(sal_before.total_sale, 0) as opening_stock,
+                COALESCE(pur_month.total_purchase, 0) - COALESCE(ret_month.total_return, 0) as purchased,
                 COALESCE(sal_month.total_sale, 0) as sold,
                 COALESCE(inv.stock, 0) as closing_stock,
                 COALESCE(sal_last.total_sale, 0) as last_month_sold
@@ -174,6 +174,22 @@ class ReportController extends Controller
             WHERE pb.bill_date < '{$startDate}' {$branchWherePb}
             GROUP BY pl.product_id
         ) AS pur_before"), 'pur_before.product_id', '=', 'p.id');
+
+        $query->leftJoin(DB::raw("(
+            SELECT prl.product_id, SUM(prl.qty * prl.units_per_pack - COALESCE(prl.replacement_units, 0)) AS total_return
+            FROM purchase_return_lines prl
+            JOIN purchase_returns rt ON rt.id = prl.purchase_return_id
+            WHERE rt.return_date < '{$startDate}' AND rt.branch_id IN ({$idList})
+            GROUP BY prl.product_id
+        ) AS ret_before"), 'ret_before.product_id', '=', 'p.id');
+
+        $query->leftJoin(DB::raw("(
+            SELECT prl.product_id, SUM(prl.qty * prl.units_per_pack - COALESCE(prl.replacement_units, 0)) AS total_return
+            FROM purchase_return_lines prl
+            JOIN purchase_returns rt ON rt.id = prl.purchase_return_id
+            WHERE rt.return_date BETWEEN '{$startDate}' AND '{$endDate}' AND rt.branch_id IN ({$idList})
+            GROUP BY prl.product_id
+        ) AS ret_month"), 'ret_month.product_id', '=', 'p.id');
 
         $query->leftJoin(DB::raw("(
             SELECT sl.product_id, SUM(sl.qty) AS total_sale

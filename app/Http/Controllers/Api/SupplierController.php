@@ -5,15 +5,14 @@ namespace App\Http\Controllers\Api;
 use App\Exports\SupplierTemplateExport;
 use App\Http\Controllers\Controller;
 use App\Imports\SupplierRowsImport;
+use App\Models\PurchaseBill;
+use App\Models\PurchaseLine;
+use App\Models\PurchasePayment;
+use App\Models\PurchaseReturn;
 use App\Models\Supplier;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
-use App\Models\PurchaseBill;
-use App\Models\PurchasePayment;
-use App\Models\PurchaseLine;
-use Illuminate\Support\Facades\DB;
 use Maatwebsite\Excel\Facades\Excel;
-
 
 class SupplierController extends Controller
 {
@@ -62,22 +61,11 @@ class SupplierController extends Controller
         '38' => 'Ladakh',
     ];
 
-    // public function index()
-    // {
-    //     $storeId = Auth::user()->store_id;
-    //     $suppliers = Supplier::where('store_id', $storeId)->with(['store'])->get();
-
-    //     return response()->json([
-    //         'status' => true,
-    //         'suppliers' => $suppliers
-    //     ], 200);
-    // }
-
     public function index()
     {
         $user = Auth::user();
 
-        if (!in_array($user->role, ['admin', 'manager'], true)) {
+        if (! in_array($user->role, ['admin', 'manager'], true)) {
             return response()->json([
                 'status' => false,
                 'message' => 'Unauthorized',
@@ -113,10 +101,17 @@ class SupplierController extends Controller
                         ->where('status', 'success')
                         ->sum('amount');
 
+                $totalReturned = $billIds->isEmpty()
+                    ? 0
+                    : (float) PurchaseReturn::whereIn('purchase_bill_id', $billIds)
+                        ->where('return_type', 'return')
+                        ->sum('total_amount');
+
                 $supplier->total_purchase = round($totalPurchase, 2);
                 $supplier->total_paid = round($totalPaid, 2);
+                $supplier->total_returned = round($totalReturned, 2);
                 $supplier->outstanding_due = round(
-                    max(0, $totalPurchase - $totalPaid),
+                    max(0, $totalPurchase - $totalReturned - $totalPaid),
                     2
                 );
                 $supplier->purchase_bill_count = $bills->count();
@@ -130,29 +125,29 @@ class SupplierController extends Controller
         ], 200);
     }
 
-
     public function show($id)
     {
         $storeId = Auth::user()->store_id;
         $supplier = Supplier::where('store_id', $storeId)->where('id', $id)->first();
 
-        if (!$supplier) {
+        if (! $supplier) {
             return response()->json([
                 'status' => false,
-                'message' => 'Supplier not found'
+                'message' => 'Supplier not found',
             ], 404);
         }
 
         return response()->json([
             'status' => true,
-            'supplier' => $supplier
+            'supplier' => $supplier,
         ], 200);
     }
+
     public function purchaseHistory($id)
     {
         $user = Auth::user();
 
-        if (!in_array($user->role, ['admin', 'manager'], true)) {
+        if (! in_array($user->role, ['admin', 'manager'], true)) {
             return response()->json([
                 'status' => false,
                 'message' => 'Unauthorized',
@@ -163,7 +158,7 @@ class SupplierController extends Controller
             ->where('id', $id)
             ->first();
 
-        if (!$supplier) {
+        if (! $supplier) {
             return response()->json([
                 'status' => false,
                 'message' => 'Supplier not found',
@@ -172,7 +167,7 @@ class SupplierController extends Controller
 
         $query = PurchaseBill::with([
             'branch:id,name',
-            'payments' => fn($q) => $q->where('status', 'success'),
+            'payments' => fn ($q) => $q->where('status', 'success'),
             'lines.product:id,name,sku',
         ])
             ->where('store_id', $user->store_id)
@@ -185,9 +180,16 @@ class SupplierController extends Controller
 
         $bills = $query->orderByDesc('bill_date')->get();
 
-        $history = $bills->map(function ($bill) {
+        $returnedByBill = PurchaseReturn::whereIn('purchase_bill_id', $bills->pluck('id'))
+            ->where('return_type', 'return')
+            ->selectRaw('purchase_bill_id, SUM(total_amount) AS total')
+            ->groupBy('purchase_bill_id')
+            ->pluck('total', 'purchase_bill_id');
+
+        $history = $bills->map(function ($bill) use ($returnedByBill) {
             $paid = (float) $bill->payments->sum('amount');
             $total = (float) $bill->total_amount;
+            $returned = (float) ($returnedByBill[$bill->id] ?? 0);
 
             return [
                 'id' => $bill->id,
@@ -196,8 +198,9 @@ class SupplierController extends Controller
                 'branch' => $bill->branch?->name,
                 'total_amount' => round($total, 2),
                 'paid_amount' => round($paid, 2),
-                'due_amount' => round(max(0, $total - $paid), 2),
-                'products' => $bill->lines->map(fn($line) => [
+                'returned_amount' => round($returned, 2),
+                'due_amount' => round(max(0, $total - $returned - $paid), 2),
+                'products' => $bill->lines->map(fn ($line) => [
                     'product_id' => $line->product_id,
                     'product_name' => $line->product?->name ?? 'Deleted product',
                     'qty' => $line->qty,
@@ -213,130 +216,130 @@ class SupplierController extends Controller
         ]);
     }
 
-public function rateComparison(Request $request)
-{
-    $user = Auth::user();
+    public function rateComparison(Request $request)
+    {
+        $user = Auth::user();
 
-    if (!in_array($user->role, ['admin', 'manager'], true)) {
-        return response()->json([
-            'status' => false,
-            'message' => 'Unauthorized',
-        ], 403);
-    }
+        if (! in_array($user->role, ['admin', 'manager'], true)) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Unauthorized',
+            ], 403);
+        }
 
-    $validated = $request->validate([
-        'product_id' => 'nullable|integer',
-        'supplier_id' => 'nullable|integer',
-        'date_from' => 'nullable|date',
-        'date_to' => 'nullable|date|after_or_equal:date_from',
-    ]);
-
-    $query = PurchaseLine::query()
-        ->join('purchase_bills', 'purchase_lines.purchase_bill_id', '=', 'purchase_bills.id')
-        ->join('products', 'purchase_lines.product_id', '=', 'products.id')
-        ->join('suppliers', 'purchase_bills.supplier_id', '=', 'suppliers.id')
-        ->where('purchase_bills.store_id', $user->store_id)
-        ->whereNull('purchase_bills.deleted_at')
-        ->where('suppliers.store_id', $user->store_id)
-        ->select([
-            'purchase_lines.product_id',
-            'products.name as product_name',
-            'purchase_bills.supplier_id',
-            'suppliers.name as supplier_name',
-            'purchase_lines.purchase_rate',
-            'purchase_lines.qty',
-            'purchase_bills.bill_no',
-            'purchase_bills.bill_date',
-            'purchase_bills.branch_id',
+        $validated = $request->validate([
+            'product_id' => 'nullable|integer',
+            'supplier_id' => 'nullable|integer',
+            'date_from' => 'nullable|date',
+            'date_to' => 'nullable|date|after_or_equal:date_from',
         ]);
 
-    if ($user->role === 'manager') {
-        $branchIds = $user->branches()
-            ->pluck('branches.id')
-            ->toArray();
+        $query = PurchaseLine::query()
+            ->join('purchase_bills', 'purchase_lines.purchase_bill_id', '=', 'purchase_bills.id')
+            ->join('products', 'purchase_lines.product_id', '=', 'products.id')
+            ->join('suppliers', 'purchase_bills.supplier_id', '=', 'suppliers.id')
+            ->where('purchase_bills.store_id', $user->store_id)
+            ->whereNull('purchase_bills.deleted_at')
+            ->where('suppliers.store_id', $user->store_id)
+            ->select([
+                'purchase_lines.product_id',
+                'products.name as product_name',
+                'purchase_bills.supplier_id',
+                'suppliers.name as supplier_name',
+                'purchase_lines.purchase_rate',
+                'purchase_lines.qty',
+                'purchase_bills.bill_no',
+                'purchase_bills.bill_date',
+                'purchase_bills.branch_id',
+            ]);
 
-        $query->whereIn('purchase_bills.branch_id', $branchIds);
+        if ($user->role === 'manager') {
+            $branchIds = $user->branches()
+                ->pluck('branches.id')
+                ->toArray();
+
+            $query->whereIn('purchase_bills.branch_id', $branchIds);
+        }
+
+        if (! empty($validated['product_id'])) {
+            $query->where(
+                'purchase_lines.product_id',
+                $validated['product_id']
+            );
+        }
+
+        if (! empty($validated['supplier_id'])) {
+            $query->where(
+                'purchase_bills.supplier_id',
+                $validated['supplier_id']
+            );
+        }
+
+        if (! empty($validated['date_from'])) {
+            $query->whereDate(
+                'purchase_bills.bill_date',
+                '>=',
+                $validated['date_from']
+            );
+        }
+
+        if (! empty($validated['date_to'])) {
+            $query->whereDate(
+                'purchase_bills.bill_date',
+                '<=',
+                $validated['date_to']
+            );
+        }
+
+        $lines = $query
+            ->orderByDesc('purchase_bills.bill_date')
+            ->orderByDesc('purchase_bills.id')
+            ->get();
+
+        $products = $lines
+            ->groupBy('product_id')
+            ->map(function ($productLines, $productId) {
+                $supplierRates = $productLines
+                    ->groupBy('supplier_id')
+                    ->map(function ($supplierLines, $supplierId) {
+                        $latest = $supplierLines->first();
+                        $rates = $supplierLines
+                            ->pluck('purchase_rate')
+                            ->map(fn ($rate) => (float) $rate);
+
+                        return [
+                            'supplier_id' => (int) $supplierId,
+                            'supplier_name' => $latest->supplier_name,
+                            'latest_rate' => round(
+                                (float) $latest->purchase_rate,
+                                2
+                            ),
+                            'lowest_rate' => round($rates->min(), 2),
+                            'highest_rate' => round($rates->max(), 2),
+                            'average_rate' => round($rates->avg(), 2),
+                            'last_purchase_date' => $latest->bill_date,
+                            'last_bill_no' => $latest->bill_no,
+                            'purchase_count' => $supplierLines->count(),
+                        ];
+                    })
+                    ->sortBy('latest_rate')
+                    ->values();
+
+                return [
+                    'product_id' => (int) $productId,
+                    'product_name' => $productLines->first()->product_name,
+                    'lowest_current_supplier' => $supplierRates->first(),
+                    'supplier_rates' => $supplierRates,
+                ];
+            })
+            ->values();
+
+        return response()->json([
+            'status' => true,
+            'filters' => $validated,
+            'products' => $products,
+        ]);
     }
-
-    if (!empty($validated['product_id'])) {
-        $query->where(
-            'purchase_lines.product_id',
-            $validated['product_id']
-        );
-    }
-
-    if (!empty($validated['supplier_id'])) {
-        $query->where(
-            'purchase_bills.supplier_id',
-            $validated['supplier_id']
-        );
-    }
-
-    if (!empty($validated['date_from'])) {
-        $query->whereDate(
-            'purchase_bills.bill_date',
-            '>=',
-            $validated['date_from']
-        );
-    }
-
-    if (!empty($validated['date_to'])) {
-        $query->whereDate(
-            'purchase_bills.bill_date',
-            '<=',
-            $validated['date_to']
-        );
-    }
-
-    $lines = $query
-        ->orderByDesc('purchase_bills.bill_date')
-        ->orderByDesc('purchase_bills.id')
-        ->get();
-
-    $products = $lines
-        ->groupBy('product_id')
-        ->map(function ($productLines, $productId) {
-            $supplierRates = $productLines
-                ->groupBy('supplier_id')
-                ->map(function ($supplierLines, $supplierId) {
-                    $latest = $supplierLines->first();
-                    $rates = $supplierLines
-                        ->pluck('purchase_rate')
-                        ->map(fn ($rate) => (float) $rate);
-
-                    return [
-                        'supplier_id' => (int) $supplierId,
-                        'supplier_name' => $latest->supplier_name,
-                        'latest_rate' => round(
-                            (float) $latest->purchase_rate,
-                            2
-                        ),
-                        'lowest_rate' => round($rates->min(), 2),
-                        'highest_rate' => round($rates->max(), 2),
-                        'average_rate' => round($rates->avg(), 2),
-                        'last_purchase_date' => $latest->bill_date,
-                        'last_bill_no' => $latest->bill_no,
-                        'purchase_count' => $supplierLines->count(),
-                    ];
-                })
-                ->sortBy('latest_rate')
-                ->values();
-
-            return [
-                'product_id' => (int) $productId,
-                'product_name' => $productLines->first()->product_name,
-                'lowest_current_supplier' => $supplierRates->first(),
-                'supplier_rates' => $supplierRates,
-            ];
-        })
-        ->values();
-
-    return response()->json([
-        'status' => true,
-        'filters' => $validated,
-        'products' => $products,
-    ]);
-}
 
     public function store(Request $request)
     {
@@ -346,15 +349,15 @@ public function rateComparison(Request $request)
                 // 'gstin' => 'required|string|max:15',
                 // 'contact' => 'required|string|max:20',
                 // 'address' => 'required|string',
-                'state' => 'required|string|max:20'
+                'state' => 'required|string|max:20',
             ]);
 
             $user = Auth::user();
 
-            if (!in_array($user->role, ['admin', 'manager'])) {
+            if (! in_array($user->role, ['admin', 'manager'])) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Unauthorized'
+                    'message' => 'Unauthorized',
                 ], 403);
             }
 
@@ -373,13 +376,13 @@ public function rateComparison(Request $request)
             return response()->json([
                 'status' => true,
                 'message' => 'Supplier created successfully',
-                'supplier' => $supplier
+                'supplier' => $supplier,
             ], 201);
         } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
                 'message' => 'An error occurred while creating the supplier.',
-                'error' => $e->getMessage()
+                'error' => $e->getMessage(),
             ], 500);
         }
     }
@@ -397,10 +400,10 @@ public function rateComparison(Request $request)
 
             $user = Auth::user();
 
-            if (!in_array($user->role, ['admin', 'manager'])) {
+            if (! in_array($user->role, ['admin', 'manager'])) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Unauthorized'
+                    'message' => 'Unauthorized',
                 ], 403);
             }
 
@@ -408,10 +411,10 @@ public function rateComparison(Request $request)
 
             $supplier = Supplier::where('store_id', $storeId)->where('id', $id)->first();
 
-            if (!$supplier) {
+            if (! $supplier) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Supplier not found'
+                    'message' => 'Supplier not found',
                 ], 404);
             }
 
@@ -427,13 +430,13 @@ public function rateComparison(Request $request)
             return response()->json([
                 'status' => true,
                 'message' => 'Supplier updated successfully',
-                'supplier' => $supplier
+                'supplier' => $supplier,
             ], 200);
         } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
                 'message' => 'An error occurred while updating the supplier.',
-                'error' => $e->getMessage()
+                'error' => $e->getMessage(),
             ], 500);
         }
     }
@@ -443,10 +446,10 @@ public function rateComparison(Request $request)
         try {
             $user = Auth::user();
 
-            if (!in_array($user->role, ['admin', 'manager'])) {
+            if (! in_array($user->role, ['admin', 'manager'])) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Unauthorized'
+                    'message' => 'Unauthorized',
                 ], 403);
             }
 
@@ -454,10 +457,10 @@ public function rateComparison(Request $request)
 
             $supplier = Supplier::where('store_id', $storeId)->where('id', $id)->first();
 
-            if (!$supplier) {
+            if (! $supplier) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Supplier not found'
+                    'message' => 'Supplier not found',
                 ], 404);
             }
             $hasPurchaseHistory = PurchaseBill::where('store_id', $storeId)
@@ -474,13 +477,13 @@ public function rateComparison(Request $request)
 
             return response()->json([
                 'status' => true,
-                'message' => 'Supplier deleted successfully'
+                'message' => 'Supplier deleted successfully',
             ], 200);
         } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
                 'message' => 'An error occurred while deleting the supplier.',
-                'error' => $e->getMessage()
+                'error' => $e->getMessage(),
             ], 500);
         }
     }
@@ -494,7 +497,7 @@ public function rateComparison(Request $request)
     {
         $user = Auth::user();
 
-        if (!$user || !in_array($user->role, ['admin', 'manager'], true)) {
+        if (! $user || ! in_array($user->role, ['admin', 'manager'], true)) {
             return response()->json([
                 'status' => false,
                 'message' => 'Unauthorized',
@@ -502,7 +505,7 @@ public function rateComparison(Request $request)
         }
 
         return Excel::download(
-            new SupplierTemplateExport(),
+            new SupplierTemplateExport,
             'supplier-import-template.xlsx'
         );
     }
@@ -511,7 +514,7 @@ public function rateComparison(Request $request)
     {
         $user = Auth::user();
 
-        if (!$user || !in_array($user->role, ['admin', 'manager'], true)) {
+        if (! $user || ! in_array($user->role, ['admin', 'manager'], true)) {
             return response()->json([
                 'status' => false,
                 'message' => 'Unauthorized',
@@ -528,7 +531,7 @@ public function rateComparison(Request $request)
             $storeId = $user->store_id;
 
             $sheetRows = Excel::toCollection(
-                new SupplierRowsImport(),
+                new SupplierRowsImport,
                 $request->file('file')
             )->first() ?? collect();
 
@@ -554,7 +557,7 @@ public function rateComparison(Request $request)
                 ], 422);
             }
 
-            if (!array_key_exists('name', $items[0]['raw'])) {
+            if (! array_key_exists('name', $items[0]['raw'])) {
                 return response()->json([
                     'status' => false,
                     'message' => 'Column "name" was not found. Please download the template and keep its headings unchanged.',
@@ -564,7 +567,7 @@ public function rateComparison(Request $request)
             if (count($items) > self::IMPORT_MAX_ROWS) {
                 return response()->json([
                     'status' => false,
-                    'message' => 'Too many rows. Please import at most ' . self::IMPORT_MAX_ROWS . ' suppliers at a time.',
+                    'message' => 'Too many rows. Please import at most '.self::IMPORT_MAX_ROWS.' suppliers at a time.',
                 ], 422);
             }
 
@@ -601,8 +604,8 @@ public function rateComparison(Request $request)
 
                 $gstinValid = $data['gstin'] !== '' && preg_match(self::GSTIN_REGEX, $data['gstin']) === 1;
 
-                if ($data['gstin'] !== '' && !$gstinValid) {
-                    $rowErrors[] = 'Invalid GSTIN format: ' . $data['gstin'];
+                if ($data['gstin'] !== '' && ! $gstinValid) {
+                    $rowErrors[] = 'Invalid GSTIN format: '.$data['gstin'];
                 }
 
                 if ($data['contact'] !== '' && preg_match('/^[0-9]{10}$/', $data['contact']) !== 1) {
@@ -618,7 +621,7 @@ public function rateComparison(Request $request)
                 if ($data['state'] !== '') {
                     $state = $stateLookup[mb_strtolower($data['state'])] ?? '';
                     if ($state === '') {
-                        $rowErrors[] = 'Unknown state: ' . $data['state'];
+                        $rowErrors[] = 'Unknown state: '.$data['state'];
                     }
                 } elseif ($gstinValid) {
                     $state = self::GST_STATE_CODES[substr($data['gstin'], 0, 2)] ?? '';
@@ -634,25 +637,26 @@ public function rateComparison(Request $request)
 
                     if ($data['gstin'] !== '') {
                         if (isset($existingGstins[$data['gstin']])) {
-                            $rowErrors[] = 'A supplier with this GSTIN already exists: ' . $data['gstin'];
+                            $rowErrors[] = 'A supplier with this GSTIN already exists: '.$data['gstin'];
                         } elseif (isset($seenGstins[$data['gstin']])) {
-                            $rowErrors[] = 'Duplicate GSTIN in this file: ' . $data['gstin'];
+                            $rowErrors[] = 'Duplicate GSTIN in this file: '.$data['gstin'];
                         }
                     } else {
                         if (isset($existingNames[$nameKey])) {
-                            $rowErrors[] = 'A supplier with this name already exists: ' . $data['name'];
+                            $rowErrors[] = 'A supplier with this name already exists: '.$data['name'];
                         } elseif (isset($seenNames[$nameKey])) {
-                            $rowErrors[] = 'Duplicate supplier name in this file: ' . $data['name'];
+                            $rowErrors[] = 'Duplicate supplier name in this file: '.$data['name'];
                         }
                     }
                 }
 
-                if (!empty($rowErrors)) {
+                if (! empty($rowErrors)) {
                     $errors[] = [
                         'row' => $rowNumber,
                         'name' => $data['name'] !== '' ? $data['name'] : null,
                         'errors' => $rowErrors,
                     ];
+
                     continue;
                 }
 
