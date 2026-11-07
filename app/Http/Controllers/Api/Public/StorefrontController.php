@@ -36,6 +36,9 @@ class StorefrontController extends Controller
 
     private array $colCache = [];
 
+    // store_id => bool: superadmin ne is store ko E-commerce (feature "online_store") diya hai ya nahi
+    private array $ecomCache = [];
+
     public function __construct(private OnlineStockService $stock) {}
 
     // GET /api/public/stores                  -> saari stores ki saari branches (home page)
@@ -304,13 +307,14 @@ class StorefrontController extends Controller
         }
 
         $ids = $stores->pluck('id')->all();
+        $this->preloadEcommerce($ids);
         $settings = DB::table('online_store_settings')->whereIn('store_id', $ids)->get()->keyBy('store_id');
         $branches = $this->branchQuery()->whereIn('store_id', $ids)->orderBy('id')->get()->groupBy('store_id');
 
         $out = [];
         foreach ($stores as $st) {
             $set = $settings->get($st->id);
-            if (!$this->isListed($set)) {
+            if (!$this->isListed($set, (int) $st->id)) {
                 continue;
             }
 
@@ -359,10 +363,39 @@ class StorefrontController extends Controller
         return $q;
     }
 
-    // Settings row hai to uska is_online_enabled maano, nahi hai to LIST_ALL_STORES
-    private function isListed(?object $set): bool
+    // Pehle superadmin ka E-commerce permission (feature "online_store"), phir store admin ki setting:
+    // settings row hai to uska is_online_enabled maano, nahi hai to LIST_ALL_STORES
+    private function isListed(?object $set, int $storeId): bool
     {
+        if (!$this->hasEcommerce($storeId)) {
+            return false;
+        }
+
         return $set ? (bool) $set->is_online_enabled : self::LIST_ALL_STORES;
+    }
+
+    private function hasEcommerce(int $storeId): bool
+    {
+        return $this->ecomCache[$storeId] ??= DB::table('store_features')
+            ->where('store_id', $storeId)
+            ->where('feature_key', 'online_store')
+            ->exists();
+    }
+
+    // Saari stores ka permission ek hi query mein (home page list ke liye)
+    private function preloadEcommerce(array $storeIds): void
+    {
+        $allowed = array_flip(
+            DB::table('store_features')
+                ->whereIn('store_id', $storeIds)
+                ->where('feature_key', 'online_store')
+                ->pluck('store_id')
+                ->all()
+        );
+
+        foreach ($storeIds as $id) {
+            $this->ecomCache[(int) $id] = isset($allowed[$id]);
+        }
     }
 
     private function defaultSettings(int $storeId): object
@@ -470,7 +503,7 @@ class StorefrontController extends Controller
         }
 
         $set = DB::table('online_store_settings')->where('store_id', $st->id)->first();
-        if (!$this->isListed($set)) {
+        if (!$this->isListed($set, (int) $st->id)) {
             return null;
         }
 
