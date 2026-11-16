@@ -38,20 +38,20 @@ class DashboardInsightsController extends Controller
 
         // ?only=peak,customers  -> sirf wahi sections compute hote hain
         $only = collect(explode(',', (string) $request->input('only', '')))
-            ->map(fn ($v) => trim($v))
+            ->map(fn($v) => trim($v))
             ->filter()
             ->values()
             ->all();
-        $want = fn (string $k) => empty($only) || in_array($k, $only, true);
+        $want = fn(string $k) => empty($only) || in_array($k, $only, true);
 
         $sales = ($want('sales') || $want('profit'))
-            ? $this->safe(fn () => $this->sales($storeId, $branchId, $from, $to, $prevFrom, $prevTo))
+            ? $this->safe(fn() => $this->sales($storeId, $branchId, $from, $to, $prevFrom, $prevTo))
             : null;
         $expenses = ($want('expenses') || $want('profit'))
-            ? $this->safe(fn () => $this->expenses($storeId, $branchId, $from, $to))
+            ? $this->safe(fn() => $this->expenses($storeId, $branchId, $from, $to))
             : null;
         $profit = $want('profit')
-            ? $this->safe(fn () => $this->profit($storeId, $branchId, $from, $to, $sales, $expenses))
+            ? $this->safe(fn() => $this->profit($storeId, $branchId, $from, $to, $sales, $expenses))
             : null;
 
         return response()->json([
@@ -63,18 +63,18 @@ class DashboardInsightsController extends Controller
                 'sales' => $want('sales') ? $sales : null,
                 'profit' => $profit,
                 'expenses' => $want('expenses') ? $expenses : null,
-                'payments' => $want('payments') ? $this->safe(fn () => $this->payments($storeId, $branchId, $from, $to)) : null,
-                'trend' => $want('trend') ? $this->safe(fn () => $this->trend($storeId, $branchId)) : null,
-                'trend_series' => $want('trend_series') ? $this->safe(fn () => $this->trendSeries($storeId, $branchId, (string) $request->input('series', '1w'))) : null,
-                'peak' => $want('peak') ? $this->safe(fn () => $this->peak($storeId, $branchId)) : null,
-                'top_profit' => $want('top_profit') ? $this->safe(fn () => $this->topProfit($storeId, $branchId)) : null,
-                'stock_risk' => $want('stock_risk') ? $this->safe(fn () => $this->stockRisk($storeId, $branchId)) : null,
-                'dead_stock' => $want('dead_stock') ? $this->safe(fn () => $this->deadStock($storeId, $branchId)) : null,
-                'expiry' => $want('expiry') ? $this->safe(fn () => $this->expiry($storeId, $branchId)) : null,
-                'customers' => $want('customers') ? $this->safe(fn () => $this->topCustomers($storeId, $branchId)) : null,
-                'customers_due_count' => $want('customers_due_count') ? $this->safe(fn () => $this->dueCustomerCount($storeId, $branchId)) : null,
+                'payments' => $want('payments') ? $this->safe(fn() => $this->payments($storeId, $branchId, $from, $to)) : null,
+                'trend' => $want('trend') ? $this->safe(fn() => $this->trend($storeId, $branchId)) : null,
+                'trend_series' => $want('trend_series') ? $this->safe(fn() => $this->trendSeries($storeId, $branchId, (string) $request->input('series', '1w'))) : null,
+                'peak' => $want('peak') ? $this->safe(fn() => $this->peak($storeId, $branchId)) : null,
+                'top_profit' => $want('top_profit') ? $this->safe(fn() => $this->topProfit($storeId, $branchId)) : null,
+                'stock_risk' => $want('stock_risk') ? $this->safe(fn() => $this->stockRisk($storeId, $branchId)) : null,
+                'dead_stock' => $want('dead_stock') ? $this->safe(fn() => $this->deadStock($storeId, $branchId)) : null,
+                'expiry' => $want('expiry') ? $this->safe(fn() => $this->expiry($storeId, $branchId)) : null,
+                'customers' => $want('customers') ? $this->safe(fn() => $this->topCustomers($storeId, $branchId)) : null,
+                'customers_due_count' => $want('customers_due_count') ? $this->safe(fn() => $this->dueCustomerCount($storeId, $branchId)) : null,
                 'branches' => ($want('branches') && $user->role === 'admin')
-                    ? $this->safe(fn () => $this->branchesSales($storeId, $from, $to))
+                    ? $this->safe(fn() => $this->branchesSales($storeId, $from, $to))
                     : null,
             ],
         ]);
@@ -151,12 +151,12 @@ class DashboardInsightsController extends Controller
             ? round(
                 (($totalSales - $previousTotal) / $previousTotal) * 100,
                 1
-            ).'%'
+            ) . '%'
             : 'n/a';
 
         // Payments and expenses
         $payments = $this->safe(
-            fn () => $this->payments(
+            fn() => $this->payments(
                 $storeId,
                 $branchId,
                 $from,
@@ -168,7 +168,7 @@ class DashboardInsightsController extends Controller
         ];
 
         $expenses = $this->safe(
-            fn () => $this->expenses(
+            fn() => $this->expenses(
                 $storeId,
                 $branchId,
                 $from,
@@ -180,8 +180,8 @@ class DashboardInsightsController extends Controller
         $branchName = $branchId
             ? (
                 DB::table('branches')
-                    ->where('id', $branchId)
-                    ->value('name') ?? ''
+                ->where('id', $branchId)
+                ->value('name') ?? ''
             )
             : 'All branches';
 
@@ -244,7 +244,7 @@ class DashboardInsightsController extends Controller
             $billRows = [];
         }
 
-        $stamp = $from->format('Ymd').'-'.$to->format('Ymd');
+        $stamp = $from->format('Ymd') . '-' . $to->format('Ymd');
 
         // PDF export
         if ($format === 'pdf') {
@@ -259,7 +259,7 @@ class DashboardInsightsController extends Controller
                 'billCount' => $billCount,
 
                 'generatedAt' => now()->format('d M Y, h:i A'),
-                'fmt' => fn ($value) => '₹'.number_format(
+                'fmt' => fn($value) => '₹' . number_format(
                     (float) $value,
                     2
                 ),
@@ -318,7 +318,7 @@ class DashboardInsightsController extends Controller
 
             $text = $from->isSameDay($to)
                 ? $from->format('d M Y')
-                : $from->format('d M Y').' - '.$to->format('d M Y');
+                : $from->format('d M Y') . ' - ' . $to->format('d M Y');
 
             return [$from, $to, $text];
         }
@@ -441,7 +441,7 @@ class DashboardInsightsController extends Controller
                 ->selectRaw('sales_bill_id, LOWER(method) as m, SUM(amount) as a')
                 ->get()
                 ->each(function ($r) use (&$payMap) {
-                    $payMap[$r->sales_bill_id][] = ucfirst($r->m).' '.round((float) $r->a, 2);
+                    $payMap[$r->sales_bill_id][] = ucfirst($r->m) . ' ' . round((float) $r->a, 2);
                 });
         }
 
@@ -480,7 +480,7 @@ class DashboardInsightsController extends Controller
                 ?? ($due <= 0 ? 'paid' : ($paid > 0 ? 'partial' : 'unpaid'));
 
             return [
-                'bill_no' => $r->bill_no ?? ('#'.$r->id),
+                'bill_no' => $r->bill_no ?? ('#' . $r->id),
                 'date' => $dt->format('d M Y, h:i A'),
                 'time' => $dt->format('h:i A'),
                 'customer' => $r->customer_name ?? 'Walk-in',
@@ -639,10 +639,12 @@ class DashboardInsightsController extends Controller
     private function itemsMeta(): ?array
     {
         // Is project ka asli table: sales_bill_lines (cogs + profit har line me pehle se saved)
-        if (Schema::hasTable('sales_bill_lines')
+        if (
+            Schema::hasTable('sales_bill_lines')
             && Schema::hasColumn('sales_bill_lines', 'sales_bill_id')
             && Schema::hasColumn('sales_bill_lines', 'product_id')
-            && Schema::hasColumn('sales_bill_lines', 'qty')) {
+            && Schema::hasColumn('sales_bill_lines', 'qty')
+        ) {
             return [
                 'table' => 'sales_bill_lines',
                 'fk' => 'sales_bill_id',
@@ -781,7 +783,7 @@ class DashboardInsightsController extends Controller
     private function stockByProduct(array $m, ?int $branchId, int $storeId)
     {
         $q = DB::table("{$m['table']} as s")
-            ->selectRaw("s.{$m['product']} as pid, SUM(".$this->availExpr($m).') as qty')
+            ->selectRaw("s.{$m['product']} as pid, SUM(" . $this->availExpr($m) . ') as qty')
             ->groupBy("s.{$m['product']}");
 
         $this->scopeStore($q, $m, $storeId);
@@ -1046,7 +1048,7 @@ class DashboardInsightsController extends Controller
             ->orderByDesc('bills')
             ->limit(3)
             ->get()
-            ->map(fn ($r) => ['hour' => (int) $r->h, 'bills' => (int) $r->bills])
+            ->map(fn($r) => ['hour' => (int) $r->h, 'bills' => (int) $r->bills])
             ->all();
 
         $day = $this->bills($storeId, $branchId, $from, $to)
@@ -1082,7 +1084,7 @@ class DashboardInsightsController extends Controller
                 ->orderByDesc('profit')
                 ->limit(5)
                 ->get()
-                ->map(fn ($r) => [
+                ->map(fn($r) => [
                     'name' => $r->name,
                     'qty' => (float) $r->qty,
                     'profit' => round((float) $r->profit, 2),
@@ -1108,7 +1110,7 @@ class DashboardInsightsController extends Controller
             ->orderByDesc('profit')
             ->limit(5)
             ->get()
-            ->map(fn ($r) => [
+            ->map(fn($r) => [
                 'name' => $r->name,
                 'qty' => (float) $r->qty,
                 'profit' => round((float) $r->profit, 2),
@@ -1132,12 +1134,12 @@ class DashboardInsightsController extends Controller
             ->where('units_per_pack', '>=', 2)
             ->pluck('units_per_pack', 'id');
 
-        $stock = $stock->map(fn ($q, $pid) => round((float) $q / max(1, (int) ($factors[$pid] ?? 1)), 2));
+        $stock = $stock->map(fn($q, $pid) => round((float) $q / max(1, (int) ($factors[$pid] ?? 1)), 2));
 
         $limit = self::LOW_STOCK_LIMIT;
 
-        $out = $stock->filter(fn ($q) => (float) $q <= 0)->count();
-        $low = $stock->filter(fn ($q) => (float) $q > 0 && (float) $q <= $limit)->count();
+        $out = $stock->filter(fn($q) => (float) $q <= 0)->count();
+        $low = $stock->filter(fn($q) => (float) $q > 0 && (float) $q <= $limit)->count();
 
         $bestLow = [];
         $im = $this->itemsMeta();
@@ -1191,7 +1193,7 @@ class DashboardInsightsController extends Controller
             ->all();
 
         $stock = $this->stockByProduct($sm, $branchId, $storeId)
-            ->filter(fn ($q, $pid) => (float) $q > 0 && ! in_array($pid, $soldIds, false));
+            ->filter(fn($q, $pid) => (float) $q > 0 && ! in_array($pid, $soldIds, false));
 
         if ($stock->isEmpty()) {
             return ['count' => 0, 'value' => 0, 'items' => []];
@@ -1205,7 +1207,7 @@ class DashboardInsightsController extends Controller
         $costs = collect();
         if (Schema::hasColumn($sm['table'], 'cost_price')) {
             $vq = DB::table("{$sm['table']} as s")
-                ->selectRaw("s.{$sm['product']} as pid, SUM(".$this->availExpr($sm).' * s.cost_price) as v')
+                ->selectRaw("s.{$sm['product']} as pid, SUM(" . $this->availExpr($sm) . ' * s.cost_price) as v')
                 ->whereIn("s.{$sm['product']}", $stock->keys()->all())
                 ->groupBy("s.{$sm['product']}");
 
@@ -1251,12 +1253,17 @@ class DashboardInsightsController extends Controller
         $e = "s.{$sm['expiry']}";
 
         $base = DB::table("{$sm['table']} as s")
-            ->whereRaw($this->availExpr($sm).' > 0')
+            ->whereRaw($this->availExpr($sm) . ' > 0')
             ->whereNotNull($e);
 
         $this->scopeStore($base, $sm, $storeId);
         $this->onlyLive($base, $sm);
-
+        \Log::info('Expiry Branch Debug', [
+            'store_id' => $storeId,
+            'branch_id' => $branchId,
+            'stock_table' => $sm['table'],
+            'branch_column' => $sm['branch'],
+        ]);
         if ($branchId && $sm['branch']) {
             $base->where("s.{$sm['branch']}", $branchId);
         }
@@ -1269,7 +1276,7 @@ class DashboardInsightsController extends Controller
             ? "COUNT(DISTINCT CONCAT_WS('|', s.{$sm['product']}, $branchPart, COALESCE(s.{$sm['batch']}, ''), $e))"
             : 'COUNT(*)';
 
-        $count = fn ($q) => (int) $q->selectRaw("$countExpr as c")->value('c');
+        $count = fn($q) => (int) $q->selectRaw("$countExpr as c")->value('c');
 
         return [
             'expired' => $count((clone $base)->whereDate($e, '<', $today)),
@@ -1296,7 +1303,7 @@ class DashboardInsightsController extends Controller
             ->orderByDesc('total')
             ->limit(5)
             ->get()
-            ->map(fn ($r) => [
+            ->map(fn($r) => [
                 'name' => $r->name,
                 'bills' => (int) $r->bills,
                 'total' => round((float) $r->total, 2),
@@ -1333,7 +1340,7 @@ class DashboardInsightsController extends Controller
             ->selectRaw("b.id, b.name, COUNT(*) as bills, SUM(sb.$t) as total")
             ->orderByDesc('total')
             ->get()
-            ->map(fn ($r) => [
+            ->map(fn($r) => [
                 'id' => (int) $r->id,
                 'name' => $r->name,
                 'bills' => (int) $r->bills,

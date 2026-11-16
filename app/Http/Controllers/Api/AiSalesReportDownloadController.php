@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Exports\SalesReportExport;
 use App\Http\Controllers\Controller;
+use App\Services\SalesChannelResolver;
 use App\Services\SalesReportService;
 use Barryvdh\DomPDF\Facade\Pdf;
 use Carbon\Carbon;
@@ -15,7 +16,8 @@ class AiSalesReportDownloadController extends Controller
 {
     public function download(
         Request $request,
-        SalesReportService $salesReportService
+        SalesReportService $salesReportService,
+        SalesChannelResolver $channels
     ) {
         $validated = $request->validate([
             'format' => ['required', 'in:pdf,excel'],
@@ -52,7 +54,9 @@ class AiSalesReportDownloadController extends Controller
 
         $kpis = $salesReportService->getKpis($filters);
         $invoiceData = $salesReportService->getInvoiceTable($filters);
-        $rows = $invoiceData['rows'];
+        // Har bill par channel (POS / Online) lagao: PDF aur Excel dono me dikhega
+        $rows = $channels->annotate($invoiceData['rows']);
+        $channelSummary = $channels->summary($rows);
 
         $from = Carbon::parse($validated['date_from'])->toDateString();
         $to = Carbon::parse($validated['date_to'])->toDateString();
@@ -65,6 +69,7 @@ class AiSalesReportDownloadController extends Controller
                 'to' => $to,
                 'kpis' => $kpis,
                 'rows' => $rows,
+                'channelSummary' => $channelSummary,
             ])->setPaper('a4', 'landscape');
 
             return $pdf->download($filename.'.pdf');
