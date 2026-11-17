@@ -4,6 +4,8 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Branch;
+use App\Models\Customer;
+use App\Models\CustomerWalletTransaction;
 use App\Models\Inventory;
 use App\Models\PrescriptionRegister;
 use App\Models\SalesBill;
@@ -196,6 +198,13 @@ class SalesReturnController extends Controller
             ], 404);
         }
 
+        if ($request->refund_type === 'store_credit' && ! $billCheck->customer_id) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Store credit needs a customer on the original bill.',
+            ], 422);
+        }
+
         if ($user->role === 'manager'
             && ! in_array((int) $billCheck->branch_id, $this->allowedBranchIds($user), true)) {
             return response()->json([
@@ -384,8 +393,13 @@ class SalesReturnController extends Controller
                 }
             }
 
+            $walletCreditAmount = (float) $returnSubtotal;
+
             if ($originalBill->payment_type === 'credit') {
-                $originalBill->decrement('due_amount', $returnSubtotal);
+                // Unpaid dues are cancelled first. Only the amount beyond the dues was actually paid by the customer.
+                $dueReduction = min((float) $originalBill->due_amount, (float) $returnSubtotal);
+                $originalBill->decrement('due_amount', $dueReduction);
+                $walletCreditAmount = round($returnSubtotal - $dueReduction, 2);
             } else {
                 $originalBill->decrement('total_amount', $returnSubtotal);
 
@@ -395,11 +409,39 @@ class SalesReturnController extends Controller
                 $originalBill->decrement('total_cogs', $returnTotalCogs);
             }
 
+            // Store credit goes into the customer's wallet (customers.opening_balance), the same balance billing uses.
+            $walletCredited = 0;
+
+            if ($request->refund_type === 'store_credit' && $walletCreditAmount > 0) {
+                $customer = Customer::where('id', $originalBill->customer_id)
+                    ->where('store_id', $user->store_id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+
+                $before = (float) $customer->opening_balance;
+                $customer->opening_balance = round($before + $walletCreditAmount, 2);
+                $customer->save();
+
+                CustomerWalletTransaction::create([
+                    'customer_id' => $customer->id,
+                    'type' => 'credit',
+                    'amount' => $walletCreditAmount,
+                    'balance_before' => $before,
+                    'balance_after' => $customer->opening_balance,
+                    'source_type' => 'sales_return',
+                    'source_id' => $salesReturn->id,
+                    'created_by' => $user->id,
+                ]);
+
+                $walletCredited = $walletCreditAmount;
+            }
+
             DB::commit();
 
             return response()->json([
                 'status' => true,
                 'message' => 'Sales return processed successfully by manager authorization.',
+                'wallet_credited' => $walletCredited,
                 'data' => $salesReturn->load('returnLines'),
             ]);
 

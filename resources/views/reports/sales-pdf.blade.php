@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html>
 <head>
@@ -13,6 +12,7 @@
         th, td { border: 1px solid #ccc; padding: 5px; }
         th { background: #eee; }
         .number { text-align: right; }
+        .channels { width: 55%; margin: 0 0 14px; }
     </style>
 </head>
 <body>
@@ -34,12 +34,34 @@
         </tr>
     </table>
 
+    <table class="channels">
+        <thead>
+            <tr>
+                <th>Channel</th>
+                <th>Bills</th>
+                <th>Sales</th>
+                <th>Profit</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach ($channelSummary as $name => $c)
+                <tr>
+                    <td>{{ $name === 'POS' ? 'POS (store)' : 'Online' }}</td>
+                    <td class="number">{{ $c['bills'] }}</td>
+                    <td class="number">₹{{ number_format($c['total'], 2) }}</td>
+                    <td class="number">₹{{ number_format($c['profit'], 2) }}</td>
+                </tr>
+            @endforeach
+        </tbody>
+    </table>
+
     <table>
         <thead>
             <tr>
                 <th>Bill No</th>
                 <th>Date</th>
                 <th>Customer</th>
+                <th>Channel</th>
                 <th>Subtotal</th>
                 <th>GST</th>
                 <th>Total</th>
@@ -55,6 +77,7 @@
                     <td>{{ $row->bill_no }}</td>
                     <td>{{ $row->created_at }}</td>
                     <td>{{ $row->customer_name ?? 'Walk-in Customer' }}</td>
+                    <td>{{ $row->channel ?? 'POS' }}</td>
                     <td class="number">{{ number_format((float) $row->subtotal, 2) }}</td>
                     <td class="number">{{ number_format((float) $row->total_gst, 2) }}</td>
                     <td class="number">{{ number_format((float) $row->total_amount, 2) }}</td>
@@ -65,7 +88,7 @@
                 </tr>
             @empty
                 <tr>
-                    <td colspan="10">No sales found for this period.</td>
+                    <td colspan="11">No sales found for this period.</td>
                 </tr>
             @endforelse
         </tbody>

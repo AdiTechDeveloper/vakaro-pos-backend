@@ -109,6 +109,8 @@ class CustomerPortalController extends Controller
         $validated = $request->validate([
             'mobile' => ['required', 'digits:10'],
             'otp' => ['required', 'digits:6'],
+            // Multiple stores case: user picks which customer account to open
+            'customer_id' => ['nullable', 'integer'],
         ]);
 
         $otpRecord = CustomerPortalOtp::where('mobile', $validated['mobile'])
@@ -139,17 +141,23 @@ class CustomerPortalController extends Controller
             ], 422);
         }
 
-        $customers = Customer::where('mobile', $validated['mobile'])->get();
+        $customers = Customer::with('store')
+            ->where('mobile', $validated['mobile'])
+            ->get();
 
         if ($customers->isEmpty()) {
             return response()->json(['status' => false, 'message' => 'Customer not found.'], 404);
         }
 
+        // Sirf isi mobile ke customers mein se dhundhta hai, isliye
+        // kisi aur ka customer_id bhejne se koi fayda nahi.
         $customer = $customers->count() === 1
             ? $customers->first()
-            : $customers->firstWhere('id', (int) $request->input('customer_id'));
+            : $customers->firstWhere('id', (int) ($validated['customer_id'] ?? 0));
 
         if (! $customer) {
+            // OTP abhi verified mark nahi hota, taaki store select ke baad
+            // wahi OTP dobara use ho sake (5 min expiry ke andar).
             return response()->json([
                 'status' => true,
                 'requires_selection' => true,
@@ -181,6 +189,7 @@ class CustomerPortalController extends Controller
                 'id' => $customer->id,
                 'name' => $customer->name,
                 'mobile' => $customer->mobile,
+                'store' => $customer->store?->name,
             ],
         ]);
     }
@@ -210,7 +219,7 @@ class CustomerPortalController extends Controller
             ], 401);
         }
 
-        $customer = Customer::find($session->customer_id);
+        $customer = Customer::with('store')->find($session->customer_id);
 
         if (! $customer) {
             return response()->json([
@@ -231,6 +240,9 @@ class CustomerPortalController extends Controller
             ->where('type', 'debit')
             ->sum('amount');
 
+        // NOTE: agar opening_balance sirf shuruaati balance hai (current wallet
+        // balance nahi), to yahan latest transaction ka balance_after ya
+        // opening_balance + advance - used use karna hoga.
         $remaining = (float) $customer->opening_balance;
 
         $transactions = $transactions->map(function ($transaction) {
@@ -291,7 +303,19 @@ class CustomerPortalController extends Controller
                 'id' => $customer->id,
                 'name' => $customer->name,
                 'mobile' => $customer->mobile,
+                'store' => $customer->store?->name,
             ],
+
+            // Same mobile ke saare store accounts (store dropdown ke liye)
+            'stores' => Customer::with('store')
+                ->where('mobile', $customer->mobile)
+                ->get()
+                ->map(fn ($c) => [
+                    'id' => $c->id,
+                    'name' => $c->name,
+                    'store' => $c->store?->name,
+                ])
+                ->values(),
 
             'summary' => [
                 'total_advance' => (float) $totalAdvance,
@@ -300,6 +324,72 @@ class CustomerPortalController extends Controller
             ],
 
             'transactions' => $transactions->values(),
+        ]);
+    }
+
+    /**
+     * Same mobile ke dusre store account par switch karo (logout/OTP ke bina).
+     * Session OTP se is mobile ke liye already verified hai, isliye sirf
+     * usi mobile ke customers par switch allowed hai.
+     */
+    public function switchStore(Request $request)
+    {
+        $validated = $request->validate([
+            'customer_id' => ['required', 'integer'],
+        ]);
+
+        $token = $request->bearerToken();
+
+        if (! $token) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Unauthorized.',
+            ], 401);
+        }
+
+        $session = CustomerPortalSession::where('token_hash', hash('sha256', $token))
+            ->where('expires_at', '>', now())
+            ->first();
+
+        if (! $session) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Session expired or invalid.',
+            ], 401);
+        }
+
+        $current = Customer::find($session->customer_id);
+
+        if (! $current) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Customer not found.',
+            ], 404);
+        }
+
+        $target = Customer::with('store')
+            ->where('mobile', $current->mobile)
+            ->where('id', $validated['customer_id'])
+            ->first();
+
+        if (! $target) {
+            return response()->json([
+                'status' => false,
+                'message' => 'This store is not available for your account.',
+            ], 403);
+        }
+
+        $session->update(['customer_id' => $target->id]);
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Store switched successfully.',
+            'customer' => [
+                'id' => $target->id,
+                'name' => $target->name,
+                'mobile' => $target->mobile,
+                'store' => $target->store?->name,
+            ],
         ]);
     }
 }
