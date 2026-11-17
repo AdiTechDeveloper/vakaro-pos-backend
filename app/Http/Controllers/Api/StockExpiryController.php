@@ -52,19 +52,38 @@ class StockExpiryController extends Controller
         $alerts = $query->get();
 
         $expiredQty = Inventory::query()
-            ->whereIn('product_id', $alerts->pluck('product_id'))
-            ->whereIn('branch_id', $alerts->pluck('branch_id'))
-            ->get()
-            ->groupBy(fn ($item) => $item->product_id.'_'.$item->branch_id.'_'.$item->batch_no.'_'.substr((string) $item->expiry_date, 0, 10))
-            ->map(fn ($items) => $items->sum(fn ($item) => max(
-                0,
-                (float) $item->qty - (float) $item->sold_qty - (float) ($item->expired_qty ?? 0)
-            )));
+                    ->whereIn('product_id', $alerts->pluck('product_id'))
+                    ->whereIn('branch_id', $alerts->pluck('branch_id'))
+                    ->get()
+                    ->groupBy(fn ($item) => $item->product_id.'_'.
+                        $item->branch_id.'_'.
+                        $item->batch_no.'_'.
+                        substr((string) $item->expiry_date, 0, 10)
+                    )
+                    ->map(fn ($items) => $items->sum(fn ($item) => max(
+                        0,
+                        (float) $item->qty
+                        - (float) $item->sold_qty
+                        - (float) ($item->expired_qty ?? 0)
+                    )));
+
+        // Remove alerts whose available stock is zero.
+        $alerts = $alerts->filter(function ($alert) use ($expiredQty) {
+            $key = $alert->product_id.'_'.
+                $alert->branch_id.'_'.
+                ($alert->purchaseLine->batch_no ?? '').'_'.
+                substr((string) $alert->expiry_date, 0, 10);
+
+            return $expiredQty->get($key, 0) > 0;
+        })->values();
 
         return response()->json([
             'total' => $alerts->count(),
             'alerts' => $alerts->map(function ($a) use ($expiredQty) {
-                $key = $a->product_id.'_'.$a->branch_id.'_'.($a->purchaseLine->batch_no ?? '').'_'.substr((string) $a->expiry_date, 0, 10);
+                $key = $a->product_id.'_'.
+                    $a->branch_id.'_'.
+                    ($a->purchaseLine->batch_no ?? '').'_'.
+                    substr((string) $a->expiry_date, 0, 10);
 
                 return [
                     'id' => $a->id,
@@ -77,7 +96,8 @@ class StockExpiryController extends Controller
                     'branch_name' => $a->branch->name ?? '-',
                     'alert_date' => $a->alert_date,
                 ];
-            }),
+            })->values(),
         ]);
+
     }
 }
