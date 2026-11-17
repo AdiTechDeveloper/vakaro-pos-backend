@@ -302,7 +302,7 @@ class AIController extends Controller
                 'type' => 'function',
                 'function' => [
                     'name' => 'get_sales_summary',
-                    'description' => 'Get actual POS sales data for a date range. Use this whenever the user asks about sales, revenue, business amount, number of bills, collected amount, due amount, profit, or similar sales performance information.',
+                    'description' => 'Get actual POS sales data for a date range. Use this whenever the user asks about sales, revenue, business amount, number of bills, collected amount, due amount, profit, or similar sales performance information. This is the COMBINED total of all channels (counter POS and online store). For a split by channel (store/counter vs online) use get_sales_by_channel instead.',
                     'parameters' => [
                         'type' => 'object',
                         'properties' => [
@@ -714,6 +714,25 @@ class AIController extends Controller
         // category-wise sales, cashier-wise sales, product info, customer dues.
         $tools = array_merge($tools, $this->extraToolDefinitions());
 
+        // Sales split by channel: counter POS vs online store (e-commerce) orders.
+        $tools[] = [
+            'type' => 'function',
+            'function' => [
+                'name' => 'get_sales_by_channel',
+                'description' => 'Sales split by channel: POS (counter billing) vs Online (online store / e-commerce orders, counted when delivered). Use whenever the user asks about online sales, e-commerce, website or app sales, online store orders sales, or POS vs online comparison. Use also for questions like "kitne store se aur kitne online", counter vs online, offline vs online. get_sales_summary gives only the combined total and cannot split by channel.',
+                'parameters' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'date_range' => ['type' => 'string', 'enum' => $dateEnum],
+                        'date_from' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
+                        'date_to' => ['type' => 'string', 'description' => 'YYYY-MM-DD, only for custom.'],
+                        'branch_id' => ['type' => 'integer', 'description' => 'Optional. Only when the user names one branch.'],
+                    ],
+                    'required' => ['date_range'],
+                ],
+            ],
+        ];
+
         $download = null;
         $maxToolRounds = 4;
 
@@ -1027,6 +1046,8 @@ class AIController extends Controller
                 return $this->getExpiryAnalysis($user, $branchId);
             case 'get_customer_wallet_balances':
                 return $this->getCustomerWalletBalances($user, $branchId);
+            case 'get_sales_by_channel':
+                return $this->getSalesByChannel($user, $branchId, $arguments);
             default:
                 // New tools live in AIExtraTools (GST, expenses, returns, dead stock, ...).
                 $extra = $this->executeExtraTool(
@@ -1039,6 +1060,87 @@ class AIController extends Controller
 
                 return $extra ?? ['error' => 'Unknown business tool.'];
         }
+    }
+
+    /**
+     * POS vs Online sales. Online = a bill that is linked in online_orders.sales_bill_id
+     * (an online order creates its POS bill when it is delivered). Same valid-bill filter as the other sales tools.
+     */
+    private function getSalesByChannel($user, ?int $branchId, array $arguments): array
+    {
+        if ($user->role === 'manager' && !$branchId) {
+            return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
+        }
+
+        $range = $this->resolveRange($arguments, 'today');
+        if (isset($range['error'])) {
+            return $range;
+        }
+
+        // Admin ne ek branch maangi ho to sirf wahi
+        if ($user->role === 'admin' && !empty($arguments['branch_id'])) {
+            $this->validateAdminBranch($user, (int) $arguments['branch_id']);
+            $branchId = (int) $arguments['branch_id'];
+        }
+
+        $query = DB::table('sales_bills as sb')
+            ->leftJoin('online_orders as oo', 'oo.sales_bill_id', '=', 'sb.id')
+            ->where('sb.store_id', $user->store_id)
+            ->whereBetween('sb.created_at', [$range['from'], $range['to']]);
+
+        if ($branchId !== null) {
+            $query->where('sb.branch_id', $branchId);
+        }
+
+        $this->excludeInvalidBills($query, 'sb.bill_status');
+
+        $rows = $query
+            ->selectRaw("
+                CASE WHEN oo.id IS NULL THEN 'pos' ELSE 'online' END as channel,
+                COUNT(sb.id) as bills,
+                COALESCE(SUM(sb.total_amount), 0) as gross_sales,
+                COALESCE(SUM(sb.paid_amount), 0) as collected,
+                COALESCE(SUM(sb.due_amount), 0) as due,
+                COALESCE(SUM(sb.total_profit), 0) as profit
+            ")
+            ->groupBy(DB::raw("CASE WHEN oo.id IS NULL THEN 'pos' ELSE 'online' END"))
+            ->get()
+            ->keyBy('channel');
+
+        $make = function (string $key) use ($rows) {
+            $r = $rows->get($key);
+
+            return [
+                'bills' => (int) ($r->bills ?? 0),
+                'gross_sales' => round((float) ($r->gross_sales ?? 0), 2),
+                'collected_amount' => round((float) ($r->collected ?? 0), 2),
+                'due_amount' => round((float) ($r->due ?? 0), 2),
+                'profit' => round((float) ($r->profit ?? 0), 2),
+            ];
+        };
+
+        $pos = $make('pos');
+        $online = $make('online');
+        $total = [
+            'bills' => $pos['bills'] + $online['bills'],
+            'gross_sales' => round($pos['gross_sales'] + $online['gross_sales'], 2),
+            'collected_amount' => round($pos['collected_amount'] + $online['collected_amount'], 2),
+            'due_amount' => round($pos['due_amount'] + $online['due_amount'], 2),
+            'profit' => round($pos['profit'] + $online['profit'], 2),
+        ];
+
+        return [
+            'date_range' => $range['label'],
+            'period' => $range['period'],
+            'branch_id' => $branchId,
+            'pos' => $pos,
+            'online' => $online,
+            'total' => $total,
+            'online_share_percent' => $total['gross_sales'] > 0
+                ? round($online['gross_sales'] / $total['gross_sales'] * 100, 1)
+                : null,
+            'note' => 'POS = counter billing. Online = orders placed on the online store, counted when the order is delivered (that is when its bill is created). Orders not delivered yet are not part of sales.',
+        ];
     }
 
     /**
@@ -2683,6 +2785,9 @@ Important rules:
 58. For any month, year or specific date range (for example "September 2026", "pichhle mahine", "1 se 15 October") use date_range "last_month" or "custom" with exact date_from and date_to (YYYY-MM-DD) in the sales, payment, top selling, branch-wise, hourly, customer, GST, expense, returns, category-wise and cashier-wise tools. Never say a past month is not supported.
 59. If a tool result has truncated = true, tell the user that only the top rows are shown and more exist. Never say "total N products" when truncated is true unless the tool gives that total.
 60. If a tool says data is not available (for example a missing table or column), say so honestly in the user's language. Never estimate or invent that data.
+61. For online store / e-commerce / website sales, or POS vs online comparison, call get_sales_by_channel. In the user's words, "store se", "counter", "offline" and "POS" mean the POS channel; "online", "ecommerce", "website" and "app" mean the Online channel. Present a Markdown table with Channel, Bills, Gross Sales, Collected Amount, Due Amount, Profit (rows POS, Online and Total) and mention the online share percent. POS means counter billing; Online means orders placed on the online store, counted when the order is delivered (when its bill is created). Orders not delivered yet are not part of sales.
+62. get_sales_summary gives only the combined total of all channels. For any split by channel (store/counter vs online), call get_sales_by_channel instead. Never assume or guess that all sales belong to one channel.
+63. If a breakdown the user asks for cannot be fetched with a tool, say clearly that you cannot split it. Never assume or guess.
 **TABLE FORMATTING RULES**
 
 1. When the user asks for data in a table, always format the response as a clean Markdown table.

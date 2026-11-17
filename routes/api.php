@@ -374,6 +374,7 @@ Route::prefix('customer-portal')->group(function () {
     Route::post('/send-otp', [CustomerPortalController::class, 'sendOtp']);
     Route::post('/verify-otp', [CustomerPortalController::class, 'verifyOtp']);
     Route::get('/dashboard', [CustomerPortalController::class, 'dashboard']);
+    Route::post('/switch-store', [CustomerPortalController::class, 'switchStore']);
 });
 
 // ai api
