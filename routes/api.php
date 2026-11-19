@@ -396,11 +396,4 @@ Route::middleware(['auth:sanctum', 'extend.token'])->group(function () {
     );
 });
 
-Route::get('/test-product-template', function () {
-    return \Maatwebsite\Excel\Facades\Excel::download(
-        new \App\Exports\ProductTemplateExport,
-        'product-import-template.xlsx'
-    );
-})->middleware(['auth:sanctum', 'extend.token']);
-
 require __DIR__.'/public_api.php';

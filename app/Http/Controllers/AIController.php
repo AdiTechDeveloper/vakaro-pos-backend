@@ -680,7 +680,7 @@ class AIController extends Controller
                 'type' => 'function',
                 'function' => [
                     'name' => 'get_customer_analysis',
-                    'description' => 'Customer analysis: total customers, new customers, repeat customers and top customers by spend for a period.',
+                    'description' => 'Customer analysis for a period: total/new/repeat/active customer counts PLUS the actual lists: new customers (name, mobile, branch, registration date, bills and spend in the period), repeat customers (visits, spend) and top customers by spend. Use this for any question like new customers list, names of new customers, customers registered on a date, repeat customers, best customers.',
                     'parameters' => [
                         'type' => 'object',
                         'properties' => [
@@ -2579,40 +2579,65 @@ PROMPT;
         $perCustomer = $bills
             ->selectRaw('customer_id, COUNT(*) as visits, SUM(total_amount) as spent')
             ->groupBy('customer_id')
-            ->get();
+            ->get()
+            ->keyBy('customer_id');
 
-        $names = DB::table('customers')
-            ->whereIn('id', $perCustomer->pluck('customer_id'))
-            ->pluck('name', 'id');
+        // NEW customers = customers REGISTERED in the period (customers.created_at).
+        $newRows = $this->storeCustomersQuery($user, $branchId)
+            ->leftJoin('branches as br', 'br.id', '=', 'c.branch_id')
+            ->whereBetween('c.created_at', [$from, $to])
+            ->orderBy('c.created_at')
+            ->get(['c.id', 'c.name', 'c.mobile', 'c.created_at', 'br.name as branch_name']);
+
+        $totalCustomers = $this->storeCustomersQuery($user, $branchId)->count();
+
+        // Names / mobiles for repeat + top customer lists.
+        $people = DB::table('customers')
+            ->whereIn('id', $perCustomer->keys())
+            ->get(['id', 'name', 'mobile'])
+            ->keyBy('id');
 
         $top = $perCustomer->sortByDesc('spent')->take(10)->values()->map(fn($c) => [
-            'customer_name' => $names[$c->customer_id] ?? 'Unknown',
+            'customer_name' => $people[$c->customer_id]->name ?? 'Unknown',
+            'mobile' => $people[$c->customer_id]->mobile ?? null,
             'visits' => (int) $c->visits,
             'total_spent' => round((float) $c->spent, 2),
         ]);
 
-        // customers table has no store_id, so scope through branches.store_id.
-        $customerScope = DB::table('customers as c')
-            ->join('branches as b', 'b.id', '=', 'c.branch_id')
-            ->where('b.store_id', $user->store_id);
+        $repeat = $perCustomer->where('visits', '>', 1)->sortByDesc('visits')->values();
+        $repeatList = $repeat->take(30)->map(fn($c) => [
+            'customer_name' => $people[$c->customer_id]->name ?? 'Unknown',
+            'mobile' => $people[$c->customer_id]->mobile ?? null,
+            'visits' => (int) $c->visits,
+            'total_spent' => round((float) $c->spent, 2),
+        ]);
 
-        if ($branchId !== null) {
-            $customerScope->where('c.branch_id', $branchId);
-        }
+        $newList = $newRows->take(50)->map(function ($c) use ($perCustomer) {
+            $stat = $perCustomer->get($c->id);
 
-        $totalCustomers = (clone $customerScope)->count();
-        $newCustomers = (clone $customerScope)
-            ->whereBetween('c.created_at', [$from, $to])
-            ->count();
+            return [
+                'customer_name' => $c->name,
+                'mobile' => $c->mobile,
+                'branch' => $c->branch_name,
+                'created_on' => \Carbon\Carbon::parse($c->created_at)->format('d M Y, h:i A'),
+                'bills_in_period' => $stat ? (int) $stat->visits : 0,
+                'spent_in_period' => $stat ? round((float) $stat->spent, 2) : 0,
+            ];
+        });
 
         return [
             'date_range' => $range,
             'period' => $r['period'],
             'active_customers' => $perCustomer->count(),
-            'repeat_customers' => $perCustomer->where('visits', '>', 1)->count(),
-            'new_customers' => $newCustomers,
+            'repeat_customers' => $repeat->count(),
+            'new_customers' => $newRows->count(),
             'total_customers' => $totalCustomers,
+            'new_customers_list' => $newList->values()->all(),
+            'new_customers_truncated' => $newRows->count() > 50,
+            'repeat_customers_list' => $repeatList->values()->all(),
+            'repeat_customers_truncated' => $repeat->count() > 30,
             'top_customers' => $top->all(),
+            'note' => 'new_customers = customers REGISTERED in the period (customers.created_at); new_customers_list has their name, mobile, branch and created_on date. repeat_customers = customers with more than one valid bill in the period. Walk-in bills without a customer are not counted. Lists are capped (50 new, 30 repeat); tell the user if truncated is true.',
         ];
     }
 
@@ -2622,11 +2647,16 @@ PROMPT;
             return ['error' => 'Manager ki assigned branch resolve nahi hui.'];
         }
 
-        // customers has no store_id, so scope through branches.store_id.
+        // customers have store_id (older rows: scope through the branch's store).
         $query = DB::table('customer_wallet_transactions as t')
             ->join('customers as c', 'c.id', '=', 't.customer_id')
-            ->join('branches as b', 'b.id', '=', 'c.branch_id')
-            ->where('b.store_id', $user->store_id);
+            ->where(function ($w) use ($user) {
+                $w->where('c.store_id', $user->store_id)
+                    ->orWhere(function ($x) use ($user) {
+                        $x->whereNull('c.store_id')
+                            ->whereIn('c.branch_id', fn ($sub) => $sub->select('id')->from('branches')->where('store_id', $user->store_id));
+                    });
+            });
 
         if ($branchId !== null) {
             $query->where('c.branch_id', $branchId);
@@ -2775,7 +2805,7 @@ Important rules:
 48. For a downloadable detailed, product-wise or item-wise purchase report use report_type purchase_detail_report. For a bill-wise purchase summary use purchase_report.
 49. Product counts: get_stock_summary returns products_in_catalog (all products registered in the store) and products_with_inventory_records (products that have received stock). When the user asks how many products they have, answer with products_in_catalog and mention how many of them have stock. Never call the inventory-record count the total number of products. For product categories always call get_product_categories and never say category information is unavailable.
 50. For time-wise / hour-wise / peak time questions call get_hourly_sales_analysis and present a Markdown table with Time Slot, Bills, Sales, Unique Customers, then clearly state the peak sales slot and the peak customer slot.
-51. For customer analysis call get_customer_analysis. For expiry analysis call get_expiry_analysis. For customer wallet balances call get_customer_wallet_balances. Never invent values.
+51. For customer analysis call get_customer_analysis. For expiry analysis call get_expiry_analysis. For customer wallet balances call get_customer_wallet_balances. Never invent values. NEW customers means customers registered (created date) in the period, and get_customer_analysis returns their names in new_customers_list, so when the user asks for new customers names, a list or customers of a date, show them as a Markdown table with Name, Mobile, Branch, Created On, Bills, Spent and never say the names are not available. Show repeat customers from repeat_customers_list in the same way. If the period is not mentioned for a new customer question use today. If new_customers is 0 say that no customer was registered in that period. For ONE named customer or a mobile number (profile, total spend, last visit, wallet, dues, recent bills) call get_customer_details.
 52. For branch-wise sales call get_branch_wise_sales and present a Markdown table with Branch Name, Total Bills, Gross Sales, Collected Amount, Due Amount, Profit, plus a Total row from the totals. Never explain or guess which branch a sale happened in. Never say sales were made at a "main" or "primary" branch. Only report what the tool returned. If a tool result looks incomplete or contradicts an earlier answer, say so honestly and do not invent a reason.
 53. For GST / tax questions call get_gst_summary and show output GST, input GST and net GST payable. Say it is an estimate from recorded bills, not a filed GST return. If input GST is null, say purchase GST data is not available. For expenses, expense categories or NET profit call get_expense_summary. For returns or refunds call get_sales_returns.
 54. For dead stock / slow-moving / "jo product bik nahi raha" questions call get_dead_stock with days 30, 60 or 90 as the user asks (default 30).

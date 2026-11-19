@@ -708,10 +708,15 @@ private function customerAnalysisReport($user, ?int $branchId, string $from, str
         $r->visits > 1 ? 'Repeat' : 'One-time',
     ])->all();
 
-    // customers table has no store_id, so scope through branches.store_id.
+    // customers have store_id (older rows: scope through the branch's store).
     $scope = DB::table('customers as c')
-        ->join('branches as b', 'b.id', '=', 'c.branch_id')
-        ->where('b.store_id', $user->store_id);
+        ->where(function ($w) use ($user) {
+            $w->where('c.store_id', $user->store_id)
+                ->orWhere(function ($x) use ($user) {
+                    $x->whereNull('c.store_id')
+                        ->whereIn('c.branch_id', fn ($sub) => $sub->select('id')->from('branches')->where('store_id', $user->store_id));
+                });
+        });
 
     if ($branchId !== null) {
         $scope->where('c.branch_id', $branchId);
@@ -740,8 +745,13 @@ private function customerWalletReport($user, ?int $branchId): array
 {
     $query = DB::table('customer_wallet_transactions as t')
         ->join('customers as c', 'c.id', '=', 't.customer_id')
-        ->join('branches as b', 'b.id', '=', 'c.branch_id')
-        ->where('b.store_id', $user->store_id);
+        ->where(function ($w) use ($user) {
+            $w->where('c.store_id', $user->store_id)
+                ->orWhere(function ($x) use ($user) {
+                    $x->whereNull('c.store_id')
+                        ->whereIn('c.branch_id', fn ($sub) => $sub->select('id')->from('branches')->where('store_id', $user->store_id));
+                });
+        });
 
     if ($branchId !== null) {
         $query->where('c.branch_id', $branchId);
