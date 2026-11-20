@@ -451,6 +451,56 @@ class StorefrontController extends Controller
         return $s;
     }
 
+    /**
+     * GET public/stores/{slug}/products/{id}
+     * Product page ki static info (Blinkit jaisi): saari photos, description, details.
+     * Price / stock list API (products) se hi aate hain, yahan nahi.
+     */
+    public function productDetails(string $slug, int $id): JsonResponse
+    {
+        $store = $this->findStore($slug);
+
+        $p = DB::table('products')
+            ->where('id', $id)
+            ->where('store_id', $store->store_id)
+            ->whereNull('deleted_at')
+            ->first();
+
+        if (! $p) {
+            return response()->json(['message' => 'Product not found'], 404);
+        }
+
+        $images = DB::table('product_images')
+            ->where('product_id', $p->id)
+            ->orderBy('sort_order')
+            ->orderBy('id')
+            ->pluck('path')
+            ->map(fn ($path) => url('/storage/' . $path))
+            ->values()
+            ->all();
+
+        // Gallery khali ho to purani single photo
+        if (! $images && $p->image) {
+            $images = [url('/storage/' . $p->image)];
+        }
+
+        $info = json_decode($p->product_info ?? '[]', true);
+
+        return response()->json([
+            'data' => [
+                'id' => $p->id,
+                'name' => $p->name,
+                'brand' => $p->brand_id ? DB::table('brands')->where('id', $p->brand_id)->value('name') : null,
+                'category' => $p->category_id ? DB::table('categories')->where('id', $p->category_id)->value('name') : null,
+                'image' => $images[0] ?? null,
+                'images' => $images,
+                'description' => $p->description,
+                // [{label, value}] - plain text hai, page par text ki tarah dikhao (innerHTML nahi)
+                'details' => is_array($info) ? $info : [],
+            ],
+        ]);
+    }
+
     // ---------------------------------------------------------------- helpers
 
     public function findStore(string $slug): object

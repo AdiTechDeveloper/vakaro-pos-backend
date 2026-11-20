@@ -31,6 +31,8 @@ class Product extends Model
         'plu_code',
         'price_per_kg',
         'image',
+        'description',
+        'product_info',
 
         // Pharmacy columns
         'salt_composition',
@@ -43,12 +45,29 @@ class Product extends Model
         'loose_unit',
     ];
 
+    // product_info = [{label, value}, ...] (Blinkit jaisi product details: Unit, Shelf Life, Storage Tips ...)
+    protected $casts = [
+        'product_info' => 'array',
+    ];
+
     // JSON mein `image_url` (poora URL) bhi jaye, taaki admin list/edit seedha dikha sake
     protected $appends = ['image_url'];
 
     public function getImageUrlAttribute(): ?string
     {
         return $this->image ? asset('storage/'.$this->image) : null;
+    }
+
+    // Max kitni photos ek product me ho sakti hain
+    public const MAX_IMAGES = 4;
+
+    /**
+     * Saari photos (pehli = main photo). products.image hamesha pehli photo ka
+     * path rakhta hai, taaki storefront / list / bulk upload pehle jaise chalein.
+     */
+    public function images()
+    {
+        return $this->hasMany(ProductImage::class)->orderBy('sort_order')->orderBy('id');
     }
 
     public function store()

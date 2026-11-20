@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers\Api;
 
+use App\Exports\ProductDetailsTemplateExport;
 use App\Exports\ProductTemplateExport;
 use App\Http\Controllers\Controller;
 use App\Imports\ProductRowsImport;
@@ -10,7 +11,9 @@ use App\Models\Brand;
 use App\Models\Category;
 use App\Models\Inventory;
 use App\Models\Product;
+use App\Models\ProductImage;
 use App\Services\FeatureService;
+use App\Support\ProductDetailsColumns;
 use App\Support\StockLabel;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -338,6 +341,8 @@ class ProductController extends Controller
             ], 404);
         }
 
+        $product->load('images');
+
         return response()->json([
             'status' => true,
             'product' => $product,
@@ -361,6 +366,296 @@ class ProductController extends Controller
         return DB::table('inventories')->where('product_id', $productId)->whereNull('deleted_at')->exists()
             || DB::table('purchase_lines')->where('product_id', $productId)->whereNull('deleted_at')->exists()
             || DB::table('sales_bill_lines')->where('product_id', $productId)->exists();
+    }
+
+    // PATCH /api/products/{id}/details   (sirf description / product_info; baaki product ko haath nahi lagata)
+    public function updateDetails(Request $request, $id)
+    {
+        $user = Auth::user();
+
+        if (! in_array($user->role, ['admin', 'manager'], true)) {
+            return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
+        }
+
+        $product = Product::where('store_id', $user->store_id)->where('id', $id)->first();
+
+        if (! $product) {
+            return response()->json(['status' => false, 'message' => 'Product not found'], 404);
+        }
+
+        $request->validate([
+            'description' => 'nullable|string|max:'.ProductDetailsColumns::MAX_DESCRIPTION,
+            'product_info' => 'nullable|array|max:'.ProductDetailsColumns::MAX_INFO_ROWS,
+            'product_info.*.label' => 'required|string|max:60',
+            'product_info.*.value' => 'required|string|max:'.ProductDetailsColumns::MAX_VALUE,
+            'merge' => 'nullable|boolean',
+        ]);
+
+        $data = ['updated_by' => $user->id];
+
+        if ($request->has('description')) {
+            $data['description'] = $this->cleanDescription($request->input('description'));
+        }
+
+        if ($request->has('product_info')) {
+            $incoming = (array) $request->input('product_info', []);
+            $rows = $request->boolean('merge', true)
+                ? ProductDetailsColumns::mergeInfo((array) $product->product_info, $incoming)
+                : ProductDetailsColumns::mergeInfo([], $incoming);
+
+            if (count($rows) > ProductDetailsColumns::MAX_INFO_ROWS) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'A product can have at most '.ProductDetailsColumns::MAX_INFO_ROWS.' info rows.',
+                ], 422);
+            }
+
+            $data['product_info'] = $rows ?: null;
+        }
+
+        $product->update($data);
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Product details updated',
+            'product' => $product->fresh(),
+        ], 200);
+    }
+
+    // GET /api/products/bulk-details-template  -> saare products + abhi ki details (Excel)
+    public function downloadDetailsTemplate()
+    {
+        $user = Auth::user();
+
+        if (! $user || ! in_array($user->role, ['admin', 'manager'], true)) {
+            return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
+        }
+
+        $rows = Product::where('store_id', $user->store_id)
+            ->orderBy('name')
+            ->get(['id', 'sku', 'barcode', 'name', 'description', 'product_info'])
+            ->map(function ($p) {
+                $byLabel = [];
+                foreach ((array) $p->product_info as $r) {
+                    $byLabel[mb_strtolower((string) ($r['label'] ?? ''))] = (string) ($r['value'] ?? '');
+                }
+
+                $row = [
+                    'product_id' => $p->id,
+                    'sku' => (string) $p->sku,
+                    'barcode' => (string) $p->barcode,
+                    'name' => $p->name,
+                    'description' => (string) $p->description,
+                ];
+                foreach (ProductDetailsColumns::INFO as $key => $label) {
+                    $row[$key] = $byLabel[mb_strtolower($label)] ?? '';
+                }
+
+                return $row;
+            })
+            ->values()
+            ->all();
+
+        return Excel::download(new ProductDetailsTemplateExport($rows), 'product-details.xlsx');
+    }
+
+    private const DETAILS_MAX_ROWS = 10000;
+
+    // POST /api/products/bulk-details  (multipart: file = filled Excel/CSV)
+    // Product product_id / sku / barcode se milta hai. Khali cell = kuch nahi badalta.
+    public function bulkUpdateDetails(Request $request)
+    {
+        $user = Auth::user();
+
+        if (! $user || ! in_array($user->role, ['admin', 'manager'], true)) {
+            return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
+        }
+
+        $request->validate([
+            'file' => 'required|file|mimes:xlsx,xls,csv,txt|max:10240',
+        ]);
+
+        set_time_limit(180);
+
+        try {
+            $sheetRows = Excel::toCollection(new ProductRowsImport, $request->file('file'))->first() ?? collect();
+
+            if ($sheetRows->count() > self::DETAILS_MAX_ROWS) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Too many rows. Maximum allowed is '.self::DETAILS_MAX_ROWS.' per file.',
+                ], 422);
+            }
+
+            // Is store ke products ka lookup (id / sku / barcode)
+            $byId = [];
+            $bySku = [];
+            $byBarcode = [];
+            foreach (Product::where('store_id', $user->store_id)->get() as $p) {
+                $byId[$p->id] = $p;
+                if ($p->sku !== null && $p->sku !== '') {
+                    $k = mb_strtolower(trim((string) $p->sku));
+                    $bySku[$k] = array_key_exists($k, $bySku) ? false : $p; // false = ek SKU kai products par
+                }
+                if ($p->barcode !== null && $p->barcode !== '') {
+                    $k = mb_strtolower(trim((string) $p->barcode));
+                    $byBarcode[$k] = array_key_exists($k, $byBarcode) ? false : $p;
+                }
+            }
+
+            $total = 0;
+            $updated = 0;
+            $unchanged = 0;
+            $errors = [];
+
+            foreach ($sheetRows as $index => $row) {
+                $raw = $row->toArray();
+                $rowNumber = $index + 2; // row 1 = heading
+
+                // poori khali row chhod do
+                if (! collect($raw)->contains(fn ($v) => trim((string) $v) !== '')) {
+                    continue;
+                }
+                $total++;
+
+                $idCell = $this->importText($raw['product_id'] ?? null);
+                $sku = mb_strtolower($this->importText($raw['sku'] ?? null));
+                $barcode = mb_strtolower($this->importText($raw['barcode'] ?? null));
+                $label = $this->importText($raw['name'] ?? null);
+
+                $product = null;
+                if ($idCell !== '' && ctype_digit($idCell)) {
+                    $product = $byId[(int) $idCell] ?? null;
+                }
+                if (! $product && $sku !== '') {
+                    $product = $bySku[$sku] ?? null;
+                    if ($product === false) {
+                        $errors[] = ['row' => $rowNumber, 'name' => $label, 'errors' => ['SKU belongs to more than one product. Use product_id.']];
+
+                        continue;
+                    }
+                }
+                if (! $product && $barcode !== '') {
+                    $product = $byBarcode[$barcode] ?? null;
+                    if ($product === false) {
+                        $errors[] = ['row' => $rowNumber, 'name' => $label, 'errors' => ['Barcode belongs to more than one product. Use product_id.']];
+
+                        continue;
+                    }
+                }
+
+                if (! $product) {
+                    $errors[] = ['row' => $rowNumber, 'name' => $label, 'errors' => ['Product not found (check product_id / sku / barcode).']];
+
+                    continue;
+                }
+
+                $rowErrors = [];
+                $changes = [];
+
+                $description = trim((string) ($raw['description'] ?? ''));
+                if ($description !== '') {
+                    if (mb_strlen($description) > ProductDetailsColumns::MAX_DESCRIPTION) {
+                        $rowErrors[] = 'Description is too long (max '.ProductDetailsColumns::MAX_DESCRIPTION.' characters).';
+                    } else {
+                        $changes['description'] = $description;
+                    }
+                }
+
+                $incoming = [];
+                foreach (ProductDetailsColumns::INFO as $key => $infoLabel) {
+                    $value = trim((string) ($raw[$key] ?? ''));
+                    if ($value === '') {
+                        continue;
+                    }
+                    if (mb_strlen($value) > ProductDetailsColumns::MAX_VALUE) {
+                        $rowErrors[] = "{$infoLabel} is too long (max ".ProductDetailsColumns::MAX_VALUE.' characters).';
+
+                        continue;
+                    }
+                    $incoming[] = ['label' => $infoLabel, 'value' => $value];
+                }
+
+                if ($incoming) {
+                    $merged = ProductDetailsColumns::mergeInfo((array) $product->product_info, $incoming);
+                    if (count($merged) > ProductDetailsColumns::MAX_INFO_ROWS) {
+                        $rowErrors[] = 'Too many info rows (max '.ProductDetailsColumns::MAX_INFO_ROWS.').';
+                    } else {
+                        $changes['product_info'] = $merged;
+                    }
+                }
+
+                if ($rowErrors) {
+                    $errors[] = ['row' => $rowNumber, 'name' => $product->name, 'errors' => $rowErrors];
+
+                    continue;
+                }
+
+                if (! $changes) {
+                    $unchanged++;
+
+                    continue;
+                }
+
+                try {
+                    $changes['updated_by'] = $user->id;
+                    $product->update($changes);
+                    $updated++;
+                } catch (\Throwable $e) {
+                    report($e);
+                    $errors[] = ['row' => $rowNumber, 'name' => $product->name, 'errors' => ['Could not save this product.']];
+                }
+            }
+
+            return response()->json([
+                'status' => true,
+                'message' => 'Bulk details update completed.',
+                'summary' => [
+                    'total_rows' => $total,
+                    'updated' => $updated,
+                    'unchanged' => $unchanged,
+                    'failed' => count($errors),
+                ],
+                'errors' => $errors,
+            ], 200);
+        } catch (\Throwable $e) {
+            report($e);
+
+            return response()->json([
+                'status' => false,
+                'message' => config('app.debug') ? $e->getMessage() : 'Could not read this file. Please use the downloaded template.',
+            ], 422);
+        }
+    }
+
+    private function cleanDescription($text): ?string
+    {
+        $text = trim((string) $text);
+
+        return $text === '' ? null : $text;
+    }
+
+    // [{label, value}] -> khali rows hata do, trim karo, max 20; kuch na bache to null
+    private function cleanProductInfo($rows): ?array
+    {
+        if (! is_array($rows)) {
+            return null;
+        }
+
+        $clean = [];
+        foreach ($rows as $row) {
+            $label = trim((string) ($row['label'] ?? ''));
+            $value = trim((string) ($row['value'] ?? ''));
+            if ($label === '' || $value === '') {
+                continue;
+            }
+            $clean[] = ['label' => $label, 'value' => $value];
+            if (count($clean) >= 20) {
+                break;
+            }
+        }
+
+        return $clean ?: null;
     }
 
     private function cleanLooseUnit($unit): string
@@ -394,6 +689,11 @@ class ProductController extends Controller
             $request->validate([
                 'name' => 'required|string',
                 'sku' => 'nullable|string|unique:products,sku',
+                // Online store product page (Blinkit jaisi details)
+                'description' => 'nullable|string|max:5000',
+                'product_info' => 'nullable|array|max:20',
+                'product_info.*.label' => 'required|string|max:60',
+                'product_info.*.value' => 'required|string|max:1500',
                 'barcode' => 'nullable|string', // This will be the Manufacturer barcode if scanned
                 'is_price_override' => 'nullable|boolean',
                 'sale_type' => 'nullable|in:unit,weight',
@@ -471,6 +771,8 @@ class ProductController extends Controller
                 'sale_type' => $request->input('sale_type', 'unit'),
                 'plu_code' => $request->plu_code,
                 'price_per_kg' => $request->price_per_kg,
+                'description' => $this->cleanDescription($request->input('description')),
+                'product_info' => $this->cleanProductInfo($request->input('product_info')),
                 'created_by' => Auth::id(),
             ], $pharmacy));
 
@@ -505,6 +807,11 @@ class ProductController extends Controller
                 'name' => 'required|string',
                 'is_price_override' => 'nullable|boolean',
                 'barcode' => 'nullable|string|unique:products,barcode,'.$id,
+                // Online store product page (Blinkit jaisi details)
+                'description' => 'nullable|string|max:5000',
+                'product_info' => 'nullable|array|max:20',
+                'product_info.*.label' => 'required|string|max:60',
+                'product_info.*.value' => 'required|string|max:1500',
                 'sale_type' => 'nullable|in:unit,weight',
                 'plu_code' => 'nullable|digits_between:1,5|required_if:sale_type,weight',
                 'price_per_kg' => 'nullable|numeric|min:0|required_if:sale_type,weight',
@@ -590,6 +897,12 @@ class ProductController extends Controller
                 'sale_type' => $request->input('sale_type', $product->sale_type),
                 'plu_code' => $request->has('plu_code') ? $request->plu_code : $product->plu_code,
                 'price_per_kg' => $request->has('price_per_kg') ? $request->price_per_kg : $product->price_per_kg,
+                'description' => $request->has('description')
+                    ? $this->cleanDescription($request->input('description'))
+                    : $product->description,
+                'product_info' => $request->has('product_info')
+                    ? $this->cleanProductInfo($request->input('product_info'))
+                    : $product->product_info,
                 'updated_by' => Auth::id(),
             ]);
 
@@ -766,6 +1079,14 @@ class ProductController extends Controller
 
         $product->update(['image' => $path, 'updated_by' => $user->id]);
 
+        // Main (pehli) photo badlo; baaki photos jaisi hain waisi rehne do
+        $first = $product->images()->first();
+        if ($first) {
+            $first->update(['path' => $path]);
+        } else {
+            $product->images()->create(['path' => $path, 'sort_order' => 0]);
+        }
+
         if ($old && $old !== $path) {
             Storage::disk('public')->delete($old);
         }
@@ -793,12 +1114,109 @@ class ProductController extends Controller
             return response()->json(['status' => false, 'message' => 'Product not found'], 404);
         }
 
-        if ($product->image) {
+        // Main (pehli) photo hatao; agar aur photos hain to agli main ban jaati hai
+        $first = $product->images()->first();
+        if ($first) {
+            Storage::disk('public')->delete($first->path);
+            $first->delete();
+        } elseif ($product->image) {
             Storage::disk('public')->delete($product->image);
-            $product->update(['image' => null, 'updated_by' => $user->id]);
         }
+        $this->syncMainImage($product, $user->id);
 
         return response()->json(['status' => true, 'message' => 'Product image removed'], 200);
+    }
+
+    // POST /api/products/{id}/images   (multipart: images[])  — max 4 photos per product
+    public function uploadImages(Request $request, $id)
+    {
+        $user = Auth::user();
+
+        if (! in_array($user->role, ['admin', 'manager'])) {
+            return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
+        }
+
+        $product = Product::where('store_id', $user->store_id)->where('id', $id)->first();
+
+        if (! $product) {
+            return response()->json(['status' => false, 'message' => 'Product not found'], 404);
+        }
+
+        $max = Product::MAX_IMAGES;
+
+        // SVG is intentionally not allowed (it can hide scripts)
+        $request->validate([
+            'images' => ['required', 'array', 'min:1', "max:{$max}"],
+            'images.*' => ['file', 'mimes:jpg,jpeg,png,webp', 'max:3072'],
+        ]);
+
+        $files = $request->file('images');
+        $existing = $product->images()->count();
+
+        if ($existing + count($files) > $max) {
+            return response()->json([
+                'status' => false,
+                'message' => "A product can have at most {$max} images. This product already has {$existing}.",
+            ], 422);
+        }
+
+        $order = $existing ? ((int) $product->images()->max('sort_order')) + 1 : 0;
+
+        foreach ($files as $file) {
+            $path = $file->store("products/{$user->store_id}", 'public');
+            $product->images()->create(['path' => $path, 'sort_order' => $order++]);
+        }
+
+        $this->syncMainImage($product, $user->id);
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Product images updated',
+            'images' => $product->images()->get(),
+            'image_url' => $product->fresh()->image_url,
+        ], 200);
+    }
+
+    // DELETE /api/products/{id}/images/{imageId}
+    public function deleteImageById($id, $imageId)
+    {
+        $user = Auth::user();
+
+        if (! in_array($user->role, ['admin', 'manager'])) {
+            return response()->json(['status' => false, 'message' => 'Unauthorized'], 403);
+        }
+
+        $product = Product::where('store_id', $user->store_id)->where('id', $id)->first();
+
+        if (! $product) {
+            return response()->json(['status' => false, 'message' => 'Product not found'], 404);
+        }
+
+        $image = ProductImage::where('product_id', $product->id)->where('id', $imageId)->first();
+
+        if (! $image) {
+            return response()->json(['status' => false, 'message' => 'Image not found'], 404);
+        }
+
+        Storage::disk('public')->delete($image->path);
+        $image->delete();
+
+        $this->syncMainImage($product, $user->id);
+
+        return response()->json(['status' => true, 'message' => 'Product image removed'], 200);
+    }
+
+    // products.image ko hamesha pehli photo ke saath sync rakho (storefront / list isi se padhte hain)
+    private function syncMainImage(Product $product, $userId = null): void
+    {
+        $first = $product->images()->first();
+
+        $data = ['image' => $first?->path];
+        if ($userId) {
+            $data['updated_by'] = $userId;
+        }
+
+        $product->update($data);
     }
 
     public function destroy($id)
@@ -1575,21 +1993,8 @@ class ProductController extends Controller
                     continue;
                 }
 
-                // Prevent duplicate SKU entries in ZIP
-                if (isset($processedSkus[$sku])) {
-                    $failed++;
-
-                    $results[] = [
-                        'file' => $filename,
-                        'sku' => $sku,
-                        'status' => 'failed',
-                        'reason' => 'Duplicate SKU found in ZIP.',
-                    ];
-
-                    continue;
-                }
-
-                $processedSkus[$sku] = true;
+                // Photo number: SKU.jpg = photo 1, SKU_2.jpg = photo 2 ... SKU_4.jpg = photo 4
+                $slot = 1;
 
                 // Read image contents
                 $contents = $zip->getFromIndex($i);
@@ -1636,6 +2041,16 @@ class ProductController extends Controller
                     ->where('sku', $sku)
                     ->get();
 
+                // "SKU_2.jpg" -> SKU "SKU", photo number 2 (pehle poora naam as SKU try hota hai)
+                if ($products->isEmpty() && preg_match('/^(.+)_([2-4])$/', $sku, $m)) {
+                    $base = Product::where('store_id', $storeId)->where('sku', $m[1])->get();
+                    if ($base->isNotEmpty()) {
+                        $products = $base;
+                        $sku = $m[1];
+                        $slot = (int) $m[2];
+                    }
+                }
+
                 if ($products->isEmpty()) {
                     $notFound++;
 
@@ -1662,9 +2077,25 @@ class ProductController extends Controller
                     continue;
                 }
 
+                // Ek hi ZIP me same SKU + same photo number do baar nahi
+                $dupKey = $sku.'#'.$slot;
+                if (isset($processedSkus[$dupKey])) {
+                    $failed++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'sku' => $sku,
+                        'status' => 'failed',
+                        'reason' => 'Duplicate photo for this SKU found in ZIP.',
+                    ];
+
+                    continue;
+                }
+                $processedSkus[$dupKey] = true;
+
                 $product = $products->first();
 
-                $oldImage = $product->image;
+                $oldImage = null;
                 $newPath = null;
 
                 try {
@@ -1678,11 +2109,22 @@ class ProductController extends Controller
                         throw new \RuntimeException('Unable to save image.');
                     }
 
-                    // Update product image
-                    $product->update([
-                        'image' => $newPath,
-                        'updated_by' => $user->id,
-                    ]);
+                    // Is photo number par jo photo hai use badlo; na ho to agli khali jagah par jodo
+                    $gallery = $product->images()->get();
+                    $target = $gallery->get($slot - 1);
+                    $oldImage = $target?->path ?? ($slot === 1 ? $product->image : null);
+
+                    if ($target) {
+                        $target->update(['path' => $newPath]);
+                    } else {
+                        $product->images()->create([
+                            'path' => $newPath,
+                            'sort_order' => $gallery->isEmpty() ? 0 : ((int) $gallery->max('sort_order')) + 1,
+                        ]);
+                    }
+
+                    // products.image = pehli photo
+                    $this->syncMainImage($product, $user->id);
 
                     // Delete old image after successful update
                     if (
@@ -1699,6 +2141,7 @@ class ProductController extends Controller
                         'file' => $filename,
                         'sku' => $sku,
                         'product_id' => $product->id,
+                        'photo_no' => $slot,
                         'status' => 'updated',
                         'message' => 'Product image uploaded successfully.',
                     ];

@@ -192,6 +192,8 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
 Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.response', 'feature:products'])->group(function () {
     Route::post('/products/import', [ProductController::class, 'importExcel']);
     Route::get('/products/import-template', [ProductController::class, 'downloadImportTemplate']);
+    Route::get('/products/bulk-details-template', [ProductController::class, 'downloadDetailsTemplate']);
+    Route::post('/products/bulk-details', [ProductController::class, 'bulkUpdateDetails']);
     Route::get('/all-products', [ProductController::class, 'getAllProducts']);
     Route::get('/products', [ProductController::class, 'index']);
     Route::post(
@@ -203,6 +205,9 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
     Route::put('/products/{id}', [ProductController::class, 'update']);
     Route::post('/products/{id}/image', [ProductController::class, 'uploadImage']);
     Route::delete('/products/{id}/image', [ProductController::class, 'deleteImage']);
+    Route::post('/products/{id}/images', [ProductController::class, 'uploadImages']);
+    Route::patch('/products/{id}/details', [ProductController::class, 'updateDetails']);
+    Route::delete('/products/{id}/images/{imageId}', [ProductController::class, 'deleteImageById']);
     Route::delete('/products/{id}', [ProductController::class, 'destroy']);
     Route::get('/products/{id}/barcode', [ProductController::class, 'barcodeImage']);
     Route::put('/inventory/{inventoryId}/selling-price', [ProductController::class, 'updateSellingPrice']);

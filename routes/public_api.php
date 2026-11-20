@@ -1,4 +1,3 @@
-
 <?php
 
 use App\Http\Controllers\Api\DeliveryLocationController;
@@ -22,6 +21,7 @@ Route::prefix('public')->middleware('throttle:120,1,sf-browse')->group(function 
     Route::get('stores/{slug}', [StorefrontController::class, 'show']);
     Route::get('stores/{slug}/categories', [StorefrontController::class, 'categories']);
     Route::get('stores/{slug}/products', [StorefrontController::class, 'products']);
+    Route::get('stores/{slug}/products/{id}', [StorefrontController::class, 'productDetails'])->whereNumber('id');
 });
 
 // Location routes
