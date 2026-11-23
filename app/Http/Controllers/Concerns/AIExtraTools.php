@@ -57,6 +57,9 @@ trait AIExtraTools
                 'product_name' => ['type' => 'string', 'description' => 'Product name or SKU mentioned by the user.'],
             ], ['product_name']),
             $tool('get_customer_dues', 'Customers who owe money (udhaar / pending due on bills): total due and the list of customers with the highest due.'),
+            $tool('get_customer_details', 'Details of ONE customer found by name or mobile number: registration date, branch, wallet balance, loyalty points, total bills and spend, first and last visit, pending due and the 5 most recent bills. Use for questions like "Ramesh ka data", "98xxxxxx customer ki detail", "is customer ne kitna kharida".', [
+                'query' => ['type' => 'string', 'description' => 'Customer name or mobile number (full or partial, at least 2 characters).'],
+            ], ['query']),
         ];
     }
 
@@ -68,7 +71,7 @@ trait AIExtraTools
         ?int $branchId
     ): ?array {
         $known = ['get_gst_summary', 'get_expense_summary', 'get_sales_returns', 'get_dead_stock',
-            'get_category_wise_sales', 'get_cashier_wise_sales', 'get_product_info', 'get_customer_dues'];
+            'get_category_wise_sales', 'get_cashier_wise_sales', 'get_product_info', 'get_customer_dues', 'get_customer_details'];
 
         if (!in_array($name, $known, true)) {
             return null;
@@ -87,6 +90,7 @@ trait AIExtraTools
             'get_cashier_wise_sales' => $this->getCashierWiseSales($user, $branchId, $args),
             'get_product_info' => $this->getProductInfo($user, $branchId, $args),
             'get_customer_dues' => $this->getCustomerDues($user, $branchId),
+            'get_customer_details' => $this->getCustomerDetails($user, $branchId, $args),
         };
     }
 
@@ -627,6 +631,110 @@ trait AIExtraTools
             ])->values()->all(),
             'truncated' => $perCustomer->count() > 30,
             'note' => 'Due is the sum of due_amount on valid sales bills. Customer opening balances are not included. At most 30 customers are listed; tell the user if truncated is true.',
+        ];
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*  9. Customers: shared store scope + single customer lookup          */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Customers of this store. customers.store_id is the source of truth; older rows
+     * without store_id are matched through their branch's store. Optional branch filter.
+     */
+    protected function storeCustomersQuery($user, ?int $branchId = null)
+    {
+        $q = DB::table('customers as c')->where(function ($w) use ($user) {
+            $w->where('c.store_id', $user->store_id)
+                ->orWhere(function ($x) use ($user) {
+                    $x->whereNull('c.store_id')
+                        ->whereIn('c.branch_id', fn ($sub) => $sub->select('id')->from('branches')->where('store_id', $user->store_id));
+                });
+        });
+
+        if ($branchId !== null) {
+            $q->where('c.branch_id', $branchId);
+        }
+
+        return $q;
+    }
+
+    private function getCustomerDetails($user, ?int $branchId, array $args): array
+    {
+        $term = trim((string) ($args['query'] ?? ''));
+
+        if (mb_strlen($term) < 2) {
+            return ['error' => 'Customer ka naam ya mobile number batao (kam se kam 2 characters).'];
+        }
+
+        $like = '%'.str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $term).'%';
+
+        $customers = $this->storeCustomersQuery($user, $branchId)
+            ->leftJoin('branches as br', 'br.id', '=', 'c.branch_id')
+            ->where(function ($w) use ($like) {
+                $w->where('c.name', 'like', $like)->orWhere('c.mobile', 'like', $like);
+            })
+            ->orderBy('c.name')
+            ->limit(5)
+            ->get(['c.id', 'c.name', 'c.mobile', 'c.city', 'c.area', 'c.created_at', 'c.opening_balance', 'c.loyalty_points', 'br.name as branch_name']);
+
+        if ($customers->isEmpty()) {
+            return ['found' => 0, 'message' => "No customer found for '{$term}'."];
+        }
+
+        $bills = function (int $customerId) use ($user, $branchId) {
+            $q = DB::table('sales_bills')
+                ->where('store_id', $user->store_id)
+                ->where('customer_id', $customerId);
+
+            if ($branchId !== null) {
+                $q->where('branch_id', $branchId);
+            }
+
+            return $this->excludeInvalidBills($q);
+        };
+
+        $result = $customers->map(function ($c) use ($bills) {
+            $stat = $bills($c->id)
+                ->selectRaw('COUNT(*) as bills, COALESCE(SUM(total_amount),0) as spent, COALESCE(SUM(due_amount),0) as due, MIN(created_at) as first_bill, MAX(created_at) as last_bill')
+                ->first();
+
+            $recent = $bills($c->id)
+                ->orderByDesc('created_at')
+                ->limit(5)
+                ->get(['bill_no', 'created_at', 'total_amount', 'paid_amount', 'due_amount'])
+                ->map(fn ($b) => [
+                    'bill_no' => $b->bill_no,
+                    'date' => Carbon::parse($b->created_at)->format('d M Y, h:i A'),
+                    'total' => round((float) $b->total_amount, 2),
+                    'paid' => round((float) $b->paid_amount, 2),
+                    'due' => round((float) $b->due_amount, 2),
+                ])->all();
+
+            $billCount = (int) ($stat->bills ?? 0);
+
+            return [
+                'customer_name' => $c->name,
+                'mobile' => $c->mobile,
+                'branch' => $c->branch_name,
+                'area' => trim(($c->area ?? '').' '.($c->city ?? '')) ?: null,
+                'registered_on' => Carbon::parse($c->created_at)->format('d M Y, h:i A'),
+                'wallet_balance' => round((float) $c->opening_balance, 2),
+                'loyalty_points' => (int) ($c->loyalty_points ?? 0),
+                'total_bills' => $billCount,
+                'total_spent' => round((float) ($stat->spent ?? 0), 2),
+                'average_bill' => $billCount > 0 ? round((float) $stat->spent / $billCount, 2) : 0,
+                'pending_due' => round((float) ($stat->due ?? 0), 2),
+                'first_bill_on' => $stat->first_bill ? Carbon::parse($stat->first_bill)->format('d M Y') : null,
+                'last_bill_on' => $stat->last_bill ? Carbon::parse($stat->last_bill)->format('d M Y') : null,
+                'recent_bills' => $recent,
+            ];
+        });
+
+        return [
+            'found' => $result->count(),
+            'customers' => $result->all(),
+            'note' => 'Up to 5 matching customers. wallet_balance is the customer advance (wallet) balance. Spend and dues count valid sales bills only.',
         ];
     }
 }
