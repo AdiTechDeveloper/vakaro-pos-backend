@@ -42,6 +42,7 @@ class StockExpiryController extends Controller
                 ->pluck('branch_id');
 
             $query->whereIn('branch_id', $branchIds);
+
         }
 
         // if ($user->role === 'manager') {
