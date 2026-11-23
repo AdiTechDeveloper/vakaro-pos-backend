@@ -705,12 +705,12 @@ class DashboardInsightsController extends Controller
     private function stockMeta(): ?array
     {
         $table = $this->firstTable([
+            'inventories',
             'product_batches',
             'stock_batches',
             'batches',
             'inventory_batches',
             'stocks',
-            'inventories',
         ]);
         if (! $table) {
             return null;
@@ -766,16 +766,20 @@ class DashboardInsightsController extends Controller
         }
     }
 
+    /**
+     * Stock ki row sirf isi store ki ho. Do jagah se bandhte hain, taaki ek bhi chhoot jaye to
+     * doosre store ka stock / expiry yahan na aa sake:
+     *   1) stock ka product is store ka ho
+     *   2) (jahan branch column hai) stock ki branch bhi is store ki ho
+     */
     private function scopeStore($q, array $m, int $storeId): void
     {
+        $q->join('products as sp', 'sp.id', '=', "s.{$m['product']}")
+            ->where('sp.store_id', $storeId);
+
         if ($m['branch']) {
             $q->join('branches as sbr', 'sbr.id', '=', "s.{$m['branch']}")
                 ->where('sbr.store_id', $storeId);
-        } elseif (Schema::hasColumn($m['table'], 'store_id')) {
-            $q->where('s.store_id', $storeId);
-        } else {
-            $q->join('products as sp', 'sp.id', '=', "s.{$m['product']}")
-                ->where('sp.store_id', $storeId);
         }
     }
 
