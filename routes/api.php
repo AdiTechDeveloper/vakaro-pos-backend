@@ -72,6 +72,7 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'check.supera
     Route::put('/stores/{id}', [StoreController::class, 'update']);
     Route::post('/stores/{id}', [StoreController::class, 'update']);
     Route::delete('/stores/{id}', [StoreController::class, 'destroy']);
+    Route::patch('/stores/{id}/status', [StoreController::class, 'updateStatus']);
     Route::get('/stores/{id}/features', [FeatureController::class, 'getStoreFeatures']);
     Route::put('/stores/{id}/features', [FeatureController::class, 'setStoreFeatures']);
 });

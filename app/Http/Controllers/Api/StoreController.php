@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Laravel\Sanctum\PersonalAccessToken;
 
 class StoreController extends Controller
 {
@@ -35,6 +36,10 @@ class StoreController extends Controller
                 'pharmacist_reg_no' => $store->pharmacist_reg_no,
                 'tagline' => $store->tagline,
                 'logo' => $store->logo,
+                'status' => $store->status,
+                'status_reason' => $store->status_reason,
+                'status_changed_at' => $store->status_changed_at,
+                'subscription_ends_at' => $store->subscription_ends_at,
                 'username' => optional($store->users->first())->username,
                 'created_at' => $store->created_at,
                 'updated_at' => $store->updated_at,
@@ -270,6 +275,55 @@ class StoreController extends Controller
                 'error' => $e->getMessage(),
             ], 500);
         }
+    }
+
+    /**
+     * Freeze, deactivate or re-activate a store (Superadmin only)
+     */
+    public function updateStatus(Request $request, $id)
+    {
+        $validated = $request->validate([
+            'status' => 'required|in:active,frozen,inactive',
+            'reason' => 'nullable|string|max:255',
+        ]);
+
+        $store = Store::find($id);
+
+        if (! $store) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Store not found',
+            ], 404);
+        }
+
+        DB::transaction(function () use ($store, $validated) {
+            $store->update([
+                'status' => $validated['status'],
+                'status_reason' => $validated['status'] === 'active' ? null : ($validated['reason'] ?? null),
+                'status_changed_at' => now(),
+            ]);
+
+            if ($validated['status'] !== 'active') {
+                // Log out every user of this store right away.
+                $userIds = User::withTrashed()->where('store_id', $store->id)->pluck('id');
+
+                PersonalAccessToken::where('tokenable_type', User::class)
+                    ->whereIn('tokenable_id', $userIds)
+                    ->delete();
+            }
+        });
+
+        return response()->json([
+            'status' => true,
+            'message' => $validated['status'] === 'active'
+                ? 'Store activated successfully.'
+                : 'Store has been blocked and all its users are logged out.',
+            'data' => [
+                'id' => $store->id,
+                'status' => $store->status,
+                'status_reason' => $store->status_reason,
+            ],
+        ], 200);
     }
 
     /**

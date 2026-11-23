@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\PosTerminal;
+use App\Models\Store;
 use App\Models\User;
 use App\Services\FeatureService;
 use App\Support\TokenExpiry;
@@ -87,6 +88,19 @@ class AuthController extends Controller
 
             if (! $user || ! Hash::check($request->password, $user->password)) {
                 return response()->json(['message' => 'Invalid credentials'], 401);
+            }
+        }
+
+        // Block login when the store is frozen, inactive or its subscription has ended.
+        if ($user->role !== 'superadmin' && $user->store_id) {
+            $store = Store::find($user->store_id);
+
+            if ($store && ! $store->isActive()) {
+                return response()->json([
+                    'status' => false,
+                    'code' => 'STORE_SUSPENDED',
+                    'message' => Store::SUSPENDED_MESSAGE,
+                ], 403);
             }
         }
 

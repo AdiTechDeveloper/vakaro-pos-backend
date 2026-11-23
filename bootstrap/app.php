@@ -22,6 +22,8 @@ return Application::configure(basePath: dirname(__DIR__))
             'feature' => \App\Http\Middleware\CheckFeature::class,
         ]);
 
+        $middleware->api(append: [\App\Http\Middleware\EnsureStoreActive::class]);
+
         // Delivery role wale token ko sirf /api/delivery/* tak rakhta hai (POS ke baaki APIs band)
         $middleware->appendToGroup('api', \App\Http\Middleware\BlockDeliveryRole::class);
     })
