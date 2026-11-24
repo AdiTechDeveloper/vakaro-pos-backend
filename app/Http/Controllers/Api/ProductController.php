@@ -1206,6 +1206,53 @@ class ProductController extends Controller
         return response()->json(['status' => true, 'message' => 'Product image removed'], 200);
     }
 
+    // "Parle-G 100g", "parle_g 100G", "PARLE G  100g" teeno ek hi key: chhote akshar; letters/numbers ke alawa sab (space, -, _, . ...) ek space
+    private function imageKey(string $text): string
+    {
+        $text = mb_strtolower(trim($text));
+
+        return trim((string) preg_replace('/[^\p{L}\p{M}\p{N}]+/u', ' ', $text));
+    }
+
+    // Store ke products: key => [product ids], SKU / barcode / naam teeno ke liye
+    private function buildImageLookup(int $storeId): array
+    {
+        $lookup = ['sku' => [], 'barcode' => [], 'name' => []];
+
+        foreach (DB::table('products')
+            ->where('store_id', $storeId)
+            ->whereNull('deleted_at')
+            ->select('id', 'name', 'sku', 'barcode')
+            ->cursor() as $row) {
+            foreach (['sku' => $row->sku, 'barcode' => $row->barcode, 'name' => $row->name] as $type => $value) {
+                $key = $this->imageKey((string) $value);
+                if ($key !== '') {
+                    $lookup[$type][$key][] = (int) $row->id;
+                }
+            }
+        }
+
+        return $lookup;
+    }
+
+    // File ke naam se product ids aur kis se mila (sku / barcode / name). SKU sabse pehle.
+    private function findProductsForImage(array $lookup, string $stem): array
+    {
+        $key = $this->imageKey($stem);
+
+        if ($key === '') {
+            return [[], null];
+        }
+
+        foreach (['sku', 'barcode', 'name'] as $type) {
+            if (! empty($lookup[$type][$key])) {
+                return [array_values(array_unique($lookup[$type][$key])), $type];
+            }
+        }
+
+        return [[], null];
+    }
+
     // products.image ko hamesha pehli photo ke saath sync rakho (storefront / list isi se padhte hain)
     private function syncMainImage(Product $product, $userId = null): void
     {
@@ -1925,6 +1972,9 @@ class ProductController extends Controller
 
         $storeId = $user->store_id;
 
+        // File ke naam se product dhundhne ke liye: SKU, barcode aur naam ki list (ek hi baar)
+        $lookup = $this->buildImageLookup((int) $storeId);
+
         try {
             // Maximum 1000 ZIP entries
             if ($zip->numFiles > 1000) {
@@ -1978,7 +2028,7 @@ class ProductController extends Controller
                     continue;
                 }
 
-                // SKU is filename without extension
+                // File ka naam (extension ke bina) = product ka SKU, barcode ya naam
                 $sku = trim(pathinfo($filename, PATHINFO_FILENAME));
 
                 if ($sku === '') {
@@ -1987,7 +2037,7 @@ class ProductController extends Controller
                     $results[] = [
                         'file' => $filename,
                         'status' => 'failed',
-                        'reason' => 'SKU is missing from filename.',
+                        'reason' => 'The file name is empty.',
                     ];
 
                     continue;
@@ -2036,22 +2086,67 @@ class ProductController extends Controller
                     continue;
                 }
 
-                // Find product in current store
-                $products = Product::where('store_id', $storeId)
-                    ->where('sku', $sku)
-                    ->get();
+                // Product dhundho: pehle SKU, phir barcode, phir product ka naam
+                [$ids, $matchedBy] = $this->findProductsForImage($lookup, $sku);
 
-                // "SKU_2.jpg" -> SKU "SKU", photo number 2 (pehle poora naam as SKU try hota hai)
-                if ($products->isEmpty() && preg_match('/^(.+)_([2-4])$/', $sku, $m)) {
-                    $base = Product::where('store_id', $storeId)->where('sku', $m[1])->get();
-                    if ($base->isNotEmpty()) {
-                        $products = $base;
+                // "Name_2.jpg" / "SKU_2.jpg" -> photo number 2 (pehle poora naam try hota hai)
+                if (! $ids && preg_match('/^(.+)_([2-4])$/', $sku, $m)) {
+                    [$baseIds, $baseBy] = $this->findProductsForImage($lookup, $m[1]);
+                    if ($baseIds) {
+                        $ids = $baseIds;
+                        $matchedBy = $baseBy;
                         $sku = $m[1];
                         $slot = (int) $m[2];
                     }
                 }
 
-                if ($products->isEmpty()) {
+                if (! $ids) {
+                    $notFound++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'sku' => $sku,
+                        'status' => 'not_found',
+                        'reason' => 'No product found with this SKU, barcode or name.',
+                    ];
+
+                    continue;
+                }
+
+                if (count($ids) > 1) {
+                    $failed++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'sku' => $sku,
+                        'status' => 'failed',
+                        'reason' => $matchedBy === 'name'
+                            ? 'More than one product has this name. Rename the file using the product SKU or barcode.'
+                            : "More than one product has this {$matchedBy}.",
+                    ];
+
+                    continue;
+                }
+
+                // Ek hi ZIP me same product + same photo number do baar nahi
+                $dupKey = $ids[0].'#'.$slot;
+                if (isset($processedSkus[$dupKey])) {
+                    $failed++;
+
+                    $results[] = [
+                        'file' => $filename,
+                        'sku' => $sku,
+                        'status' => 'failed',
+                        'reason' => 'Another file in this ZIP is already used for this product and photo number.',
+                    ];
+
+                    continue;
+                }
+                $processedSkus[$dupKey] = true;
+
+                $product = Product::where('store_id', $storeId)->find($ids[0]);
+
+                if (! $product) {
                     $notFound++;
 
                     $results[] = [
@@ -2063,37 +2158,6 @@ class ProductController extends Controller
 
                     continue;
                 }
-
-                if ($products->count() > 1) {
-                    $failed++;
-
-                    $results[] = [
-                        'file' => $filename,
-                        'sku' => $sku,
-                        'status' => 'failed',
-                        'reason' => 'Duplicate SKU found in database.',
-                    ];
-
-                    continue;
-                }
-
-                // Ek hi ZIP me same SKU + same photo number do baar nahi
-                $dupKey = $sku.'#'.$slot;
-                if (isset($processedSkus[$dupKey])) {
-                    $failed++;
-
-                    $results[] = [
-                        'file' => $filename,
-                        'sku' => $sku,
-                        'status' => 'failed',
-                        'reason' => 'Duplicate photo for this SKU found in ZIP.',
-                    ];
-
-                    continue;
-                }
-                $processedSkus[$dupKey] = true;
-
-                $product = $products->first();
 
                 $oldImage = null;
                 $newPath = null;
@@ -2141,6 +2205,8 @@ class ProductController extends Controller
                         'file' => $filename,
                         'sku' => $sku,
                         'product_id' => $product->id,
+                        'product_name' => $product->name,
+                        'matched_by' => $matchedBy,
                         'photo_no' => $slot,
                         'status' => 'updated',
                         'message' => 'Product image uploaded successfully.',
