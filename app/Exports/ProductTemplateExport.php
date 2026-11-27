@@ -51,14 +51,15 @@ class ProductTemplateColumns
 
     // Sirf pharmacy store
     public const PHARMACY = [
-        'salt_composition', 'manufacturer', 'drug_schedule',
+        'gst_rate', 'salt_composition', 'manufacturer', 'drug_schedule',
         'requires_prescription', 'pack_type', 'units_per_pack',
+        'allow_loose', 'loose_unit',
     ];
 
     // Text format wale columns (leading zero / lambe barcode kharab na hon)
     public const TEXT = [
         'sku', 'barcode', 'hsn_code', 'sale_type', 'plu_code',
-        'salt_composition', 'manufacturer', 'drug_schedule', 'pack_type',
+        'salt_composition', 'manufacturer', 'drug_schedule', 'pack_type', 'loose_unit',
     ];
 
     public static function keys(bool $pharmacy): array
@@ -172,6 +173,9 @@ class ProductDataTemplateSheet implements
                 'requires_prescription' => 1,
                 'pack_type' => 'strip',
                 'units_per_pack' => 15,
+                'gst_rate' => 5,
+                'allow_loose' => 1,
+                'loose_unit' => 'tablet',
             ],
             [
                 'name' => 'SAMPLE - DELETE THIS ROW',
@@ -190,6 +194,9 @@ class ProductDataTemplateSheet implements
                 'requires_prescription' => 0,
                 'pack_type' => 'bottle',
                 'units_per_pack' => 1,
+                'gst_rate' => 5,
+                'allow_loose' => 0,
+                'loose_unit' => '',
             ],
         ];
     }
@@ -234,8 +241,8 @@ class ProductInstructionsSheet implements
             ['all', 'name', 'Yes', 'Product name.', $p ? 'Dolo 650 Tablet' : 'Rice'],
             ['all', 'sku', 'No', 'Unique SKU.', $p ? 'MED-001' : 'RICE-001'],
             ['all', 'barcode', 'No', 'Leave blank to generate a barcode automatically.', '8901234567890'],
-            ['all', 'brand', 'No', 'Brand name. A missing brand may be created automatically.', $p ? 'Micro Labs' : 'ABC Foods'],
-            ['all', 'category', 'No', 'Category name. A missing category may be created automatically.', $p ? 'Tablets' : 'Grains'],
+            ['all', 'brand', 'No', 'Brand name. If this brand does not exist yet, it is created automatically during import (no need to create it first). Matching ignores capital/small letters.', $p ? 'Micro Labs' : 'ABC Foods'],
+            ['all', 'category', 'No', 'Category name. If this category does not exist yet, it is created automatically during import (no need to create it first). Matching ignores capital/small letters.', $p ? 'Tablets' : 'Grains'],
             ['all', 'hsn_code', 'No', 'HSN code.', $p ? '3004' : '100630'],
             ['all', 'gst_rate_id', 'No', 'Existing ID from the gst_rates table.', 'Check your database for the correct ID.'],
             ['all', 'cost_price', 'No', 'Product cost price. Enter a non-negative number.', $p ? '26' : '45'],
@@ -250,12 +257,15 @@ class ProductInstructionsSheet implements
             ['mart', 'Unit product', 'Important', 'For sale_type=unit, PLU code and price_per_kg can remain blank.', 'Parle-G, unit'],
 
             // ---- Pharmacy only ----
-            ['pharmacy', 'salt_composition', 'Yes', 'Salt / generic composition of the medicine. Compulsory for every row.', 'Paracetamol 650mg'],
+            ['pharmacy', 'salt_composition', 'Conditional', 'Salt / generic composition of the medicine. Compulsory for schedule G, H, H1 and X. Leave blank for non-medicine items (surgical, FMCG, cosmetics).', 'Paracetamol 650mg'],
             ['pharmacy', 'manufacturer', 'Yes', 'Manufacturer / company name. Compulsory for every row.', 'Micro Labs Ltd'],
             ['pharmacy', 'drug_schedule', 'Yes', 'Drug schedule. Compulsory. Write none if the product has no schedule.', 'none, G, H, H1 or X'],
             ['pharmacy', 'requires_prescription', 'No', 'Whether a prescription is needed. Optional: it is always 1 for schedule H, H1 and X.', '1 = Yes, 0 = No'],
             ['pharmacy', 'pack_type', 'Yes', 'Pack type (maximum 30 characters). Compulsory.', 'strip, bottle, tube, vial'],
             ['pharmacy', 'units_per_pack', 'Yes', 'Number of units in one pack. Whole number, 1 or more. Compulsory.', '15'],
+            ['pharmacy', 'gst_rate', 'No', 'GST percentage. Used only when gst_rate_id is blank. The percentage must already exist in this store\'s GST Rates, otherwise the row is skipped (never saved with a blank GST).', '5'],
+            ['pharmacy', 'allow_loose', 'No', 'Sell single units (tablets) out of a pack. Needs units_per_pack of 2 or more. Set it here: it cannot be changed once the product has stock or sales.', '1 = Yes, 0 = No'],
+            ['pharmacy', 'loose_unit', 'No', 'Name of the single unit when allow_loose = 1 (default: tablet).', 'tablet, capsule, ml'],
             ['pharmacy', 'Medicine product', 'Important', 'Rows with a missing compulsory pharmacy column are skipped and reported with the row number.', 'Dolo 650, Paracetamol 650mg, Micro Labs Ltd, H, strip, 15'],
 
             // ---- Common notes ----

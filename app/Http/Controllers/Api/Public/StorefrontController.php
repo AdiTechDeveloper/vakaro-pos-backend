@@ -359,6 +359,10 @@ class StorefrontController extends Controller
         if ($this->hasCol('branches', 'is_active')) {
             $q->where(fn($w) => $w->where('is_active', 1)->orWhereNull('is_active'));
         }
+        // Admin ne Online Settings me is branch ko OFF kiya ho to wo online store par nahi (list, link, order sab band)
+        if ($this->hasCol('branches', 'online_enabled')) {
+            $q->where(fn($w) => $w->where('online_enabled', 1)->orWhereNull('online_enabled'));
+        }
 
         return $q;
     }

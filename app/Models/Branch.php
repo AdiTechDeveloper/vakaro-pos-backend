@@ -19,6 +19,11 @@ class Branch extends Model
         'phone',
     ];
 
+    // online_enabled = online store par is branch ka on/off
+    protected $casts = [
+        'online_enabled' => 'boolean',
+    ];
+
     public function store(): BelongsTo
     {
         return $this->belongsTo(Store::class);

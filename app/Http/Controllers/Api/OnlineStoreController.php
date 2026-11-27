@@ -10,6 +10,7 @@ use App\Models\Store;
 use App\Models\StoreServicePincode;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 
@@ -36,34 +37,64 @@ class OnlineStoreController extends Controller
 
         $existing = OnlineStoreSetting::where('store_id', $storeId)->first();
 
+        // Text fields: har language ke letters + 0-9 + thode se symbols (frontend onlineValidation.js ke same rules)
         $data = $request->validate([
             'is_online_enabled' => ['required', 'boolean'],
             'slug' => [
-                'nullable', 'string', 'max:100',
+                'nullable', 'string', 'min:3', 'max:50',
                 'regex:/^[a-z0-9]+(-[a-z0-9]+)*$/',
                 'not_regex:/-b\d+$/', // "-b<number>" branch ke liye reserved hai
                 Rule::unique('online_store_settings', 'slug')->ignore($existing?->id),
             ],
-            'display_name' => ['nullable', 'string', 'max:150'],
-            'about' => ['nullable', 'string', 'max:1000'],
-            'phone' => ['nullable', 'string', 'max:20'],
-            'address' => ['nullable', 'string', 'max:255'],
+            'display_name' => [
+                'nullable', 'string', 'min:3', 'max:60',
+                'regex:/\A[\p{L}\p{M}0-9][\p{L}\p{M}0-9 .&\'-]*\z/u',
+                'regex:/\p{L}/u',
+                'not_regex:/ {2,}/',
+            ],
+            'about' => [
+                'nullable', 'string', 'min:10', 'max:500',
+                'regex:/\A[\p{L}\p{M}0-9][\p{L}\p{M}0-9 .,!?&\'():;-]*\z/u',
+                'regex:/\p{L}/u',
+                'not_regex:/ {2,}/',
+            ],
+            'phone' => ['nullable', 'string', 'regex:/\A[6-9][0-9]{9}\z/'],
+            'address' => [
+                'nullable', 'string', 'min:5', 'max:150',
+                'regex:/\A[\p{L}\p{M}0-9][\p{L}\p{M}0-9 ,.\/#-]*\z/u',
+                'regex:/\p{L}/u',
+                'not_regex:/ {2,}/',
+            ],
             'open_time' => ['nullable', 'required_with:close_time', 'date_format:H:i'],
-            'close_time' => ['nullable', 'required_with:open_time', 'date_format:H:i'],
+            'close_time' => ['nullable', 'required_with:open_time', 'date_format:H:i', 'different:open_time'],
             'accepts_delivery' => ['required', 'boolean'],
             'accepts_pickup' => ['required', 'boolean'],
-            'min_order_amount' => ['nullable', 'numeric', 'min:0', 'max:100000'],
-            'delivery_charge' => ['nullable', 'numeric', 'min:0', 'max:100000'],
-            'free_delivery_above' => ['nullable', 'numeric', 'min:0', 'max:1000000'],
-            'prep_minutes' => ['nullable', 'integer', 'min:0', 'max:1440'],
+            'min_order_amount' => ['required', 'numeric', 'min:0', 'max:100000', 'decimal:0,2'],
+            'delivery_charge' => ['required', 'numeric', 'min:0', 'max:100000', 'decimal:0,2'],
+            'free_delivery_above' => ['nullable', 'numeric', 'gt:0', 'max:1000000', 'decimal:0,2', 'gte:min_order_amount'],
+            'prep_minutes' => ['required', 'integer', 'min:1', 'max:1440'],
             'online_stock_percent' => ['required', 'integer', 'min:0', 'max:100'],
             'max_qty_per_product' => ['nullable', 'integer', 'min:1', 'max:10000'],
         ], [
             'slug.regex' => 'Store link can have only small letters, numbers and hyphens (for example: my-store).',
             'slug.not_regex' => 'Store link cannot end with -b and a number (that is used for branches).',
             'slug.unique' => 'This store link is already taken. Please choose another.',
+            'display_name.regex' => 'Display name can have only letters, numbers, spaces and . & \' - (start with a letter or number, at least one letter).',
+            'display_name.not_regex' => 'Display name cannot have two spaces in a row.',
+            'about.regex' => 'About can have only letters, numbers, spaces and . , ! ? & \' ( ) : ; - (one paragraph, start with a letter or number).',
+            'about.not_regex' => 'About cannot have two spaces in a row.',
+            'address.regex' => 'Address can have only letters, numbers, spaces and , . / # - (start with a letter or number, at least one letter).',
+            'address.not_regex' => 'Address cannot have two spaces in a row.',
+            'phone.regex' => 'Enter a valid 10-digit mobile number that starts with 6, 7, 8 or 9.',
             'open_time.required_with' => 'Enter both opening and closing time, or leave both empty.',
             'close_time.required_with' => 'Enter both opening and closing time, or leave both empty.',
+            'close_time.different' => 'Closing time must be different from the opening time.',
+            'min_order_amount.decimal' => 'Minimum order can have up to 2 decimal places.',
+            'delivery_charge.decimal' => 'Delivery charge can have up to 2 decimal places.',
+            'free_delivery_above.decimal' => 'Free delivery limit can have up to 2 decimal places.',
+            'free_delivery_above.gt' => 'Free delivery limit must be more than 0.',
+            'free_delivery_above.gte' => 'Free delivery limit cannot be less than the minimum order.',
+            'prep_minutes.min' => 'Prepare time must be at least 1 minute.',
         ]);
 
         if ($data['is_online_enabled'] && ! $data['accepts_delivery'] && ! $data['accepts_pickup']) {
@@ -131,11 +162,18 @@ class OnlineStoreController extends Controller
 
         $data = $request->validate([
             'pincodes' => ['required'],
-            'delivery_charge' => ['nullable', 'numeric', 'min:0', 'max:100000'],
-            'min_order_amount' => ['nullable', 'numeric', 'min:0', 'max:100000'],
+            'delivery_charge' => ['nullable', 'numeric', 'min:0', 'max:100000', 'decimal:0,2'],
+            'min_order_amount' => ['nullable', 'numeric', 'min:0', 'max:100000', 'decimal:0,2'],
         ]);
 
         $raw = is_array($data['pincodes']) ? implode(' ', $data['pincodes']) : (string) $data['pincodes'];
+
+        if (strlen($raw) > 2000) {
+            return $this->fail('Too much text. You can add up to 200 pincodes at a time.', 422);
+        }
+        if (preg_match('/[^0-9\s,;]/', $raw)) {
+            return $this->fail('Pincodes can have only digits, commas, spaces and new lines.', 422);
+        }
         $list = array_values(array_unique(array_filter(preg_split('/[\s,;]+/', $raw))));
 
         if (! $list) {
@@ -145,9 +183,9 @@ class OnlineStoreController extends Controller
             return $this->fail('You can add up to 200 pincodes at a time.', 422);
         }
 
-        $invalid = array_values(array_filter($list, fn ($p) => ! preg_match('/^\d{6}$/', $p)));
+        $invalid = array_values(array_filter($list, fn ($p) => ! preg_match('/^[1-9]\d{5}$/', $p)));
         if ($invalid) {
-            return $this->fail('These are not valid 6-digit pincodes: '.implode(', ', array_slice($invalid, 0, 5)), 422);
+            return $this->fail('These are not valid 6-digit pincodes (they cannot start with 0): '.implode(', ', array_slice($invalid, 0, 5)), 422);
         }
 
         $added = 0;
@@ -182,8 +220,8 @@ class OnlineStoreController extends Controller
         abort_if(! $row, 404, 'Pincode not found.');
 
         $data = $request->validate([
-            'delivery_charge' => ['nullable', 'numeric', 'min:0', 'max:100000'],
-            'min_order_amount' => ['nullable', 'numeric', 'min:0', 'max:100000'],
+            'delivery_charge' => ['nullable', 'numeric', 'min:0', 'max:100000', 'decimal:0,2'],
+            'min_order_amount' => ['nullable', 'numeric', 'min:0', 'max:100000', 'decimal:0,2'],
             'is_active' => ['nullable', 'boolean'],
         ]);
 
@@ -214,6 +252,41 @@ class OnlineStoreController extends Controller
 
     // ---------------------------------------------------------------- helpers
 
+    // PUT /api/online/branches/{id}   body: { online_enabled: true|false }
+    // Is branch ko online store par on / off karo. Off branch customers ko dikhti nahi, order bhi nahi leti.
+    // Pehle se lagaye gaye orders par koi asar nahi (staff unhe POS me dekh aur poora kar sakta hai).
+    public function updateBranch(Request $request, int $id): JsonResponse
+    {
+        [$storeId] = $this->onlineScope($request, true);
+
+        $data = $request->validate([
+            'online_enabled' => ['required', 'boolean'],
+        ]);
+
+        if (! Schema::hasColumn('branches', 'online_enabled')) {
+            return $this->fail('Branch on/off is not set up yet. Please run the latest database migration.', 409);
+        }
+
+        $branch = Branch::where('store_id', $storeId)->find($id);
+
+        if (! $branch) {
+            return $this->fail('Branch not found.', 404);
+        }
+
+        $branch->online_enabled = (bool) $data['online_enabled'];
+        $branch->save();
+
+        $label = trim((string) $branch->name) ?: "Branch {$branch->id}";
+
+        return response()->json([
+            'status' => true,
+            'message' => $branch->online_enabled
+                ? "{$label} is now ON for online orders."
+                : "{$label} is now OFF for online orders.",
+            'data' => $this->payload($storeId),
+        ]);
+    }
+
     private function fail(string $message, int $status): JsonResponse
     {
         return response()->json(['status' => false, 'message' => $message], $status);
@@ -239,7 +312,7 @@ class OnlineStoreController extends Controller
     {
         $store = Store::findOrFail($storeId);
         $set = OnlineStoreSetting::where('store_id', $storeId)->first();
-        $branches = Branch::where('store_id', $storeId)->orderBy('id')->get(['id', 'name']);
+        $branches = Branch::where('store_id', $storeId)->orderBy('id')->get();
 
         $time = fn ($t) => $t ? substr((string) $t, 0, 5) : '';
 
@@ -273,8 +346,11 @@ class OnlineStoreController extends Controller
             'settings' => $settings,
             'listings' => $branches->map(fn ($b) => [
                 'branch_id' => $b->id,
+                'branch_name' => $b->name,
                 'name' => $branches->count() > 1 ? "{$base} - {$b->name}" : $base,
                 'slug' => "{$prefix}-b{$b->id}",
+                // Is branch ka online on/off (column na ho to on maano)
+                'online_enabled' => (bool) ($b->online_enabled ?? true),
             ])->values(),
             'pincodes' => $this->pincodeList($storeId),
         ];

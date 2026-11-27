@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Exports\ProductDetailsTemplateExport;
 use App\Exports\ProductTemplateExport;
 use App\Http\Controllers\Controller;
+use App\Imports\PharmacyProductFields;
 use App\Imports\ProductRowsImport;
 use App\Models\Branch;
 use App\Models\Brand;
@@ -26,81 +27,101 @@ use Milon\Barcode\Facades\DNS1DFacade as DNS1D;
 
 class ProductController extends Controller
 {
+    // GET /api/products/all  (paginated: ?page=&per_page=&search=&category_id=&brand_id=&in_stock=1&with_inventories=1&branch_id=)
     public function getAllProducts(Request $request)
     {
         $user = Auth::user();
         $role = $user->role;
         $storeId = $user->store_id;
 
-        $query = Product::where('store_id', $storeId)
-            ->with([
-                'brand',
-                'category',
-                'gstRate',
-            ]);
-
         $branchId = null;
 
         if ($role === 'manager') {
-            $branchId = $user->branch_id;
-
-            if (! $branchId) {
-                $branchId = DB::table('branch_staff')
-                    ->where('user_id', $user->id)
-                    ->value('branch_id');
-            }
+            $branchId = $user->branch_id
+                ?: DB::table('branch_staff')->where('user_id', $user->id)->value('branch_id');
 
             if (! $branchId) {
                 return response()->json([
                     'status' => true,
                     'products' => [],
+                    'meta' => ['page' => 1, 'per_page' => 0, 'total' => 0, 'last_page' => 1],
                 ], 200);
             }
-        } elseif ($role === 'admin') {
-            if ($request->filled('branch_id')) {
-                $branchId = (int) $request->branch_id;
-            }
+        } elseif ($role === 'admin' && $request->filled('branch_id')) {
+            $branchId = (int) $request->branch_id;
         }
 
-        $query->addSelect([
-            'total_stock' => Inventory::selectRaw('COALESCE(SUM(qty - sold_qty), 0)')
-                ->whereColumn('inventories.product_id', 'products.id')
-                ->whereNull('inventories.deleted_at')
-                ->when($branchId, fn ($q) => $q->where('inventories.branch_id', $branchId))
+        $perPage = min(max((int) $request->input('per_page', 50), 1), 500);
+        $today = now()->toDateString();
+
+        // Sellable stock rows (not sold out, not expired) -- ek hi jagah define, dono jagah use hota hai
+        $sellable = function ($q) use ($today, $branchId) {
+            $q->whereNull('inventories.deleted_at')
                 ->whereColumn('inventories.sold_qty', '<', 'inventories.qty')
-                ->where(function ($q) {
-                    $q->whereNull('inventories.expiry_date')
-                        ->orWhere('inventories.expiry_date', '>=', now()->toDateString());
-                }),
-        ]);
+                ->where(function ($q2) use ($today) {
+                    $q2->whereNull('inventories.expiry_date')
+                        ->orWhere('inventories.expiry_date', '>=', $today);
+                })
+                ->when($branchId, fn ($q3) => $q3->where('inventories.branch_id', $branchId));
+        };
 
-        $query->with([
-            'inventories' => function ($inventoryQuery) use ($branchId) {
-                $inventoryQuery->whereNull('deleted_at')
-                    ->whereColumn('sold_qty', '<', 'qty')
-                    ->where(function ($q) {
-                        $q->whereNull('expiry_date')
-                            ->orWhere('expiry_date', '>=', now()->toDateString());
-                    });
+        $query = Product::query()
+            ->select('products.*')
+            ->where('products.store_id', $storeId)
+            ->with(['brand:id,name', 'category:id,name', 'gstRate'])
+            ->when($request->filled('search'), function ($q) use ($request) {
+                $term = '%'.trim($request->search).'%';
+                $q->where(function ($q2) use ($term) {
+                    $q2->where('products.name', 'like', $term)
+                        ->orWhere('products.sku', 'like', $term)
+                        ->orWhere('products.barcode', 'like', $term);
+                });
+            })
+            ->when($request->filled('category_id'), fn ($q) => $q->where('products.category_id', $request->category_id))
+            ->when($request->filled('brand_id'), fn ($q) => $q->where('products.brand_id', $request->brand_id))
+            // sirf stock wale products (?in_stock=1)
+            ->when($request->boolean('in_stock'), function ($q) use ($sellable) {
+                $q->whereExists(function ($sub) use ($sellable) {
+                    $sub->select(DB::raw(1))
+                        ->from('inventories')
+                        ->whereColumn('inventories.product_id', 'products.id');
+                    $sellable($sub);
+                });
+            })
+            ->addSelect([
+                'total_stock' => Inventory::selectRaw('COALESCE(SUM(qty - sold_qty), 0)')
+                    ->whereColumn('inventories.product_id', 'products.id')
+                    ->where($sellable),
+            ])
+            ->orderBy('products.name');
 
-                if ($branchId) {
-                    $inventoryQuery->where('branch_id', $branchId);
-                }
-            },
-        ]);
+        // Inventories bhaari hoti hain: sirf ?with_inventories=1 par, aur sirf is page ke products ki
+        if ($request->boolean('with_inventories')) {
+            $query->with(['inventories' => function ($q) use ($sellable) {
+                $q->where($sellable);
+            }]);
+        }
 
-        $products = $query->get();
+        $page = $query->paginate($perPage);
 
         return response()->json([
             'status' => true,
-            'products' => $products,
+            'products' => $page->items(),
+            'meta' => [
+                'page' => $page->currentPage(),
+                'per_page' => $page->perPage(),
+                'total' => $page->total(),
+                'last_page' => $page->lastPage(),
+            ],
         ], 200);
     }
 
+    // GET /api/products  (POS list: ?page=&per_page=&search=&category_id=&brand_id=&branch_id=&show_out_of_stock=1)
     public function index(Request $request)
     {
         $user = Auth::user();
         $storeId = $user->store_id;
+
         if ($user->role === 'admin') {
             $storeBranchIds = Branch::where('store_id', $storeId)
                 ->pluck('id')
@@ -118,134 +139,95 @@ class ProductController extends Controller
         }
 
         $showOutOfStock = $request->boolean('show_out_of_stock', false);
+        $perPage = min(max((int) $request->input('per_page', 60), 1), 200);
+        $today = now()->toDateString();
 
-        $products = Product::where('products.store_id', $storeId)
-            ->when($request->category_id, function ($q) use ($request) {
-                $q->where('category_id', $request->category_id);
-            })
-            ->when($request->brand_id, function ($q) use ($request) {
-                $q->where('brand_id', $request->brand_id);
-            })
-            ->when($request->search, function ($q) use ($request) {
-                $term = '%'.$request->search.'%';
-                $q->where(function ($q2) use ($term) {
-                    $q2->where('name', 'like', $term)
-                        ->orWhere('salt_composition', 'like', $term)
-                        ->orWhere('manufacturer', 'like', $term);
+        // Bikne layak stock row (khatam nahi, expire nahi) -- ek hi jagah define
+        $sellable = function ($q) use ($branchIds, $today) {
+            $q->whereNull('inventories.deleted_at')
+                ->whereIn('inventories.branch_id', $branchIds)
+                ->whereRaw('(inventories.qty - inventories.sold_qty - COALESCE(inventories.expired_qty, 0)) > 0')
+                ->where(function ($q2) use ($today) {
+                    $q2->whereNull('inventories.expiry_date')
+                        ->orWhere('inventories.expiry_date', '>=', $today);
+                });
+        };
+
+        $query = Product::query()
+            ->where('products.store_id', $storeId)
+            ->when($request->filled('category_id'), fn ($q) => $q->where('products.category_id', $request->category_id))
+            ->when($request->filled('brand_id'), fn ($q) => $q->where('products.brand_id', $request->brand_id))
+            ->when($request->filled('search'), function ($q) use ($request) {
+                $raw = trim($request->search);
+                $term = '%'.$raw.'%';
+                $q->where(function ($q2) use ($term, $raw) {
+                    $q2->where('products.name', 'like', $term)
+                        ->orWhere('products.salt_composition', 'like', $term)
+                        ->orWhere('products.manufacturer', 'like', $term)
+                        // scanner: exact SKU / barcode / batch barcode
+                        ->orWhere('products.sku', $raw)
+                        ->orWhere('products.barcode', $raw)
+                        ->orWhereIn('products.id', function ($sub) use ($raw) {
+                            $sub->select('inventories.product_id')->from('inventories')
+                                ->where('inventories.batch_barcode', $raw);
+                        });
                 });
             })
             ->with(['store', 'brand', 'category', 'gstRate'])
-            ->with(['inventories' => function ($q) use ($branchIds) {
-                $q->whereIn('branch_id', $branchIds)
+            // sirf is page ke products ki, sirf bikne layak inventories
+            ->with(['inventories' => function ($q) use ($sellable) {
+                $q->where($sellable)
                     ->orderByRaw('expiry_date IS NULL, expiry_date ASC')
                     ->orderBy('id', 'asc');
             }])
             ->addSelect([
-                'total_stock' => Inventory::selectRaw(
-                    'COALESCE(SUM(qty - sold_qty - COALESCE(expired_qty, 0)), 0)'
-                )
+                'total_stock' => Inventory::query()
+                    ->selectRaw('COALESCE(SUM(qty - sold_qty - COALESCE(expired_qty, 0)), 0)')
                     ->whereColumn('inventories.product_id', 'products.id')
-                    ->whereIn('inventories.branch_id', $branchIds)
-                    ->whereRaw(
-                        '(qty - sold_qty - COALESCE(expired_qty, 0)) > 0'
-                    )
-                    ->where(function ($q) {
-                        $q->whereNull('inventories.expiry_date')
-                            ->orWhereDate(
-                                'inventories.expiry_date',
-                                '>=',
-                                now()->toDateString()
-                            );
-                    }),
-            ])
-
-            ->addSelect([
-                'nearest_expiry' => Inventory::selectRaw('MIN(expiry_date)')
+                    ->where($sellable),
+                'nearest_expiry' => Inventory::query()
+                    ->selectRaw('MIN(expiry_date)')
                     ->whereColumn('inventories.product_id', 'products.id')
-                    ->whereIn('inventories.branch_id', $branchIds)
-                    ->whereColumn('inventories.sold_qty', '<', 'inventories.qty')
-                    ->where('inventories.expiry_date', '>=', now()->toDateString()),
-            ])
-            ->addSelect([
-                'last_purchase_bill_no' => Inventory::select('purchase_bills.inward_no')
-                    ->join('purchase_bills', 'purchase_bills.id', '=', 'inventories.purchase_bill_id')
-                    ->whereColumn('inventories.product_id', 'products.id')
-                    ->whereIn('inventories.branch_id', $branchIds)
-                    ->latest('inventories.created_at')
-                    ->limit(1),
-            ])
-            ->orderByRaw('nearest_expiry IS NULL, nearest_expiry ASC')
-            ->get();
+                    ->where($sellable),
+            ]);
 
         if (! $showOutOfStock) {
-            $products = $products->filter(function ($product) {
-                return (float) $product->total_stock > 0;
-            })->values();
+            $query->whereExists(function ($sub) use ($sellable) {
+                $sub->select(DB::raw(1))->from('inventories')
+                    ->whereColumn('inventories.product_id', 'products.id');
+                $sellable($sub);
+            })->orderByRaw('nearest_expiry IS NULL, nearest_expiry ASC')
+                ->orderBy('products.name');
+        } else {
+            $query->orderBy('products.name');
         }
 
-        $products = $products->map(function ($product) {
+        $page = $query->paginate($perPage);
 
-            // Same batch + same selling price = one selectable POS option.
-            $groupedBatches = $product->inventories->groupBy(
-                function ($inv) {
-                    return $inv->batch_no.'|'
-                        .number_format((float) $inv->selling_price, 6, '.', '')
-                        .'|'
-                        .($inv->expiry_date ? substr((string) $inv->expiry_date, 0, 10) : 'none');
-                }
-            );
+        // last purchase bill: sirf is page ke products ke liye, ek hi query
+        $ids = collect($page->items())->pluck('id');
+        $lastBills = $ids->isEmpty() ? collect() : Inventory::query()
+            ->join('purchase_bills', 'purchase_bills.id', '=', 'inventories.purchase_bill_id')
+            ->whereIn('inventories.product_id', $ids)
+            ->whereIn('inventories.branch_id', $branchIds)
+            ->orderByDesc('inventories.created_at')
+            ->get(['inventories.product_id', 'purchase_bills.inward_no'])
+            ->unique('product_id')
+            ->pluck('inward_no', 'product_id');
 
-            $batches = $groupedBatches->map(function ($invGroup) {
-
-                $eligibleRows = $invGroup->filter(function ($inv) {
-                    $available = (float) $inv->qty
-                        - (float) $inv->sold_qty
-                        - (float) ($inv->expired_qty ?? 0);
-
-                    return $available > 0
-                        && (
-                            ! $inv->expiry_date
-                            || \Carbon\Carbon::parse($inv->expiry_date)->startOfDay()
-                                ->gte(now()->startOfDay())
-                        );
-                });
-
-                if ($eligibleRows->isEmpty()) {
-                    return null;
-                }
-
-                // This ID must identify a real, sellable inventory row.
-                $first = $eligibleRows->first();
-
-                $totalQty = $eligibleRows->sum(
-                    fn ($inv) => (float) $inv->qty
-                );
-
-                $totalSoldQty = $eligibleRows->sum(
-                    fn ($inv) => (float) $inv->sold_qty
-                );
-
-                $totalExpiredQty = $eligibleRows->sum(
-                    fn ($inv) => (float) ($inv->expired_qty ?? 0)
-                );
-
-                $totalFree = $eligibleRows->sum(
-                    fn ($inv) => (float) $inv->free
-                );
-
-                $availableQty = $eligibleRows->sum(
-                    fn ($inv) => max(
-                        0,
-                        (float) $inv->qty
-                            - (float) $inv->sold_qty
-                            - (float) ($inv->expired_qty ?? 0)
-                    )
-                );
+        $page->getCollection()->transform(function ($product) use ($lastBills) {
+            // same batch + same selling price + same expiry = ek POS option
+            $batches = $product->inventories->groupBy(
+                fn ($inv) => $inv->batch_no.'|'
+                    .number_format((float) $inv->selling_price, 6, '.', '').'|'
+                    .($inv->expiry_date ? substr((string) $inv->expiry_date, 0, 10) : 'none')
+            )->map(function ($rows) {
+                $first = $rows->first();
+                $upp = max(1, (int) $first->units_per_pack);
 
                 return [
                     // Use this ID when adding the option to the cart.
                     'id' => $first->id,
-
                     'product_id' => $first->product_id,
                     'branch_id' => $first->branch_id,
                     'batch_no' => $first->batch_no,
@@ -253,56 +235,38 @@ class ProductController extends Controller
                     'mrp' => (float) $first->mrp,
                     'cost_price' => (float) $first->cost_price,
                     'selling_price' => (float) $first->selling_price,
-                    'units_per_pack' => max(1, (int) $first->units_per_pack),
-                    'pack_price' => round((float) $first->selling_price * max(1, (int) $first->units_per_pack), 2),
+                    'units_per_pack' => $upp,
+                    'pack_price' => round((float) $first->selling_price * $upp, 2),
 
-                    'qty' => $totalQty,
-                    'sold_qty' => $totalSoldQty,
-                    'expired_qty' => $totalExpiredQty,
-                    'free' => $totalFree,
-                    'qty_available' => $availableQty,
+                    'qty' => $rows->sum(fn ($i) => (float) $i->qty),
+                    'sold_qty' => $rows->sum(fn ($i) => (float) $i->sold_qty),
+                    'expired_qty' => $rows->sum(fn ($i) => (float) ($i->expired_qty ?? 0)),
+                    'free' => $rows->sum(fn ($i) => (float) $i->free),
+                    'qty_available' => $rows->sum(
+                        fn ($i) => max(0, (float) $i->qty - (float) $i->sold_qty - (float) ($i->expired_qty ?? 0))
+                    ),
 
                     'expiry_date' => $first->expiry_date,
                     'is_opening' => $first->is_opening,
 
                     // Preserve barcode-level details.
                     'batch_barcode' => $first->batch_barcode,
-                    'inventory_ids' => $eligibleRows->pluck('id')->values(),
-                    'batch_barcodes' => $eligibleRows
-                        ->pluck('batch_barcode')
-                        ->unique()
-                        ->values(),
+                    'inventory_ids' => $rows->pluck('id')->values(),
+                    'batch_barcodes' => $rows->pluck('batch_barcode')->unique()->values(),
                 ];
-            })
-                ->filter()
-                ->values();
+            })->values();
 
-            $prices = $batches
-                ->pluck('selling_price')
-                ->filter(fn ($price) => $price !== null);
+            $prices = $batches->pluck('selling_price')->filter(fn ($p) => $p !== null);
 
-            // $data = $product->toArray();
-
-            // $data['min_price'] = $prices->min();
-            // $data['max_price'] = $prices->max();
-
-            // $data['has_multiple_prices'] =
-            //     $prices->unique()->count() > 1;
-
-            // $data['batch_count'] = $batches->count();
-            // $data['batches'] = $batches;
-
-            // unset($data['inventories']);
-
-            // return $data;
-
+            // list ke liye bhaari text/JSON columns nahi chahiye (POS par chahiye to is line ko hata do)
+            $product->makeHidden(['description', 'product_info']);
             $data = $product->toArray();
 
             // Use calculated sellable inventory stock instead of stale products.stock
-            $calculatedStock = (float) ($product->total_stock ?? 0);
-
-            $data['stock'] = $calculatedStock;
-            $data['total_stock'] = $calculatedStock;
+            $stock = (float) ($product->total_stock ?? 0);
+            $data['stock'] = $stock;
+            $data['total_stock'] = $stock;
+            $data['last_purchase_bill_no'] = $lastBills[$product->id] ?? null;
 
             // Card price is shown per pack (strip) for loose-enabled products
             $upp = ($product->allow_loose && (int) $product->units_per_pack >= 2)
@@ -310,10 +274,7 @@ class ProductController extends Controller
                 : 1;
             $data['min_price'] = $prices->isEmpty() ? null : round($prices->min() * $upp, 2);
             $data['max_price'] = $prices->isEmpty() ? null : round($prices->max() * $upp, 2);
-
-            $data['has_multiple_prices'] =
-                $prices->unique()->count() > 1;
-
+            $data['has_multiple_prices'] = $prices->unique()->count() > 1;
             $data['batch_count'] = $batches->count();
             $data['batches'] = $batches;
 
@@ -324,11 +285,228 @@ class ProductController extends Controller
 
         return response()->json([
             'status' => true,
-            'products' => $products,
+            'products' => $page->items(),
+            'meta' => [
+                'page' => $page->currentPage(),
+                'per_page' => $page->perPage(),
+                'total' => $page->total(),
+                'last_page' => $page->lastPage(),
+            ],
         ], 200);
+    }
+public function matchProductsForPurchase(Request $request)
+{
+    $validated = $request->validate([
+        'lines' => 'required|array|min:1|max:500',
+        'lines.*.line_index' => 'nullable|integer|min:0',
+        'lines.*.product_name' => 'nullable|string|max:255',
+        'lines.*.sku' => 'nullable|string|max:100',
+        'lines.*.barcode' => 'nullable|string|max:100',
+        'lines.*.salt_composition' => 'nullable|string|max:500',
+        'lines.*.manufacturer' => 'nullable|string|max:255',
+    ]);
 
+    $user = Auth::user();
+
+    if (!$user || !$user->store_id) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Store not found.',
+        ], 403);
     }
 
+    $results = [];
+
+    foreach ($validated['lines'] as $index => $line) {
+
+        $productName = trim($line['product_name'] ?? '');
+        $sku = trim($line['sku'] ?? '');
+        $barcode = trim($line['barcode'] ?? '');
+        $salt = trim($line['salt_composition'] ?? '');
+        $manufacturer = trim($line['manufacturer'] ?? '');
+
+        if (
+            $productName === '' &&
+            $sku === '' &&
+            $barcode === '' &&
+            $salt === '' &&
+            $manufacturer === ''
+        ) {
+            $results[] = [
+                'line_index' => $line['line_index'] ?? $index,
+                'matched_product' => null,
+                'candidates' => [],
+            ];
+
+            continue;
+        }
+
+        $query = Product::query()
+            ->where('store_id', $user->store_id)
+            ->with(['brand:id,name', 'category:id,name', 'gstRate'])
+            ->where(function ($q) use (
+                $productName,
+                $sku,
+                $barcode,
+                $salt,
+                $manufacturer
+            ) {
+                if ($sku !== '') {
+                    $q->orWhere('sku', $sku);
+                }
+
+                if ($barcode !== '') {
+                    $q->orWhere('barcode', $barcode);
+                }
+
+                if ($productName !== '') {
+                    $q->orWhere('name', 'LIKE', '%' . $productName . '%');
+                }
+
+                if ($salt !== '') {
+                    $q->orWhere('salt_composition', 'LIKE', '%' . $salt . '%');
+                }
+
+                if ($manufacturer !== '') {
+                    $q->orWhere('manufacturer', 'LIKE', '%' . $manufacturer . '%');
+                }
+            });
+
+        $products = $query->limit(100)->get();
+
+        // Calculate matching score for every candidate.
+        $scoredProducts = $products->map(function ($product) use (
+            $productName,
+            $sku,
+            $barcode,
+            $salt,
+            $manufacturer
+        ) {
+            $score = 0;
+
+            $normalize = function ($value) {
+                return strtolower(
+                    preg_replace('/[^a-zA-Z0-9]/', '', trim($value ?? ''))
+                );
+            };
+
+            $dbName = $normalize($product->name);
+            $invoiceName = $normalize($productName);
+
+            $dbSku = $normalize($product->sku);
+            $invoiceSku = $normalize($sku);
+
+            $dbBarcode = $normalize($product->barcode);
+            $invoiceBarcode = $normalize($barcode);
+
+            $dbSalt = $normalize($product->salt_composition);
+            $invoiceSalt = $normalize($salt);
+
+            $dbManufacturer = $normalize($product->manufacturer);
+            $invoiceManufacturer = $normalize($manufacturer);
+
+            // Exact SKU match
+            if ($invoiceSku !== '' && $dbSku === $invoiceSku) {
+                $score += 100;
+            }
+
+            // Exact barcode match
+            if ($invoiceBarcode !== '' && $dbBarcode === $invoiceBarcode) {
+                $score += 100;
+            }
+
+            // Exact product name match
+            if ($invoiceName !== '' && $dbName === $invoiceName) {
+                $score += 80;
+            } elseif (
+                $invoiceName !== '' &&
+                (
+                    str_contains($dbName, $invoiceName) ||
+                    str_contains($invoiceName, $dbName)
+                )
+            ) {
+                $score += 50;
+            }
+
+            // Salt composition match
+            if ($invoiceSalt !== '' && $dbSalt === $invoiceSalt) {
+                $score += 40;
+            } elseif (
+                $invoiceSalt !== '' &&
+                str_contains($dbSalt, $invoiceSalt)
+            ) {
+                $score += 20;
+            }
+
+            // Manufacturer match
+            if (
+                $invoiceManufacturer !== '' &&
+                $dbManufacturer === $invoiceManufacturer
+            ) {
+                $score += 20;
+            }
+
+            return [
+                'product' => $product,
+                'match_score' => $score,
+            ];
+        })
+        ->filter(function ($item) {
+            return $item['match_score'] > 0;
+        })
+        ->sortByDesc('match_score')
+        ->take(10)
+        ->values();
+
+        $candidates = $scoredProducts->map(function ($item) {
+            $product = $item['product'];
+
+            return [
+                'id' => $product->id,
+                'name' => $product->name,
+                'sku' => $product->sku,
+                'barcode' => $product->barcode,
+                'hsn_code' => $product->hsn_code,
+                'manufacturer' => $product->manufacturer,
+                'salt_composition' => $product->salt_composition,
+                'mrp' => $product->mrp,
+                'selling_price' => $product->selling_price,
+                'cost_price' => $product->cost_price,
+                'gst_rate_id' => $product->gst_rate_id,
+                'gst_inclusive' => $product->gst_inclusive,
+                'match_score' => $item['match_score'],
+            ];
+        })->values();
+
+        // Automatically select only a strong, unambiguous match.
+        $matchedProduct = null;
+
+        if ($scoredProducts->count() > 0) {
+            $best = $scoredProducts->first();
+            $second = $scoredProducts->get(1);
+
+            $isStrongMatch = $best['match_score'] >= 80;
+
+            $isUnambiguous = !$second ||
+                $best['match_score'] > $second['match_score'];
+
+            if ($isStrongMatch && $isUnambiguous) {
+                $matchedProduct = $candidates->first();
+            }
+        }
+
+        $results[] = [
+            'line_index' => $line['line_index'] ?? $index,
+            'matched_product' => $matchedProduct,
+            'candidates' => $candidates,
+        ];
+    }
+
+    return response()->json([
+        'success' => true,
+        'data' => $results,
+    ]);
+}
     public function show($id)
     {
         $storeId = Auth::user()->store_id;
@@ -487,11 +665,30 @@ class ProductController extends Controller
                 ], 422);
             }
 
-            // Is store ke products ka lookup (id / sku / barcode)
-            $byId = [];
-            $bySku = [];
-            $byBarcode = [];
-            foreach (Product::where('store_id', $user->store_id)->get() as $p) {
+            // File mein jo product_id / sku / barcode hain, sirf unhi products ko load karo (pura store nahi)
+            $wantIds = $wantSkus = $wantBarcodes = [];
+            foreach ($sheetRows as $row) {
+                $raw = $row->toArray();
+                $i = $this->importText($raw['product_id'] ?? null);
+                if ($i !== '' && ctype_digit($i)) {
+                    $wantIds[] = (int) $i;
+                }
+                $s = $this->importText($raw['sku'] ?? null);
+                if ($s !== '') {
+                    $wantSkus[] = $s;
+                }
+                $b = $this->importText($raw['barcode'] ?? null);
+                if ($b !== '') {
+                    $wantBarcodes[] = $b;
+                }
+            }
+
+            $byId = $bySku = $byBarcode = $loaded = [];
+            $remember = function ($p) use (&$byId, &$bySku, &$byBarcode, &$loaded) {
+                if (isset($loaded[$p->id])) {
+                    return;
+                }
+                $loaded[$p->id] = true;
                 $byId[$p->id] = $p;
                 if ($p->sku !== null && $p->sku !== '') {
                     $k = mb_strtolower(trim((string) $p->sku));
@@ -500,6 +697,25 @@ class ProductController extends Controller
                 if ($p->barcode !== null && $p->barcode !== '') {
                     $k = mb_strtolower(trim((string) $p->barcode));
                     $byBarcode[$k] = array_key_exists($k, $byBarcode) ? false : $p;
+                }
+            };
+
+            $base = fn () => Product::where('store_id', $user->store_id)
+                ->select(['id', 'store_id', 'name', 'sku', 'barcode', 'product_info']);
+
+            foreach (array_chunk(array_unique($wantIds), 1000) as $c) {
+                foreach ($base()->whereIn('id', $c)->get() as $p) {
+                    $remember($p);
+                }
+            }
+            foreach (array_chunk(array_unique($wantSkus), 1000) as $c) {
+                foreach ($base()->whereIn('sku', $c)->get() as $p) {
+                    $remember($p);
+                }
+            }
+            foreach (array_chunk(array_unique($wantBarcodes), 1000) as $c) {
+                foreach ($base()->whereIn('barcode', $c)->get() as $p) {
+                    $remember($p);
                 }
             }
 
@@ -681,6 +897,35 @@ class ProductController extends Controller
 
         // Final barcode
         return $base.$checkDigit;
+    }
+
+    /** $count naye EAN13 barcode, jo DB mein nahi hain (chunked check, bulk import ke liye) */
+    private function freshBarcodes(int $count): array
+    {
+        $found = [];
+
+        while (count($found) < $count) {
+            $cand = [];
+            while (count($cand) < ($count - count($found)) + 20) {
+                $cand[$this->generateEan13Barcode()] = true;
+            }
+            $cand = array_keys($cand);
+
+            $taken = [];
+            foreach (array_chunk($cand, 2000) as $chunk) {
+                foreach (DB::table('products')->whereIn('barcode', $chunk)->pluck('barcode') as $t) {
+                    $taken[$t] = true;
+                }
+            }
+
+            foreach ($cand as $c) {
+                if (! isset($taken[$c]) && count($found) < $count) {
+                    $found[$c] = true;
+                }
+            }
+        }
+
+        return array_keys($found);
     }
 
     public function store(Request $request)
@@ -1554,7 +1799,7 @@ class ProductController extends Controller
         ]);
     }
 
-    private const IMPORT_MAX_ROWS = 2000;
+    private const IMPORT_MAX_ROWS = 100000;
 
     /**
      * Empty Excel template (headings only) so a new user knows the exact columns.
@@ -1571,7 +1816,7 @@ class ProductController extends Controller
         }
 
         return Excel::download(
-            new ProductTemplateExport,
+            new ProductTemplateExport($this->isPharmacyStore($user->store_id)),
             'product-import-template.xlsx'
         );
     }
@@ -1592,10 +1837,24 @@ class ProductController extends Controller
         ]);
 
         // Large files can take a while (row by row validation).
-        set_time_limit(120);
+        set_time_limit(0);
+        ini_set('memory_limit', '1024M');
 
         try {
             $storeId = $user->store_id;
+
+            // Pharmacy store: pharmacy columns (salt, manufacturer, schedule, pack, loose ...) are read and saved.
+            // Mart store: those columns are ignored, so the mart import works exactly as before.
+            $isPharmacy = $this->isPharmacyStore($storeId);
+
+            // This store's GST rates by percent ("5" => id), so a file can say gst_rate = 5 instead of an id.
+            $gstIdByRate = [];
+            foreach (DB::table('gst_rates')->where('store_id', $storeId)->where('active', 1)->orderBy('id')->get(['id', 'rate']) as $g) {
+                $rateKey = $this->importRateKey($g->rate);
+                if ($rateKey !== null && ! isset($gstIdByRate[$rateKey])) {
+                    $gstIdByRate[$rateKey] = $g->id;
+                }
+            }
 
             $sheetRows = Excel::toCollection(
                 new ProductRowsImport,
@@ -1617,9 +1876,13 @@ class ProductController extends Controller
                 $items[] = [
                     'row' => $index + 2,
                     'data' => $this->normalizeImportRow($raw),
+                    'raw' => $isPharmacy ? $raw : [],
                     'has_name_column' => array_key_exists('name', $raw),
                 ];
             }
+
+            // Poori sheet ab memory se hata do
+            unset($sheetRows);
 
             if (empty($items)) {
                 return response()->json([
@@ -1648,9 +1911,13 @@ class ProductController extends Controller
 
             // Brands / categories of this store, so each name is looked up only once.
             $brandIds = Brand::where('store_id', $storeId)->get(['id', 'name'])
-                ->mapWithKeys(fn ($b) => [mb_strtolower($b->name) => $b->id])->all();
+                ->mapWithKeys(fn ($b) => [mb_strtolower($this->importName($b->name)) => $b->id])->all();
             $categoryIds = Category::where('store_id', $storeId)->get(['id', 'name'])
-                ->mapWithKeys(fn ($c) => [mb_strtolower($c->name) => $c->id])->all();
+                ->mapWithKeys(fn ($c) => [mb_strtolower($this->importName($c->name)) => $c->id])->all();
+
+            // Names of brands / categories that this import created automatically.
+            $createdBrands = [];
+            $createdCategories = [];
 
             // Valid GST rate ids (small table). Unknown ids are left blank instead of failing the row.
             $validGstRateIds = DB::table('gst_rates')->pluck('id')
@@ -1658,6 +1925,10 @@ class ProductController extends Controller
 
             // cost_price is saved only if the products table really has that column
             $hasCostPrice = \Illuminate\Support\Facades\Schema::hasColumn('products', 'cost_price');
+
+            // Jin rows ka barcode khali hai unke liye EAN13 ek saath bana lo (row-by-row exists() query nahi)
+            $blankBarcodeRows = count(array_filter($items, fn ($i) => $i['data']['barcode'] === ''));
+            $spareBarcodes = $this->freshBarcodes($blankBarcodeRows);
 
             $seenSkus = [];
             $seenBarcodes = [];
@@ -1671,6 +1942,42 @@ class ProductController extends Controller
                 // GST rate not available / not found -> save the product with a blank GST rate.
                 if ($data['gst_rate_id'] !== null && ! isset($validGstRateIds[$data['gst_rate_id']])) {
                     $data['gst_rate_id'] = null;
+                }
+
+                // gst_rate (percent) given and no usable gst_rate_id -> use this store's GST rate with that percent.
+                // Unlike a wrong gst_rate_id, an unknown percent skips the row (never a silent blank GST).
+                if ($data['gst_rate_id'] === null && $data['gst_rate'] !== null) {
+                    $rateKey = $this->importRateKey($data['gst_rate']);
+
+                    if ($rateKey === null || ! isset($gstIdByRate[$rateKey])) {
+                        $errors[] = [
+                            'row' => $rowNumber,
+                            'name' => $data['name'] ?: null,
+                            'errors' => ["GST rate {$data['gst_rate']}% is not set up in this store's GST Rates. Add it there first, then import again."],
+                        ];
+
+                        continue;
+                    }
+
+                    $data['gst_rate_id'] = (string) $gstIdByRate[$rateKey];
+                }
+
+                // Pharmacy columns (compulsory on a pharmacy store)
+                $pharmacyData = [];
+                if ($isPharmacy) {
+                    $parsed = PharmacyProductFields::parse($item['raw'], true);
+
+                    if ($parsed['errors']) {
+                        $errors[] = [
+                            'row' => $rowNumber,
+                            'name' => $data['name'] ?: null,
+                            'errors' => $parsed['errors'],
+                        ];
+
+                        continue;
+                    }
+
+                    $pharmacyData = $parsed['data'];
                 }
 
                 $validator = Validator::make($data, [
@@ -1747,19 +2054,22 @@ class ProductController extends Controller
                     }
                 }
 
+                // New brand / category made by THIS row (so we can undo them if the product fails).
+                $newBrand = false;
+                $newCategory = false;
+
+                DB::beginTransaction();
+
                 try {
-                    $brandId = $this->importLookupId(Brand::class, $brandIds, $data['brand'], $storeId, $user->id);
-                    $categoryId = $this->importLookupId(Category::class, $categoryIds, $data['category'], $storeId, $user->id);
+                    // Brand / category missing in the store -> created automatically.
+                    $brandId = $this->importLookupId(Brand::class, $brandIds, $data['brand'], $storeId, $user->id, $newBrand);
+                    $categoryId = $this->importLookupId(Category::class, $categoryIds, $data['category'], $storeId, $user->id, $newCategory);
 
                     $barcodeToSave = $data['barcode'];
 
                     if ($barcodeToSave === '') {
-                        do {
-                            $barcodeToSave = $this->generateEan13Barcode();
-                        } while (
-                            isset($seenBarcodes[mb_strtolower($barcodeToSave)])
-                            || DB::table('products')->where('barcode', $barcodeToSave)->exists()
-                        );
+                        // pehle se bana kar rakha hua, DB mein na hone wala barcode
+                        $barcodeToSave = array_pop($spareBarcodes);
                     }
 
                     $attributes = [
@@ -1784,10 +2094,25 @@ class ProductController extends Controller
                     ];
 
                     if ($hasCostPrice) {
-                        $attributes['cost_price'] = $data['cost_price'];
+                        $attributes['cost_price'] = $data['cost_price'] ?? 0;
+                    }
+
+                    if ($pharmacyData) {
+                        // salt_composition, manufacturer, drug_schedule, requires_prescription,
+                        // pack_type, units_per_pack, allow_loose, loose_unit (same rules as ProductController::store)
+                        $attributes = array_merge($attributes, $pharmacyData);
                     }
 
                     Product::create($attributes);
+
+                    DB::commit();
+
+                    if ($newBrand) {
+                        $createdBrands[] = $data['brand'];
+                    }
+                    if ($newCategory) {
+                        $createdCategories[] = $data['category'];
+                    }
 
                     if ($data['sku'] !== '') {
                         $seenSkus[$skuKey] = true;
@@ -1796,6 +2121,17 @@ class ProductController extends Controller
 
                     $created++;
                 } catch (\Throwable $e) {
+                    DB::rollBack();
+
+                    // The brand / category created for this row was rolled back too,
+                    // so forget it, otherwise the next rows would reuse a dead id.
+                    if ($newBrand) {
+                        unset($brandIds[mb_strtolower($data['brand'])]);
+                    }
+                    if ($newCategory) {
+                        unset($categoryIds[mb_strtolower($data['category'])]);
+                    }
+
                     report($e);
 
                     $errors[] = [
@@ -1813,7 +2149,11 @@ class ProductController extends Controller
                     'total_rows' => count($items),
                     'created' => $created,
                     'skipped' => count($errors),
+                    'brands_created' => count($createdBrands),
+                    'categories_created' => count($createdCategories),
                 ],
+                'created_brands' => $createdBrands,
+                'created_categories' => $createdCategories,
                 'errors' => $errors,
             ]);
         } catch (\Throwable $e) {
@@ -1832,10 +2172,11 @@ class ProductController extends Controller
             'name' => $this->importText($raw['name'] ?? null),
             'sku' => $this->importText($raw['sku'] ?? null),
             'barcode' => $this->importText($raw['barcode'] ?? null),
-            'brand' => $this->importText($raw['brand'] ?? null),
-            'category' => $this->importText($raw['category'] ?? null),
+            'brand' => $this->importName($raw['brand'] ?? null),
+            'category' => $this->importName($raw['category'] ?? null),
             'hsn_code' => $this->importText($raw['hsn_code'] ?? null),
             'gst_rate_id' => $this->importNumber($raw['gst_rate_id'] ?? null),
+            'gst_rate' => $this->importNumber($raw['gst_rate'] ?? null),
             'cost_price' => $this->importNumber($raw['cost_price'] ?? null),
             'gst_inclusive' => $this->importFlag($raw['gst_inclusive'] ?? null),
             'is_price_override' => $this->importFlag($raw['is_price_override'] ?? null),
@@ -1860,6 +2201,24 @@ class ProductController extends Controller
         }
 
         return trim((string) $value);
+    }
+
+    /** Brand / category name: trimmed and extra inner spaces collapsed ("Tata   Tea " -> "Tata Tea"). */
+    private function importName($value): string
+    {
+        return trim((string) preg_replace('/\s+/u', ' ', $this->importText($value)));
+    }
+
+    /** "5", "5.0", "5.00", "5%" -> "5" (same key for the file value and the gst_rates.rate column); null if not a number. */
+    private function importRateKey($value): ?string
+    {
+        $text = str_replace(['%', ' '], '', trim((string) $value));
+
+        if ($text === '' || ! is_numeric($text)) {
+            return null;
+        }
+
+        return rtrim(rtrim(number_format((float) $text, 2, '.', ''), '0'), '.');
     }
 
     private function importNumber($value): ?string
@@ -1903,8 +2262,10 @@ class ProductController extends Controller
     }
 
     /** Find (or create once) a brand/category by name for this store. */
-    private function importLookupId(string $model, array &$cache, string $name, $storeId, $userId): ?int
+    private function importLookupId(string $model, array &$cache, string $name, $storeId, $userId, bool &$wasCreated = false): ?int
     {
+        $wasCreated = false;
+
         if ($name === '') {
             return null;
         }
@@ -1917,6 +2278,8 @@ class ProductController extends Controller
                 'name' => $name,
                 'created_by' => $userId,
             ])->id;
+
+            $wasCreated = true;
         }
 
         return (int) $cache[$key];

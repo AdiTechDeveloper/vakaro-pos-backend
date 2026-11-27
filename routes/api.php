@@ -212,6 +212,10 @@ Route::middleware(['auth:sanctum', 'token.expiry', 'extend.token', 'api.auth.res
     Route::delete('/products/{id}', [ProductController::class, 'destroy']);
     Route::get('/products/{id}/barcode', [ProductController::class, 'barcodeImage']);
     Route::put('/inventory/{inventoryId}/selling-price', [ProductController::class, 'updateSellingPrice']);
+    Route::post(
+    '/products/match-for-purchase',
+    [ProductController::class, 'matchProductsForPurchase']
+);
 });
 
 // Purchasebill routes

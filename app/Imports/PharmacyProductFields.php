@@ -21,7 +21,6 @@ class PharmacyProductFields
     // Pharmacy store par ye columns har row mein compulsory hain
     // (requires_prescription optional hai: H/H1/X par apne aap 1 hota hai)
     public const REQUIRED = [
-        'salt_composition',
         'manufacturer',
         'drug_schedule',
         'pack_type',
@@ -39,6 +38,8 @@ class PharmacyProductFields
         'requires_prescription' => ['requires_prescription', 'prescription_required', 'rx'],
         'pack_type' => ['pack_type', 'pack'],
         'units_per_pack' => ['units_per_pack', 'pack_size', 'strip_size'],
+        'allow_loose' => ['allow_loose', 'loose'],
+        'loose_unit' => ['loose_unit'],
     ];
 
     /**
@@ -110,6 +111,13 @@ class PharmacyProductFields
             $data['requires_prescription'] = true;
         }
 
+        // salt_composition is compulsory only for scheduled drugs (G, H, H1, X). Non-medicine items
+        // (surgical, FMCG, cosmetics) have no salt, and a fake placeholder would make them show up
+        // as substitutes of each other.
+        if ($required && $schedule !== null && in_array($schedule, ['G', 'H', 'H1', 'X'], true) && ! isset($data['salt_composition'])) {
+            $errors[] = "salt_composition is required for schedule {$schedule} products.";
+        }
+
         // pack_type
         $packType = self::get($row, 'pack_type');
 
@@ -131,6 +139,26 @@ class PharmacyProductFields
                 $data['units_per_pack'] = (int) $units;
             } else {
                 $errors[] = "units_per_pack '{$units}' must be a whole number of 1 or more.";
+            }
+        }
+
+        // allow_loose: sell single units (tablets) out of a pack. Needs units_per_pack of 2 or more
+        // (same rule as ProductController::store). Must be set now: it is locked once stock exists.
+        $rawLoose = self::get($row, 'allow_loose');
+
+        if ($rawLoose !== null) {
+            $loose = self::toBool($rawLoose);
+
+            if ($loose === null) {
+                $errors[] = "allow_loose '{$rawLoose}' is invalid (use 1 or 0).";
+            } elseif ($loose) {
+                if (! isset($data['units_per_pack']) || $data['units_per_pack'] < 2) {
+                    $errors[] = 'units_per_pack must be at least 2 to allow loose selling.';
+                } else {
+                    $looseUnit = mb_strtolower(trim((string) (self::get($row, 'loose_unit') ?? 'tablet')));
+                    $data['allow_loose'] = true;
+                    $data['loose_unit'] = mb_substr($looseUnit !== '' ? $looseUnit : 'tablet', 0, 20);
+                }
             }
         }
 

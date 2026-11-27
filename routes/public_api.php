@@ -82,6 +82,8 @@ Route::prefix('online')
         Route::get('settings', [OnlineStoreController::class, 'show']);
         Route::put('settings', [OnlineStoreController::class, 'update']);
 
+        Route::put('branches/{id}', [OnlineStoreController::class, 'updateBranch'])->whereNumber('id');
+
         Route::get('pincodes', [OnlineStoreController::class, 'pincodes']);
         Route::post('pincodes', [OnlineStoreController::class, 'addPincodes']);
         Route::put('pincodes/{id}', [OnlineStoreController::class, 'updatePincode'])->whereNumber('id');
